@@ -317,15 +317,15 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `Cargo.toml` (`eventkit-bridge` 0.1.0, edition 2024), `.mise.toml` (`rust = { version = "1.99", components = "rustfmt,clippy" }`, tasks `build`, `test`, `lint`, `fmt`, `check` as in the gate), `.gitignore`, `LICENSE` (MIT, Pavel Karpovich, 2026)
 - Create: `src/main.rs`, `src/config.rs`
 
-- [ ] add dependencies with `cargo add` so current versions are resolved: `tokio` (rt-multi-thread, macros, process, signal, sync, time), `axum`, `serde` (derive), `serde_json`, `toml`, `argh`, `thiserror`, `tracing`, `tracing-subscriber`, `chrono` (std, clock), `url`; dev: `tempfile`, `tower` (util), `http-body-util`
-- [ ] `config.rs`: load from `$HOME/.config/eventkit-bridge/config.toml`, plus a path override used by tests. Apply every rule from Solution Overview: literal non-unspecified `listen`, write calendar always readable. The error type names the offending key
-- [ ] `main.rs`: `#![forbid(unsafe_code)]`, the `argh` CLI with `install`, `uninstall`, `--check-config`, `--version`; the daemon path is a stub that loads config and exits until Task 4
-- [ ] tests:
+- [x] add dependencies with `cargo add` so current versions are resolved: `tokio` (rt-multi-thread, macros, process, signal, sync, time), `axum`, `serde` (derive), `serde_json`, `toml`, `argh`, `thiserror`, `tracing`, `tracing-subscriber`, `chrono` (std, clock), `url`; dev: `tempfile`, `tower` (util), `http-body-util`
+- [x] `config.rs`: load from `$HOME/.config/eventkit-bridge/config.toml`, plus a path override used by tests. Apply every rule from Solution Overview: literal non-unspecified `listen`, write calendar always readable. The error type names the offending key
+- [x] `main.rs`: `#![forbid(unsafe_code)]`, the `argh` CLI with `install`, `uninstall`, `--check-config`, `--version`; the daemon path is a stub that loads config and exits until Task 4
+- [x] tests:
   - valid config;
   - each invalid case (missing listen, `0.0.0.0`, hostname instead of IP, malformed TOML);
   - write calendar implied readable;
   - absent write calendar
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 2: `ekctl` runner and output parsing
 
