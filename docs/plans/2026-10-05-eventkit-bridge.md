@@ -426,11 +426,16 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 **Files:**
 - Create: `Info.plist.template`, `entitlements.plist`, `ekctl-LICENSE.txt`, `scripts/fetch-ekctl.sh`, `scripts/bundle.sh`, `scripts/build-signed.sh`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`
 
-- [ ] the three scripts per Solution Overview; `shellcheck scripts/*.sh` clean
-- [ ] `ekctl-LICENSE.txt`: "ekctl by schappim, MIT License, https://github.com/schappim/ekctl", with the MIT text
-- [ ] both workflows per Solution Overview; the cask `caveats` text matches the README setup section
-- [ ] both plists parse: `python3 -c 'import plistlib,sys; plistlib.loads(sys.stdin.read().replace("__VERSION__","0.1.0").encode())' < Info.plist.template` and the same for `entitlements.plist`
-- [ ] gate passes (no Rust changes, but CI runs it)
+- [x] the three scripts per Solution Overview; `shellcheck scripts/*.sh` clean
+- [x] `ekctl-LICENSE.txt`: "ekctl by schappim, MIT License, https://github.com/schappim/ekctl", with the MIT text
+- [x] both workflows per Solution Overview; the cask `caveats` text matches the README setup section
+- [x] both plists parse: `python3 -c 'import plistlib,sys; plistlib.loads(sys.stdin.read().replace("__VERSION__","0.1.0").encode())' < Info.plist.template` and the same for `entitlements.plist`
+- [x] gate passes (no Rust changes, but CI runs it)
+- ⚠️ the cask `caveats` text is written first here, in the release workflow (README does not exist yet); Task 7's README setup section must match it
+- ⚠️ `shellcheck = "0.11.0"` is added to `.mise.toml` tools so `jdx/mise-action` provides it on the CI runner. In this container, shellcheck 0.11.0 and actionlint 1.7.7 ran from downloaded binaries: shellcheck and actionlint (with shellcheck on the inline `run` scripts) are clean
+- ⚠️ `fetch-ekctl.sh` was run against the real v1.8.0 asset (checksum OK, binary extracted) and with a wrong sha256 (exit 1, nothing extracted). `bundle.sh`/`build-signed.sh` refuse on Linux; the signed path is verified in Post-Completion
+- ⚠️ `zap` also carries `launchctl: "dev.pkarpovich.eventkit-bridge"`, so `brew uninstall --zap` unloads the agent before it removes the plist; it does not run on upgrades
+- ⚠️ the release workflow finds the signing identity by its SHA-1 hash (`security find-identity`, matching `Developer ID Application: ... (<team-id>)`), as does `build-signed.sh`
 
 ### Task 7: README
 
