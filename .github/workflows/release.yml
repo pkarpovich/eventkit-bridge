@@ -1,0 +1,171 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      APP: dist/EventKitBridge.app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag matches Cargo.toml version
+        id: version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "eventkit-bridge") | .version')"
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - run: mise run check
+
+      - name: Build
+        run: |
+          rustup target add aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Fetch ekctl
+        id: ekctl
+        run: echo "path=$(scripts/fetch-ekctl.sh target/ekctl)" >> "$GITHUB_OUTPUT"
+
+      - uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      - name: Bundle and sign
+        env:
+          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          EKCTL: ${{ steps.ekctl.outputs.path }}
+        run: |
+          identity="$(security find-identity -v -p codesigning |
+            awk -v suffix="(${TEAM_ID})\"" 'index($0, "\"Developer ID Application: ") && substr($0, length($0) - length(suffix) + 1) == suffix { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "no Developer ID Application (${TEAM_ID}) identity" >&2
+            exit 1
+          fi
+          scripts/bundle.sh target/aarch64-apple-darwin/release/eventkit-bridge "$EKCTL" dist "$identity"
+          codesign -d --entitlements - "$APP"
+
+      - name: Notarize and staple
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_CONTENT }}
+        run: |
+          key="${RUNNER_TEMP}/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s\n' "$ASC_KEY_CONTENT" > "$key"
+          auth=(--key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID")
+          ditto -c -k --keepParent "$APP" "${RUNNER_TEMP}/notarize.zip"
+          result="$(xcrun notarytool submit "${RUNNER_TEMP}/notarize.zip" "${auth[@]}" --wait --output-format json)"
+          echo "$result"
+          status="$(jq -r '.status' <<< "$result")"
+          if [[ "$status" != "Accepted" ]]; then
+            xcrun notarytool log "$(jq -r '.id' <<< "$result")" "${auth[@]}"
+            exit 1
+          fi
+          xcrun stapler staple "$APP"
+
+      - name: Gatekeeper assessment
+        run: |
+          assessment="$(spctl --assess --type exec --verbose=2 "$APP" 2>&1)"
+          echo "$assessment"
+          grep -q "source=Notarized Developer ID" <<< "$assessment"
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          zip_name="EventKitBridge-arm64-${VERSION}.zip"
+          ditto -c -k --keepParent "$APP" "dist/${zip_name}"
+          (cd dist && shasum -a 256 "$zip_name" > checksums.txt)
+          echo "zip=${zip_name}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(awk '{ print $1 }' dist/checksums.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: gh release create "$GITHUB_REF_NAME" "dist/${ZIP}" dist/checksums.txt --title "$GITHUB_REF_NAME" --generate-notes
+
+      - uses: actions/checkout@v5
+        with:
+          repository: pkarpovich/homebrew-apps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update Homebrew cask
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          mkdir -p tap/Casks
+          cat > tap/Casks/eventkit-bridge.rb <<EOF
+          cask "eventkit-bridge" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v#{version}/EventKitBridge-arm64-#{version}.zip"
+            name "EventKitBridge"
+            desc "HTTP API over the Mac's calendars through EventKit"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
+            depends_on arch: :arm64
+            depends_on macos: :sonoma
+
+            app "EventKitBridge.app"
+            binary "#{appdir}/EventKitBridge.app/Contents/MacOS/eventkit-bridge"
+
+            zap launchctl: "dev.pkarpovich.eventkit-bridge",
+                trash:     [
+                  "~/.config/eventkit-bridge",
+                  "~/Library/LaunchAgents/dev.pkarpovich.eventkit-bridge.plist",
+                  "~/Library/Logs/eventkit-bridge.log",
+                ]
+
+            caveats <<~EOS
+              eventkit-bridge runs as a LaunchAgent and needs a config before its first start.
+
+              1. Create ~/.config/eventkit-bridge/config.toml with the address to listen on,
+                 a literal IP such as your tailscale IP:
+                   listen = "100.64.0.1:8790"
+              2. Check the config:
+                   eventkit-bridge --check-config
+              3. Install and start the LaunchAgent:
+                   eventkit-bridge install
+              4. Approve the Calendars prompt for EventKitBridge.
+              5. Find your calendar ids in ~/Library/Logs/eventkit-bridge.log, add
+                 read_calendars and write_calendar to the config, then run
+                   eventkit-bridge install
+                 again.
+
+              Upgrades need no action: the daemon restarts on the new version by itself.
+            EOS
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/eventkit-bridge.rb
+          git commit -m "eventkit-bridge ${VERSION}"
+          git push

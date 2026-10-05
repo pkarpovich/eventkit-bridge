@@ -148,7 +148,7 @@ delete event -- <id>
 
 ### HTTP API
 
-`axum` on the configured address, with no authentication: reachability is the tailnet. Request bodies are capped at 64 KiB. Every error body is `{"error":"<message>"}`.
+`axum` on the configured address, with no authentication: reachability is the tailnet. Every request's `Host` must be the listen IP or a name from the optional `hosts` config key, otherwise `421`, which blocks DNS rebinding from a browser on the tailnet. Request bodies are capped at 64 KiB. Every error body is `{"error":"<message>"}`.
 
 **Shared types:**
 
@@ -182,7 +182,7 @@ Slot: {"start":"...","end":"...","duration_minutes":60,"weekday":"monday"}
   - `weekdays`: default `weekdays`. Otherwise `weekdays`, `weekends`, `all`, or a comma list of day names (`monday`/`mon` ...), where an item may be a range such as `mon-fri`;
   - `buffer`: default 0, range 0-240;
   - `limit`: default 20, range 1-100;
-  - `from`/`to`: RFC3339 when given, otherwise not passed, so `ekctl`'s defaults apply (now to +7 days). When both are given, the span is at most 62 days;
+  - `from`/`to`: RFC3339 when given, otherwise not passed, so `ekctl`'s defaults apply (now to +7 days). Both or neither must be given (a one-sided range is `400`), and the span is at most 62 days;
   - `calendar`: same rules as `/v1/events`.
 - **`POST /v1/events`**, body `{"title","start","end","location"?,"notes"?,"url"?}` -> `201 Event`, created in the write calendar.
   - `403 no write calendar configured` when `write_calendar` is absent.
@@ -316,6 +316,7 @@ If step 2 attributes the grant to anything other than the app, or no prompt appe
 
 The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not depend on its outcome. Only the bundle and entitlements in Task 6 would change if it fails.
 
+
 ## Implementation Steps
 
 ### Task 1: Crate scaffold, config and CLI
@@ -324,15 +325,15 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `Cargo.toml` (`eventkit-bridge` 0.1.0, edition 2024), `.mise.toml` (`rust = { version = "1.99", components = "rustfmt,clippy" }`, tasks `build`, `test`, `lint`, `fmt`, `check` as in the gate), `.gitignore`, `LICENSE` (MIT, Pavel Karpovich, 2026)
 - Create: `src/main.rs`, `src/config.rs`
 
-- [ ] add dependencies with `cargo add` so current versions are resolved: `tokio` (rt-multi-thread, macros, process, signal, sync, time), `axum`, `serde` (derive), `serde_json`, `toml`, `argh`, `thiserror`, `tracing`, `tracing-subscriber`, `chrono` (std, clock), `url`; dev: `tempfile`, `tower` (util), `http-body-util`
-- [ ] `config.rs`: load from `$HOME/.config/eventkit-bridge/config.toml`, plus a path override used by tests. Apply every rule from Solution Overview: literal non-unspecified `listen`, write calendar always readable. The error type names the offending key
-- [ ] `main.rs`: `#![forbid(unsafe_code)]`, the `argh` CLI with `install`, `uninstall`, `--check-config`, `--version`; the daemon path is a stub that loads config and exits until Task 4
-- [ ] tests:
+- [x] add dependencies with `cargo add` so current versions are resolved: `tokio` (rt-multi-thread, macros, process, signal, sync, time), `axum`, `serde` (derive), `serde_json`, `toml`, `argh`, `thiserror`, `tracing`, `tracing-subscriber`, `chrono` (std, clock), `url`; dev: `tempfile`, `tower` (util), `http-body-util`
+- [x] `config.rs`: load from `$HOME/.config/eventkit-bridge/config.toml`, plus a path override used by tests. Apply every rule from Solution Overview: literal non-unspecified `listen`, write calendar always readable. The error type names the offending key
+- [x] `main.rs`: `#![forbid(unsafe_code)]`, the `argh` CLI with `install`, `uninstall`, `--check-config`, `--version`; the daemon path is a stub that loads config and exits until Task 4
+- [x] tests:
   - valid config;
   - each invalid case (missing listen, `0.0.0.0`, hostname instead of IP, malformed TOML);
   - write calendar implied readable;
   - absent write calendar
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 2: `ekctl` runner and output parsing
 
@@ -340,10 +341,10 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `src/ekctl.rs`, `src/model.rs`
 - Create: `fixtures/list_calendars.json`, `fixtures/list_events.json`, `fixtures/show_event.json`, `fixtures/free.json`, `fixtures/add_event.json`, `fixtures/delete_event.json`, `fixtures/error.json` (content under Technical Details)
 
-- [ ] `model.rs`: serde types for the `ekctl` shapes (tolerant of unknown fields, a missing `url` and `null` values) and the bridge's own `Calendar`, `Event`, `Attendee`, `Slot`; conversions from one to the other
-- [ ] `ekctl.rs`: the `Runner` (path, timeout, mutex), with the exec, timeout, stdout cap, stderr tail and the result mapping from Solution Overview, returning a typed error the HTTP layer maps to a status
-- [ ] typed argv builders for every command in Solution Overview; nothing outside this module builds argv
-- [ ] tests with the fake `ekctl`:
+- [x] `model.rs`: serde types for the `ekctl` shapes (tolerant of unknown fields, a missing `url` and `null` values) and the bridge's own `Calendar`, `Event`, `Attendee`, `Slot`; conversions from one to the other
+- [x] `ekctl.rs`: the `Runner` (path, timeout, mutex), with the exec, timeout, stdout cap, stderr tail and the result mapping from Solution Overview, returning a typed error the HTTP layer maps to a status
+- [x] typed argv builders for every command in Solution Overview; nothing outside this module builds argv
+- [x] tests with the fake `ekctl`:
   - each fixture parses and converts;
   - error envelope with exit 0;
   - `Event not found` on `show` vs other errors;
@@ -354,21 +355,25 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
   - unexpected JSON;
   - exact argv for each builder, including a title starting with `-` and an id after `--`;
   - two concurrent calls never overlap
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ the crate is split into `src/lib.rs` (`#![forbid(unsafe_code)]`, `pub mod config; pub mod ekctl; pub mod model;`) and `src/main.rs` (the CLI, using the library). Without the split, items not yet reachable from `main` until Task 4 fail `clippy -D warnings` as dead code, and a blanket `allow(dead_code)` is forbidden. Later modules go into `lib.rs` too
+- ⚠️ `tokio` also needs the `io-util` feature, for reading `ekctl`'s pipes
+- ⚠️ timestamps the bridge passes to `ekctl` are formatted with whole seconds (`2026-10-05T11:00:00+02:00`); Task 4 should reject or accept fractional seconds knowingly
 
 ### Task 3: Policy
 
 **Files:**
 - Create: `src/policy.rs`
 
-- [ ] `Policy` from config: `readable(id)`, `writable(id)`, `filter_calendars` (event calendars only, readable only, `writable` flag set), `require_readable(ids)`, `default_read_set()`
-- [ ] the write guard: given an event id, run `show` through the runner and allow only when the event's calendar is the write calendar. It returns the shown event so `PATCH` can merge the range, and it runs inside the same runner lock as the write that follows
-- [ ] tests:
+- [x] `Policy` from config: `readable(id)`, `writable(id)`, `filter_calendars` (event calendars only, readable only, `writable` flag set), `require_readable(ids)`, `default_read_set()`
+- [x] the write guard: given an event id, run `show` through the runner and allow only when the event's calendar is the write calendar. It returns the shown event so `PATCH` can merge the range, and it runs inside the same runner lock as the write that follows
+- [x] tests:
   - filtering on the `list calendars` fixture (reminder lists dropped, non-readable dropped, writable flag);
   - non-readable id refused;
   - empty request set means all readable;
   - write guard allows the write calendar, refuses a user calendar, and passes through not-found
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ the fake `ekctl` used by tests moved from `ekctl.rs` into `src/fake_ekctl.rs` (`#[cfg(test)]`) so `policy.rs` and the Task 4 HTTP tests share it. `Policy` also exposes `write_calendar()`, which gives `403 no write calendar configured` for `POST`
 
 ### Task 4: HTTP API and health
 
@@ -376,15 +381,15 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `src/server.rs`, `src/health.rs`
 - Modify: `src/main.rs`
 
-- [ ] router with every route, the 64 KiB body limit, query and body validation exactly as in Solution Overview, and the status mapping from runner and policy errors to `{"error":...}` bodies
-- [ ] `health.rs`: the cached and collapsed check with the four degraded reasons
-- [ ] `main.rs`: the daemon:
+- [x] router with every route, the 64 KiB body limit, query and body validation exactly as in Solution Overview, and the status mapping from runner and policy errors to `{"error":...}` bodies
+- [x] `health.rs`: the cached and collapsed check with the four degraded reasons
+- [x] `main.rs`: the daemon:
   - tracing to stdout;
   - bind `listen`; on failure, exit non-zero with the reason and let launchd retry;
   - the startup calendar listing;
   - serve until SIGTERM or swap (Task 5 wires swap), with the 25 s graceful bound
-- [ ] request logging per Solution Overview. A test captures the log output (a `tracing` subscriber writing to a buffer) and asserts that a request with a title, notes, location, url and attendees leaves none of them in the log
-- [ ] tests through `oneshot`:
+- [x] request logging per Solution Overview. A test captures the log output (a `tracing` subscriber writing to a buffer) and asserts that a request with a title, notes, location, url and attendees leaves none of them in the log
+- [x] tests through `oneshot`:
   - each route's success;
   - each `400` validation rule;
   - `403` for non-readable calendars, writes without a write calendar, and update/delete of a user event (the fake records that no `update`/`delete` ran);
@@ -394,7 +399,16 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
   - `502`/`504` mapping;
   - healthz ok, unconfigured, timeout, ekctl failed and calendar missing;
   - cache reuse (the fake counts calls)
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ query and body parsing and validation live in `src/request.rs` (pure, unit-tested); `server.rs` holds the routes, error mapping, logging and `serve`
+- ⚠️ fractional seconds are rejected with `400` (`.000` is accepted), so the whole-second argv never silently truncates a client's time. A `+` offset sent unencoded in a query (decoded to a space) is restored
+- ⚠️ unknown query parameters, unknown body fields (`deny_unknown_fields`) and repeated single-valued parameters are `400`. A `null` field in `PATCH` means unchanged
+- ⚠️ a read with no `calendar` and nothing readable answers `403 no readable calendars configured` instead of calling `ekctl` with an empty list. `GET /v1/events/{id}` on an event in a non-readable calendar answers `403 event is not in a readable calendar` (the calendar id is not echoed). `/v1/events` also drops any event `ekctl` returns from a non-readable calendar
+- ⚠️ `weekdays` ranges must run forward (`fri-mon` is `400`); day names are case-insensitive
+- ⚠️ `/healthz` `calendars` is the count of readable calendars that exist as event calendars; a configured reminder-list id counts as `calendar missing`
+- ⚠️ the request log line carries `ekctl="show event=0, update event=0"` (subcommand=exit code, or `timeout`/`not started`/`killed`/`signalled`), collected through a task-local `CallLog` in `ekctl.rs`. Unknown routes log `route=unmatched`; `404`/`405` bodies are JSON too
+- ⚠️ the startup calendar listing retries every 30 s until `list calendars` first succeeds (the grant may still be pending)
+- ⚠️ `mise` is broken in this container; the gate ran as the three cargo commands directly
 
 ### Task 5: LaunchAgent install and upgrade detection
 
@@ -402,32 +416,41 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `src/service.rs`, `src/executable.rs`
 - Modify: `src/main.rs`
 
-- [ ] `service.rs`: `install` and `uninstall` per Solution Overview. Plist rendering is a pure function from `(binary, log path)` to the plist string, and launchctl calls go through a small trait so tests do not run launchctl
-- [ ] `executable.rs`: `(device, inode)` identity of the canonical executable; a future that resolves when the file is swapped or removed (2 s poll); wired into the daemon's shutdown signal
-- [ ] tests:
+- [x] `service.rs`: `install` and `uninstall` per Solution Overview. Plist rendering is a pure function from `(binary, log path)` to the plist string, and launchctl calls go through a small trait so tests do not run launchctl
+- [x] `executable.rs`: `(device, inode)` identity of the canonical executable; a future that resolves when the file is swapped or removed (2 s poll); wired into the daemon's shutdown signal
+- [x] tests:
   - rendered plist is valid XML containing the canonical path, `KeepAlive.PathState`, `AssociatedBundleIdentifiers` and log paths;
   - housing detection inside and outside `.app`;
   - swap detection on a temp file replaced by rename and on removal;
   - install sequence order (unload, wait, write, bootstrap) against a recording fake
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ `install` validates the config first and refuses with the reason when it is missing or invalid, so it never loads an agent that would only crash-loop under `KeepAlive`
+- ⚠️ the uid for `gui/<uid>` comes from `rustix::process::getuid()` (safe wrapper; `#![forbid(unsafe_code)]` rules out `libc`). `plist` is a dev-dependency used only to parse the rendered plist in tests
+- ⚠️ `launchctl` calls run `/bin/launchctl` with a 10 s deadline (`kill_on_drop`). `bootout`'s exit status is ignored; `launchctl print` decides whether the agent is gone, and a still-loaded agent after 5 s fails `install`/`uninstall` with `bootout`'s stderr. `uninstall` reports when nothing was installed
+- ⚠️ `executable::changed` treats a file that is gone as removed; other stat errors are logged and polling continues
 
 ### Task 6: Bundle, release and cask
 
 **Files:**
 - Create: `Info.plist.template`, `entitlements.plist`, `ekctl-LICENSE.txt`, `scripts/fetch-ekctl.sh`, `scripts/bundle.sh`, `scripts/build-signed.sh`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`
 
-- [ ] the three scripts per Solution Overview; `shellcheck scripts/*.sh` clean
-- [ ] `ekctl-LICENSE.txt`: "ekctl by schappim, MIT License, https://github.com/schappim/ekctl", with the MIT text
-- [ ] both workflows per Solution Overview; the cask `caveats` text matches the README setup section
-- [ ] both plists parse: `python3 -c 'import plistlib,sys; plistlib.loads(sys.stdin.read().replace("__VERSION__","0.1.0").encode())' < Info.plist.template` and the same for `entitlements.plist`
-- [ ] gate passes (no Rust changes, but CI runs it)
+- [x] the three scripts per Solution Overview; `shellcheck scripts/*.sh` clean
+- [x] `ekctl-LICENSE.txt`: "ekctl by schappim, MIT License, https://github.com/schappim/ekctl", with the MIT text
+- [x] both workflows per Solution Overview; the cask `caveats` text matches the README setup section
+- [x] both plists parse: `python3 -c 'import plistlib,sys; plistlib.loads(sys.stdin.read().replace("__VERSION__","0.1.0").encode())' < Info.plist.template` and the same for `entitlements.plist`
+- [x] gate passes (no Rust changes, but CI runs it)
+- ⚠️ the cask `caveats` text is written first here, in the release workflow (README does not exist yet); Task 7's README setup section must match it
+- ⚠️ `shellcheck = "0.11.0"` is added to `.mise.toml` tools so `jdx/mise-action` provides it on the CI runner. In this container, shellcheck 0.11.0 and actionlint 1.7.7 ran from downloaded binaries: shellcheck and actionlint (with shellcheck on the inline `run` scripts) are clean
+- ⚠️ `fetch-ekctl.sh` was run against the real v1.8.0 asset (checksum OK, binary extracted) and with a wrong sha256 (exit 1, nothing extracted). `bundle.sh`/`build-signed.sh` refuse on Linux; the signed path is verified in Post-Completion
+- ⚠️ `zap` also carries `launchctl: "dev.pkarpovich.eventkit-bridge"`, so `brew uninstall --zap` unloads the agent before it removes the plist; it does not run on upgrades
+- ⚠️ the release workflow finds the signing identity by its SHA-1 hash (`security find-identity`, matching `Developer ID Application: ... (<team-id>)`), as does `build-signed.sh`
 
 ### Task 7: README
 
 **Files:**
 - Create: `README.md`, `CLAUDE.md`
 
-- [ ] `README.md` (public-facing, full sentences):
+- [x] `README.md` (public-facing, full sentences):
   - what it is and the security model;
   - install with `brew install --cask pkarpovich/apps/eventkit-bridge`;
   - first run: write the config with `listen`, `eventkit-bridge --check-config`, `eventkit-bridge install`, approve the prompt, read the calendar ids from the log, fill `read_calendars` and `write_calendar`, `install` again;
@@ -438,18 +461,22 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
   - troubleshooting (`ekctl failed` -> check the grant in System Settings, `tccutil reset Calendar dev.pkarpovich.eventkit-bridge`; alive only after login after a reboot with FileVault);
   - releasing (tag flow, the seven secrets and where they come from);
   - credits to `ekctl`
-- [ ] `CLAUDE.md`: the code conventions from Code-Quality Rules; the rule that only `ekctl.rs` builds argv; the never-logged fields; that the bundle id must never change because it keys the TCC grant
-- [ ] gate passes
+- [x] `CLAUDE.md`: the code conventions from Code-Quality Rules; the rule that only `ekctl.rs` builds argv; the never-logged fields; that the bundle id must never change because it keys the TCC grant
+- [x] gate passes
+- ⚠️ the README documents `413` for bodies over 64 KiB (axum's body-limit rejection) and `405` for unsupported methods, alongside the `400`/`403`/`404`/`502`/`504` mapping. The setup section matches the cask `caveats` in `release.yml`, including the example address `100.64.0.1:8790`
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] every route, rule and status in Solution Overview has a test
-- [ ] `mise run check` green, `shellcheck` clean
+- [x] every route, rule and status in Solution Overview has a test
+- [x] `mise run check` green, `shellcheck` clean
+- ⚠️ the audit found two untested daemon paths in `src/main.rs`; tests now cover a `listen` address that cannot be bound (the daemon returns `cannot listen on <addr>: ...`) and the shutdown future resolving when the executable is removed
+- ⚠️ `mise run check` works in this container now (198 + 13 tests); shellcheck 0.11.0 is clean
 
 ### Task 9: [Final] Documentation
 
-- [ ] README matches the code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README matches the code
+- [x] move this plan to `docs/plans/completed/`
+- ⚠️ the README was checked against the CLI, config, routes, messages, bounds, status mapping, health reasons, log format, LaunchAgent paths and the cask caveats; the only change was adding the timestamp prefix `tracing` writes to the example log lines
 
 ## Technical Details
 
