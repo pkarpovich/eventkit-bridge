@@ -1,0 +1,18 @@
+{
+  "creationDate" : "2026-10-04T10:00:00Z",
+  "dueDateIsAllDay" : false,
+  "id" : "3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A",
+  "isCompleted" : false,
+  "lastModifiedDate" : "2026-10-04T10:00:00Z",
+  "listID" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+  "listName" : "Shopping",
+  "locationTrigger" : {
+    "address" : "1 Example Street, Exampletown",
+    "latitude" : 50.0001,
+    "longitude" : 10.0001,
+    "proximity" : "leaving",
+    "radius" : 150
+  },
+  "priority" : "none",
+  "title" : "Batteries"
+}

@@ -206,11 +206,12 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 - Create: `src/remindctl.rs`, `src/reminders_model.rs`
 - Create: `fixtures/remindctl_list.json`, `remindctl_show.json`, `remindctl_info.json`, `remindctl_info_location.json`, `remindctl_add.json`, `remindctl_edit.json`, `remindctl_delete.json`, `remindctl_status.json` (shapes from Context, with placeholder ids, titles and coordinates)
 - Modify: `src/ekctl.rs` (share the lock)
+- ⚠️ Create: `src/subprocess.rs`. The spawn, deadline, output cap and stderr tail moved here from `ekctl.rs`, together with the `StoreLock` both runners share, so `remindctl.rs` reuses them instead of copying them.
 
-- [ ] a runner for `remindctl` sharing the `ekctl` runner's lock; the error mapping from Solution Overview
-- [ ] argv builders for every command, plus the UUID check
-- [ ] serde types and conversion to `List`/`Reminder`: `due` converted from UTC to the local zone, or to a date for all-day; `repeat` mapped or `custom`. Place resolution by exact address match against the config; addresses and coordinates dropped
-- [ ] tests:
+- [x] a runner for `remindctl` sharing the `ekctl` runner's lock; the error mapping from Solution Overview
+- [x] argv builders for every command, plus the UUID check
+- [x] serde types and conversion to `List`/`Reminder`: `due` converted from UTC to the local zone, or to a date for all-day; `repeat` mapped or `custom`. Place resolution by exact address match against the config; addresses and coordinates dropped
+- [x] tests:
   - each fixture parses;
   - exact argv per builder, including a `-`-leading title and `--` before ids;
   - an index-like id (`1`, a prefix) rejected before exec;
@@ -218,7 +219,7 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - other stderr -> upstream error with the tail;
   - timeout;
   - a reminder call and a calendar call never overlap (the fake records start and end)
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 3: Policy for lists
 

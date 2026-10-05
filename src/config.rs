@@ -55,7 +55,8 @@ impl fmt::Display for CalendarId {
 }
 
 /// A reminder list identifier, always a full UUID so `remindctl` never reads it as a row index.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct ListId(String);
 
 impl ListId {
@@ -73,6 +74,20 @@ impl ListId {
     }
 }
 
+impl TryFrom<String> for ListId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<ListId> for String {
+    fn from(id: ListId) -> Self {
+        id.0
+    }
+}
+
 impl fmt::Display for ListId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -80,7 +95,8 @@ impl fmt::Display for ListId {
 }
 
 /// The name a client uses to pick a configured place for a location trigger.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct PlaceName(String);
 
 impl PlaceName {

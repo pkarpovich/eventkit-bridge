@@ -1,0 +1,88 @@
+[
+  {
+    "creationDate" : "2026-10-01T08:12:45Z",
+    "dueDateIsAllDay" : false,
+    "id" : "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D",
+    "isCompleted" : false,
+    "lastModifiedDate" : "2026-10-01T08:12:45Z",
+    "listID" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+    "listName" : "Shopping",
+    "priority" : "none",
+    "title" : "Milk"
+  },
+  {
+    "alarmDate" : "2026-10-06T07:00:00Z",
+    "creationDate" : "2026-10-02T18:00:00Z",
+    "dueDate" : "2026-10-06T07:00:00Z",
+    "dueDateIsAllDay" : false,
+    "id" : "1B2C3D4E-5F6A-4B7C-9D8E-0F1A2B3C4D5E",
+    "isCompleted" : false,
+    "lastModifiedDate" : "2026-10-02T18:00:00Z",
+    "listID" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+    "listName" : "Shopping",
+    "notes" : "Example notes",
+    "priority" : "high",
+    "recurrenceRule" : {
+      "frequency" : "monthly",
+      "interval" : 1
+    },
+    "title" : "Pay for the box"
+  },
+  {
+    "creationDate" : "2026-10-03T09:30:00Z",
+    "dueDate" : "2026-10-06T22:00:00Z",
+    "dueDateIsAllDay" : true,
+    "id" : "2C3D4E5F-6A7B-4C8D-AE9F-1A2B3C4D5E6F",
+    "isCompleted" : false,
+    "lastModifiedDate" : "2026-10-03T09:30:00Z",
+    "listID" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+    "listName" : "Shopping",
+    "priority" : "low",
+    "recurrenceRule" : {
+      "frequency" : "weekly",
+      "interval" : 2
+    },
+    "title" : "Water filter"
+  },
+  {
+    "creationDate" : "2026-10-04T10:00:00Z",
+    "dueDateIsAllDay" : false,
+    "id" : "3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A",
+    "isCompleted" : false,
+    "lastModifiedDate" : "2026-10-04T10:00:00Z",
+    "listID" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+    "listName" : "Shopping",
+    "locationTrigger" : {
+      "address" : "1 Example Street, Exampletown",
+      "latitude" : 50.0001,
+      "longitude" : 10.0001,
+      "proximity" : "arriving",
+      "radius" : 150
+    },
+    "priority" : "medium",
+    "recurrenceRule" : {
+      "frequency" : "daily",
+      "interval" : 3
+    },
+    "title" : "Batteries"
+  },
+  {
+    "completionDate" : "2026-10-04T16:45:10Z",
+    "creationDate" : "2026-09-30T07:00:00Z",
+    "dueDateIsAllDay" : false,
+    "id" : "4E5F6A7B-8C9D-4EAF-80B1-3C4D5E6F7A8B",
+    "isCompleted" : true,
+    "lastModifiedDate" : "2026-10-04T16:45:10Z",
+    "listID" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+    "listName" : "Shopping",
+    "locationTrigger" : {
+      "address" : "99 Elsewhere Road, Othertown",
+      "latitude" : 50.0002,
+      "longitude" : 10.0002,
+      "proximity" : "leaving",
+      "radius" : 100
+    },
+    "priority" : "none",
+    "title" : "Bread"
+  }
+]

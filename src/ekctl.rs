@@ -1,17 +1,13 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveTime, SecondsFormat, Weekday};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, MutexGuard};
-use tokio::time;
+use tokio::sync::MutexGuard;
 use url::Url;
 
 use crate::config::CalendarId;
@@ -19,13 +15,11 @@ use crate::model::{
     EkCalendar, EkCalendarList, EkDeleted, EkEventEnvelope, EkEventList, EkFree, EkWritten,
     EkWrittenEvent, Event, EventId, FreeSlots,
 };
+use crate::subprocess::{self, Output, RunError, StoreLock};
 
 /// How long one `ekctl` invocation may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
-const STDOUT_CAP: usize = 8 * 1024 * 1024;
-const STDERR_TAIL: usize = 500;
-const READ_CHUNK: usize = 64 * 1024;
 const EVENT_NOT_FOUND: &str = "Event not found";
 
 /// Why an `ekctl` invocation produced no usable result.
@@ -60,6 +54,17 @@ pub enum EkctlError {
     /// `ekctl`'s stdout was not the JSON shape the command produces.
     #[error("unexpected ekctl output")]
     UnexpectedOutput,
+}
+
+impl From<RunError> for EkctlError {
+    fn from(err: RunError) -> Self {
+        match err {
+            RunError::Spawn(source) => EkctlError::Spawn(source),
+            RunError::Io(source) => EkctlError::Io(source),
+            RunError::Timeout => EkctlError::Timeout,
+            RunError::OutputTooLarge => EkctlError::OutputTooLarge,
+        }
+    }
 }
 
 fn exit_message(code: Option<i32>, reason: &str) -> String {
@@ -476,7 +481,7 @@ fn delete_event(id: &EventId) -> Invocation {
 pub struct Runner {
     program: PathBuf,
     timeout: Duration,
-    lock: Mutex<()>,
+    lock: StoreLock,
 }
 
 /// Exclusive use of the runner; every call made through one session runs under the same lock.
@@ -486,25 +491,24 @@ pub struct Session<'a> {
     _guard: MutexGuard<'a, ()>,
 }
 
-struct Collected {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    status: ExitStatus,
-}
-
 impl Runner {
     /// A runner for the `ekctl` at `program`, killing any invocation that outlives `timeout`.
     pub fn new(program: PathBuf, timeout: Duration) -> Self {
         Self {
             program,
             timeout,
-            lock: Mutex::new(()),
+            lock: StoreLock::default(),
         }
+    }
+
+    /// The lock this runner's sessions hold, for other EventKit runners to share.
+    pub fn lock(&self) -> StoreLock {
+        self.lock.clone()
     }
 
     /// Waits for every other session to end and starts a new one.
     pub async fn session(&self) -> Session<'_> {
-        let guard = self.lock.lock().await;
+        let guard = self.lock.acquire().await;
         Session {
             runner: self,
             _guard: guard,
@@ -518,29 +522,11 @@ impl Runner {
     }
 
     async fn run_child(&self, invocation: &Invocation) -> Result<Vec<u8>, EkctlError> {
-        let mut child = Command::new(&self.program)
-            .args(&invocation.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(EkctlError::Spawn)?;
-        let collected = match time::timeout(self.timeout, collect(&mut child)).await {
-            Ok(collected) => collected,
-            Err(_elapsed) => Err(EkctlError::Timeout),
-        };
-        let Collected {
+        let Output {
             stdout,
             stderr,
             status,
-        } = match collected {
-            Ok(collected) => collected,
-            Err(err) => {
-                kill(&mut child).await;
-                return Err(err);
-            }
-        };
+        } = subprocess::run(&self.program, &invocation.args, self.timeout).await?;
         if !status.success() {
             let reason = match envelope_error(&stdout) {
                 Some(message) => message,
@@ -643,58 +629,6 @@ fn outcome(result: &Result<Vec<u8>, EkctlError>) -> CallOutcome {
     }
 }
 
-async fn collect(child: &mut Child) -> Result<Collected, EkctlError> {
-    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err(EkctlError::Io(io::Error::other(
-            "ekctl output pipes are missing",
-        )));
-    };
-    let (stdout, stderr) = tokio::try_join!(read_capped(stdout), read_tail(stderr))?;
-    let status = child.wait().await.map_err(EkctlError::Io)?;
-    Ok(Collected {
-        stdout,
-        stderr,
-        status,
-    })
-}
-
-async fn kill(child: &mut Child) {
-    if let Err(err) = child.kill().await {
-        tracing::warn!(error = %err, "could not kill ekctl");
-    }
-}
-
-async fn read_capped(mut pipe: impl AsyncRead + Unpin) -> Result<Vec<u8>, EkctlError> {
-    let mut output = Vec::new();
-    let mut chunk = vec![0; READ_CHUNK];
-    loop {
-        let read = pipe.read(&mut chunk).await.map_err(EkctlError::Io)?;
-        if read == 0 {
-            return Ok(output);
-        }
-        output.extend_from_slice(&chunk[..read]);
-        if output.len() > STDOUT_CAP {
-            return Err(EkctlError::OutputTooLarge);
-        }
-    }
-}
-
-async fn read_tail(mut pipe: impl AsyncRead + Unpin) -> Result<Vec<u8>, EkctlError> {
-    let mut tail = Vec::new();
-    let mut chunk = vec![0; READ_CHUNK];
-    loop {
-        let read = pipe.read(&mut chunk).await.map_err(EkctlError::Io)?;
-        if read == 0 {
-            return Ok(tail);
-        }
-        tail.extend_from_slice(&chunk[..read]);
-        if tail.len() > STDERR_TAIL {
-            let excess = tail.len() - STDERR_TAIL;
-            tail.drain(..excess);
-        }
-    }
-}
-
 fn parse<T: DeserializeOwned>(subcommand: Subcommand, stdout: &[u8]) -> Result<T, EkctlError> {
     let Ok(value) = serde_json::from_slice::<Value>(stdout) else {
         return Err(EkctlError::UnexpectedOutput);
@@ -737,9 +671,12 @@ fn reported(subcommand: Subcommand, message: &str) -> EkctlError {
 mod tests {
     use std::sync::Arc;
 
+    use tokio::time;
+
     use super::*;
     use crate::fake_ekctl::{Fake, fixture};
     use crate::model::CalendarKind;
+    use crate::subprocess::{READ_CHUNK, STDERR_TAIL, STDOUT_CAP};
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
     const WRITE_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
