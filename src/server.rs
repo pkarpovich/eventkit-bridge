@@ -2735,6 +2735,48 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn reminder_routes_refuse_unknown_hosts_and_large_bodies() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let routes = [
+            (Method::GET, "/v1/lists"),
+            (Method::GET, "/v1/places"),
+            (Method::GET, "/v1/reminders"),
+            (Method::POST, "/v1/reminders"),
+            (Method::GET, REMINDER_PATH),
+            (Method::PATCH, REMINDER_PATH),
+            (Method::DELETE, REMINDER_PATH),
+        ];
+        for (method, uri) in routes {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header("host", "evil.example.com:8790")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&reminder_body()).unwrap()))
+                .unwrap();
+            let (status, body) = send(&router, request).await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{method} {uri}");
+            assert_eq!(
+                body,
+                error("unknown host: use the listen IP or a name from `hosts` in the config"),
+                "{method} {uri}"
+            );
+        }
+        for (method, uri) in [
+            (Method::POST, "/v1/reminders"),
+            (Method::PATCH, REMINDER_PATH),
+        ] {
+            let mut body = reminder_body();
+            body["notes"] = json!("a".repeat(BODY_LIMIT));
+            let (status, response) = send(&router, json_request(method.clone(), uri, &body)).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method}");
+            assert!(response["error"].is_string(), "{method}");
+        }
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn update_reminder() {
         let fake = reminders_fake();
         let router = reminder_app(&lists_config(), &fake);

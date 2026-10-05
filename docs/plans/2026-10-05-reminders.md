@@ -277,8 +277,8 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] every route, rule and status above has a test
-- [ ] `mise run check` green, `shellcheck` clean
+- [x] every route, rule and status above has a test
+- [x] `mise run check` green, `shellcheck` clean
 
 ### Task 7: [Final] Documentation
 
