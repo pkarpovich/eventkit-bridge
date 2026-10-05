@@ -1,12 +1,22 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use argh::FromArgs;
+use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
+use tracing::Level;
 
 use eventkit_bridge::config::Config;
+use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
+use eventkit_bridge::server::{self, App, SHUTDOWN_GRACE};
+
+const ANNOUNCE_RETRY: Duration = Duration::from_secs(30);
 
 /// Exposes the Mac's calendars over HTTP through ekctl.
 #[derive(FromArgs, Debug, PartialEq, Eq)]
@@ -108,8 +118,56 @@ fn check_config() -> Result<(), String> {
 }
 
 fn run_daemon() -> Result<(), String> {
-    load_config()?;
+    let (_path, config) = load_config()?;
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
+        .init();
+    let executable = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|err| format!("cannot resolve the running executable: {err}"))?;
+    let runner = Runner::new(config.ekctl_path(&executable), DEFAULT_TIMEOUT);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("cannot start the runtime: {err}"))?;
+    runtime.block_on(daemon(config, runner))
+}
+
+async fn daemon(config: Config, runner: Runner) -> Result<(), String> {
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .map_err(|err| format!("cannot listen on {}: {err}", config.listen))?;
+    tracing::info!(listen = %config.listen, version = env!("CARGO_PKG_VERSION"), "listening");
+    let app = Arc::new(App::new(&config, runner));
+    let announcer = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move { app.announce_calendars(ANNOUNCE_RETRY).await })
+    };
+    let result = server::serve(listener, app, shutdown_signal(), SHUTDOWN_GRACE).await;
+    announcer.abort();
+    result.map_err(|err| format!("server failed: {err}"))?;
+    tracing::info!("stopped");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot watch SIGTERM");
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %err, "cannot watch SIGINT");
+                std::future::pending::<()>().await;
+            }
+            return;
+        }
+    };
+    tokio::select! {
+        _ = terminate.recv() => tracing::info!("SIGTERM received, shutting down"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down"),
+    }
 }
 
 fn describe(path: &Path, config: &Config) -> String {

@@ -1,6 +1,8 @@
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveTime, SecondsFormat, Weekday};
@@ -207,6 +209,83 @@ impl Subcommand {
             Subcommand::UpdateEvent => &["update", "event"],
             Subcommand::DeleteEvent => &["delete", "event"],
         }
+    }
+}
+
+/// How one `ekctl` invocation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// `ekctl` could not be started.
+    NotStarted,
+    /// `ekctl` exited with this code.
+    Exited(i32),
+    /// A signal ended `ekctl`.
+    Signalled,
+    /// `ekctl` ran past its deadline and was killed.
+    TimedOut,
+    /// The bridge stopped reading and killed `ekctl`.
+    Killed,
+}
+
+/// One `ekctl` invocation, as the request log reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Call {
+    /// The subcommand that ran.
+    pub subcommand: Subcommand,
+    /// How it ended.
+    pub outcome: CallOutcome,
+}
+
+impl fmt::Display for Call {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Call {
+            subcommand,
+            outcome,
+        } = self;
+        let subcommand = subcommand.as_str();
+        match outcome {
+            CallOutcome::NotStarted => write!(f, "{subcommand}=not started"),
+            CallOutcome::Exited(code) => write!(f, "{subcommand}={code}"),
+            CallOutcome::Signalled => write!(f, "{subcommand}=signalled"),
+            CallOutcome::TimedOut => write!(f, "{subcommand}=timeout"),
+            CallOutcome::Killed => write!(f, "{subcommand}=killed"),
+        }
+    }
+}
+
+tokio::task_local! {
+    static CALLS: CallLog;
+}
+
+/// Collects the `ekctl` invocations made by a future run through [`CallLog::scope`].
+#[derive(Debug, Clone, Default)]
+pub struct CallLog(Arc<std::sync::Mutex<Vec<Call>>>);
+
+impl CallLog {
+    /// Runs `future`, recording every `ekctl` invocation it makes on this task.
+    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        CALLS.scope(self.clone(), future).await
+    }
+
+    /// The invocations recorded so far, in order.
+    pub fn calls(&self) -> Vec<Call> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record(subcommand: Subcommand, outcome: CallOutcome) {
+        let recorded = CALLS.try_with(|log| {
+            log.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Call {
+                    subcommand,
+                    outcome,
+                });
+        });
+        recorded.ok();
     }
 }
 
@@ -433,6 +512,12 @@ impl Runner {
     }
 
     async fn run(&self, invocation: &Invocation) -> Result<Vec<u8>, EkctlError> {
+        let result = self.run_child(invocation).await;
+        CallLog::record(invocation.subcommand, outcome(&result));
+        result
+    }
+
+    async fn run_child(&self, invocation: &Invocation) -> Result<Vec<u8>, EkctlError> {
         let mut child = Command::new(&self.program)
             .args(&invocation.args)
             .stdin(Stdio::null())
@@ -529,6 +614,29 @@ impl Session<'_> {
     async fn execute<T: DeserializeOwned>(&self, invocation: &Invocation) -> Result<T, EkctlError> {
         let stdout = self.runner.run(invocation).await?;
         parse(invocation.subcommand, &stdout)
+    }
+}
+
+fn outcome(result: &Result<Vec<u8>, EkctlError>) -> CallOutcome {
+    let err = match result {
+        Ok(_) => return CallOutcome::Exited(0),
+        Err(err) => err,
+    };
+    match err {
+        EkctlError::Spawn(_) => CallOutcome::NotStarted,
+        EkctlError::Timeout => CallOutcome::TimedOut,
+        EkctlError::Io(_) | EkctlError::OutputTooLarge => CallOutcome::Killed,
+        EkctlError::Exit {
+            code: Some(code),
+            stderr: _,
+        } => CallOutcome::Exited(*code),
+        EkctlError::Exit {
+            code: None,
+            stderr: _,
+        } => CallOutcome::Signalled,
+        EkctlError::NotFound(_) | EkctlError::Reported(_) | EkctlError::UnexpectedOutput => {
+            CallOutcome::Exited(0)
+        }
     }
 }
 
@@ -1177,6 +1285,63 @@ mod tests {
         let EkctlError::UnexpectedOutput = err else {
             panic!("unexpected error: {err:?}");
         };
+    }
+
+    #[tokio::test]
+    async fn call_log_records_calls_made_in_scope() {
+        let fake = Fake::new("exit 4");
+        let runner = fake.runner();
+        let log = CallLog::default();
+        log.scope(async {
+            runner.session().await.list_calendars().await.unwrap_err();
+            runner
+                .session()
+                .await
+                .show_event(&event_id(EVENT_ID))
+                .await
+                .unwrap_err();
+        })
+        .await;
+        runner.session().await.list_calendars().await.unwrap_err();
+        let calls = log.calls();
+        assert_eq!(
+            calls,
+            vec![
+                Call {
+                    subcommand: Subcommand::ListCalendars,
+                    outcome: CallOutcome::Exited(4),
+                },
+                Call {
+                    subcommand: Subcommand::ShowEvent,
+                    outcome: CallOutcome::Exited(4),
+                },
+            ]
+        );
+        assert_eq!(calls[0].to_string(), "list calendars=4");
+    }
+
+    #[tokio::test]
+    async fn call_log_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = Runner::new(dir.path().join("ekctl"), Duration::from_secs(5));
+        let reported = Fake::printing("error.json");
+        let reported_runner = reported.runner();
+        let log = CallLog::default();
+        log.scope(async {
+            missing.session().await.list_calendars().await.unwrap_err();
+            reported_runner
+                .session()
+                .await
+                .show_event(&event_id("nonexistent-id"))
+                .await
+                .unwrap_err();
+        })
+        .await;
+        let mut rendered = Vec::new();
+        for call in log.calls() {
+            rendered.push(call.to_string());
+        }
+        assert_eq!(rendered, vec!["list calendars=not started", "show event=0"]);
     }
 
     #[tokio::test]

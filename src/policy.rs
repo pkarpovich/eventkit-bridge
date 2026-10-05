@@ -8,6 +8,12 @@ pub enum PolicyError {
     /// A requested calendar is outside the readable set.
     #[error("calendar not readable: {0}")]
     CalendarNotReadable(CalendarId),
+    /// A read names no calendar and the config makes none readable.
+    #[error("no readable calendars configured")]
+    NoReadableCalendars,
+    /// A requested event lives in a calendar outside the readable set.
+    #[error("event is not in a readable calendar")]
+    EventNotReadable,
     /// A write was requested but the config names no write calendar.
     #[error("no write calendar configured")]
     NoWriteCalendar,
@@ -89,10 +95,14 @@ impl Policy {
     }
 
     /// The calendars a read touches: `ids` without duplicates, or the default read set when
-    /// `ids` is empty. Refuses the first id that is not readable.
+    /// `ids` is empty. Refuses the first id that is not readable, and an empty read set.
     pub fn require_readable(&self, ids: Vec<CalendarId>) -> Result<Vec<CalendarId>, PolicyError> {
         if ids.is_empty() {
-            return Ok(self.default_read_set());
+            let all = self.default_read_set();
+            if all.is_empty() {
+                return Err(PolicyError::NoReadableCalendars);
+            }
+            return Ok(all);
         }
         let mut required = Vec::new();
         for id in ids {
@@ -104,6 +114,14 @@ impl Policy {
             }
         }
         Ok(required)
+    }
+
+    /// Refuses an event whose calendar is not readable.
+    pub fn require_event_readable(&self, event: &Event) -> Result<(), PolicyError> {
+        if !self.readable(&event.calendar.id) {
+            return Err(PolicyError::EventNotReadable);
+        }
+        Ok(())
     }
 
     /// Shows the event `id` through `session` and returns it when it lives in the write
@@ -130,7 +148,7 @@ mod tests {
 
     use super::*;
     use crate::fake_ekctl::{Fake, fixture};
-    use crate::model::EkCalendarList;
+    use crate::model::{EkCalendarList, EkEventEnvelope};
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
     const WRITE_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
@@ -246,6 +264,35 @@ mod tests {
         ];
         assert_eq!(policy.default_read_set(), expected);
         assert_eq!(policy.require_readable(Vec::new()), Ok(expected));
+    }
+
+    #[test]
+    fn empty_request_with_nothing_readable_is_refused() {
+        let policy = policy("listen = \"127.0.0.1:8790\"");
+        assert_eq!(
+            policy.require_readable(Vec::new()),
+            Err(PolicyError::NoReadableCalendars)
+        );
+        assert_eq!(
+            policy.require_readable(vec![calendar_id(READ_ID)]),
+            Err(PolicyError::CalendarNotReadable(calendar_id(READ_ID)))
+        );
+    }
+
+    #[test]
+    fn event_readability() {
+        let EkEventEnvelope { event } = serde_json::from_str(&show_event_in(OTHER_ID)).unwrap();
+        assert_eq!(
+            read_and_write().require_event_readable(&Event::from(event)),
+            Err(PolicyError::EventNotReadable)
+        );
+        let EkEventEnvelope { event } = serde_json::from_str(&show_event_in(WRITE_ID)).unwrap();
+        let event = Event::from(event);
+        assert_eq!(read_and_write().require_event_readable(&event), Ok(()));
+        assert_eq!(
+            read_only().require_event_readable(&event),
+            Err(PolicyError::EventNotReadable)
+        );
     }
 
     #[test]

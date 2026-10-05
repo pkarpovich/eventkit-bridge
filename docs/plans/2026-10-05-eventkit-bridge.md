@@ -373,15 +373,15 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `src/server.rs`, `src/health.rs`
 - Modify: `src/main.rs`
 
-- [ ] router with every route, the 64 KiB body limit, query and body validation exactly as in Solution Overview, and the status mapping from runner and policy errors to `{"error":...}` bodies
-- [ ] `health.rs`: the cached and collapsed check with the four degraded reasons
-- [ ] `main.rs`: the daemon:
+- [x] router with every route, the 64 KiB body limit, query and body validation exactly as in Solution Overview, and the status mapping from runner and policy errors to `{"error":...}` bodies
+- [x] `health.rs`: the cached and collapsed check with the four degraded reasons
+- [x] `main.rs`: the daemon:
   - tracing to stdout;
   - bind `listen`; on failure, exit non-zero with the reason and let launchd retry;
   - the startup calendar listing;
   - serve until SIGTERM or swap (Task 5 wires swap), with the 25 s graceful bound
-- [ ] request logging per Solution Overview. A test captures the log output (a `tracing` subscriber writing to a buffer) and asserts that a request with a title, notes, location, url and attendees leaves none of them in the log
-- [ ] tests through `oneshot`:
+- [x] request logging per Solution Overview. A test captures the log output (a `tracing` subscriber writing to a buffer) and asserts that a request with a title, notes, location, url and attendees leaves none of them in the log
+- [x] tests through `oneshot`:
   - each route's success;
   - each `400` validation rule;
   - `403` for non-readable calendars, writes without a write calendar, and update/delete of a user event (the fake records that no `update`/`delete` ran);
@@ -391,7 +391,16 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
   - `502`/`504` mapping;
   - healthz ok, unconfigured, timeout, ekctl failed and calendar missing;
   - cache reuse (the fake counts calls)
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ query and body parsing and validation live in `src/request.rs` (pure, unit-tested); `server.rs` holds the routes, error mapping, logging and `serve`
+- ⚠️ fractional seconds are rejected with `400` (`.000` is accepted), so the whole-second argv never silently truncates a client's time. A `+` offset sent unencoded in a query (decoded to a space) is restored
+- ⚠️ unknown query parameters, unknown body fields (`deny_unknown_fields`) and repeated single-valued parameters are `400`. A `null` field in `PATCH` means unchanged
+- ⚠️ a read with no `calendar` and nothing readable answers `403 no readable calendars configured` instead of calling `ekctl` with an empty list. `GET /v1/events/{id}` on an event in a non-readable calendar answers `403 event is not in a readable calendar` (the calendar id is not echoed). `/v1/events` also drops any event `ekctl` returns from a non-readable calendar
+- ⚠️ `weekdays` ranges must run forward (`fri-mon` is `400`); day names are case-insensitive
+- ⚠️ `/healthz` `calendars` is the count of readable calendars that exist as event calendars; a configured reminder-list id counts as `calendar missing`
+- ⚠️ the request log line carries `ekctl="show event=0, update event=0"` (subcommand=exit code, or `timeout`/`not started`/`killed`/`signalled`), collected through a task-local `CallLog` in `ekctl.rs`. Unknown routes log `route=unmatched`; `404`/`405` bodies are JSON too
+- ⚠️ the startup calendar listing retries every 30 s until `list calendars` first succeeds (the grant may still be pending)
+- ⚠️ `mise` is broken in this container; the gate ran as the three cargo commands directly
 
 ### Task 5: LaunchAgent install and upgrade detection
 

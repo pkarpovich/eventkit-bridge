@@ -55,6 +55,27 @@ impl Fake {
         ))
     }
 
+    pub(crate) fn scripted(responses: &[(&str, &str)]) -> Self {
+        let mut body = String::from("printf '%s\\n' \"$*\" >> \"$LOG\"\ncase \"$1 $2\" in\n");
+        for (command, json) in responses {
+            let pattern = match *command {
+                "free" => "free\\ *".to_owned(),
+                command => format!("'{command}'"),
+            };
+            body.push_str(&format!("  {pattern}) cat <<'JSON'\n{json}\nJSON\n  ;;\n"));
+        }
+        body.push_str("  *) echo '{\"status\":\"error\",\"error\":\"unexpected call\"}' ;;\nesac");
+        Self::new(&body)
+    }
+
+    pub(crate) fn calls(&self) -> Vec<String> {
+        let mut calls = Vec::new();
+        for line in self.log().lines() {
+            calls.push(line.to_owned());
+        }
+        calls
+    }
+
     pub(crate) fn runner(&self) -> Runner {
         self.runner_with_timeout(Duration::from_secs(10))
     }
@@ -74,6 +95,10 @@ impl Fake {
         }
         args
     }
+}
+
+pub(crate) fn fixture_text(name: &str) -> String {
+    fs::read_to_string(fixture(name)).unwrap()
 }
 
 pub(crate) fn fixture(name: &str) -> PathBuf {
