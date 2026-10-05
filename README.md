@@ -55,8 +55,8 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 5. Find your calendar ids in `~/Library/Logs/eventkit-bridge.log`. After it first reads your calendars, the daemon logs one line per calendar:
 
    ```
-   INFO eventkit_bridge::server: calendar id=4F7D9489-A78F-4369-A951-213207DCFEE3 title="Calendar" source="work@example.com" readable=false writable=false
-   INFO eventkit_bridge::server: calendar id=8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10 title="Agent" source="iCloud" readable=false writable=false
+   2026-10-05T09:00:01.204518Z  INFO eventkit_bridge::server: calendar id=4F7D9489-A78F-4369-A951-213207DCFEE3 title="Calendar" source="work@example.com" readable=false writable=false
+   2026-10-05T09:00:01.204533Z  INFO eventkit_bridge::server: calendar id=8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10 title="Agent" source="iCloud" readable=false writable=false
    ```
 
    Add `read_calendars` and `write_calendar` to the config, then run
@@ -307,7 +307,7 @@ There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; 
 The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` ran, each subcommand with its exit code:
 
 ```
-INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
+2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
 ```
 
 Policy refusals log their reason. Event titles, notes, locations, URLs and attendees are never logged; the only calendar details in the log are the startup listing of ids, titles and accounts.

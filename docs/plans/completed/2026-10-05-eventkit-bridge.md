@@ -466,8 +466,9 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 
 ### Task 9: [Final] Documentation
 
-- [ ] README matches the code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README matches the code
+- [x] move this plan to `docs/plans/completed/`
+- ⚠️ the README was checked against the CLI, config, routes, messages, bounds, status mapping, health reasons, log format, LaunchAgent paths and the cask caveats; the only change was adding the timestamp prefix `tracing` writes to the example log lines
 
 ## Technical Details
 
