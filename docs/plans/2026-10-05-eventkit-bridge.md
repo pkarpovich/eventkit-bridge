@@ -442,7 +442,7 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 **Files:**
 - Create: `README.md`, `CLAUDE.md`
 
-- [ ] `README.md` (public-facing, full sentences):
+- [x] `README.md` (public-facing, full sentences):
   - what it is and the security model;
   - install with `brew install --cask pkarpovich/apps/eventkit-bridge`;
   - first run: write the config with `listen`, `eventkit-bridge --check-config`, `eventkit-bridge install`, approve the prompt, read the calendar ids from the log, fill `read_calendars` and `write_calendar`, `install` again;
@@ -453,8 +453,9 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
   - troubleshooting (`ekctl failed` -> check the grant in System Settings, `tccutil reset Calendar dev.pkarpovich.eventkit-bridge`; alive only after login after a reboot with FileVault);
   - releasing (tag flow, the seven secrets and where they come from);
   - credits to `ekctl`
-- [ ] `CLAUDE.md`: the code conventions from Code-Quality Rules; the rule that only `ekctl.rs` builds argv; the never-logged fields; that the bundle id must never change because it keys the TCC grant
-- [ ] gate passes
+- [x] `CLAUDE.md`: the code conventions from Code-Quality Rules; the rule that only `ekctl.rs` builds argv; the never-logged fields; that the bundle id must never change because it keys the TCC grant
+- [x] gate passes
+- ⚠️ the README documents `413` for bodies over 64 KiB (axum's body-limit rejection) and `405` for unsupported methods, alongside the `400`/`403`/`404`/`502`/`504` mapping. The setup section matches the cask `caveats` in `release.yml`, including the example address `100.64.0.1:8790`
 
 ### Task 8: Verify acceptance criteria
 
