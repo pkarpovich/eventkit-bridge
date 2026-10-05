@@ -235,11 +235,15 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 
 **Files:**
 - Modify: `src/server.rs`, `src/request.rs`, `src/health.rs`, `src/main.rs`
+- ⚠️ Also modified: `src/subprocess.rs` (`CallOutcome` moved here so both runners' call logs share it), `src/remindctl.rs` (its own task-local `CallLog`), `src/policy.rs` (`any_readable_list`, so `GET /v1/lists` answers `[]` without running `remindctl` when no lists are configured).
+- ⚠️ `App::new` takes `Runners { calendars, reminders }`, and `HealthCheck::check` takes a `Probe` struct (clippy's argument limit). Health also runs `remindctl list` to count the readable lists that exist, and reports `remindctl failed` (or `timeout`) when `remindctl` itself fails.
+- ⚠️ `PATCH` also refuses with `400 `repeat` needs `due`` when the change would leave a repeat rule without a due date, checked against the `info` result.
+- ⚠️ The startup listing of reminder lists runs even with no lists configured, because it is how the user finds the list ids.
 
-- [ ] the six routes with validation and status mapping; the write guard in one session; startup listing of lists and place names
-- [ ] health: `remindctl status` when lists are configured; the `lists` count; the new degraded reason
-- [ ] request logging carries `remindctl="<command>=<exit>"`. A test asserts that titles, notes, place addresses and coordinates never reach the log
-- [ ] tests through `oneshot`:
+- [x] the six routes with validation and status mapping; the write guard in one session; startup listing of lists and place names
+- [x] health: `remindctl status` when lists are configured; the `lists` count; the new degraded reason
+- [x] request logging carries `remindctl="<command>=<exit>"`. A test asserts that titles, notes, place addresses and coordinates never reach the log
+- [x] tests through `oneshot`:
   - every route's success;
   - every `400` rule, including `repeat` without `due`, a fractional-second `due` and an unknown priority;
   - `due` as a date-time and as a date map to the right argv, and `null` maps to `--clear-due`;
@@ -249,7 +253,7 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - `proximity` without `place`;
   - health ok and `reminders access missing`;
   - no `remindctl` call when no lists are configured
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 5: Bundle, release and docs
 

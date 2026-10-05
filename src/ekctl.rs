@@ -15,7 +15,7 @@ use crate::model::{
     EkCalendar, EkCalendarList, EkDeleted, EkEventEnvelope, EkEventList, EkFree, EkWritten,
     EkWrittenEvent, Event, EventId, FreeSlots,
 };
-use crate::subprocess::{self, Output, RunError, StoreLock};
+use crate::subprocess::{self, CallOutcome, Output, RunError, StoreLock};
 
 /// How long one `ekctl` invocation may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -217,21 +217,6 @@ impl Subcommand {
     }
 }
 
-/// How one `ekctl` invocation ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallOutcome {
-    /// `ekctl` could not be started.
-    NotStarted,
-    /// `ekctl` exited with this code.
-    Exited(i32),
-    /// A signal ended `ekctl`.
-    Signalled,
-    /// `ekctl` ran past its deadline and was killed.
-    TimedOut,
-    /// The bridge stopped reading and killed `ekctl`.
-    Killed,
-}
-
 /// One `ekctl` invocation, as the request log reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Call {
@@ -247,14 +232,7 @@ impl fmt::Display for Call {
             subcommand,
             outcome,
         } = self;
-        let subcommand = subcommand.as_str();
-        match outcome {
-            CallOutcome::NotStarted => write!(f, "{subcommand}=not started"),
-            CallOutcome::Exited(code) => write!(f, "{subcommand}={code}"),
-            CallOutcome::Signalled => write!(f, "{subcommand}=signalled"),
-            CallOutcome::TimedOut => write!(f, "{subcommand}=timeout"),
-            CallOutcome::Killed => write!(f, "{subcommand}=killed"),
-        }
+        write!(f, "{}={outcome}", subcommand.as_str())
     }
 }
 

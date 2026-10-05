@@ -192,6 +192,11 @@ impl Policy {
         }
     }
 
+    /// Whether any reminder list is readable; without one, reminders are off.
+    pub fn any_readable_list(&self) -> bool {
+        !self.readable_lists.is_empty()
+    }
+
     /// Whether reads may touch the reminder list `id`.
     pub fn readable_list(&self, id: &ListId) -> bool {
         self.readable_lists.contains(id)
@@ -613,6 +618,13 @@ mod tests {
         assert!(policy.writable_list(&list_id(WRITE_ID)));
         assert!(!policy.writable_list(&list_id(READ_ID)));
         assert!(!policy.writable_list(&list_id(OTHER_ID)));
+    }
+
+    #[test]
+    fn any_readable_list() {
+        assert!(lists_read_and_write().any_readable_list());
+        assert!(lists_read_only().any_readable_list());
+        assert!(!read_and_write().any_readable_list());
     }
 
     #[test]

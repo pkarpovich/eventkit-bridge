@@ -1,4 +1,6 @@
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -8,7 +10,7 @@ use crate::config::{ListId, Place};
 use crate::reminders_model::{
     Due, Priority, Proximity, RcDeleted, RcList, RcReminder, RcStatus, ReminderId, Repeat,
 };
-use crate::subprocess::{self, Output, RunError, StoreLock};
+use crate::subprocess::{self, CallOutcome, Output, RunError, StoreLock};
 
 const REMINDER_NOT_FOUND: &str = "Reminder not found";
 const LIST_NOT_FOUND: &str = "List not found";
@@ -100,6 +102,71 @@ impl Command {
             Command::Delete => "delete",
             Command::Status => "status",
         }
+    }
+}
+
+/// One `remindctl` invocation, as the request log reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Call {
+    /// The command that ran.
+    pub command: Command,
+    /// How it ended.
+    pub outcome: CallOutcome,
+}
+
+impl fmt::Display for Call {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Call { command, outcome } = self;
+        write!(f, "{}={outcome}", command.as_str())
+    }
+}
+
+tokio::task_local! {
+    static CALLS: CallLog;
+}
+
+/// Collects the `remindctl` invocations made by a future run through [`CallLog::scope`].
+#[derive(Debug, Clone, Default)]
+pub struct CallLog(Arc<std::sync::Mutex<Vec<Call>>>);
+
+impl CallLog {
+    /// Runs `future`, recording every `remindctl` invocation it makes on this task.
+    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        CALLS.scope(self.clone(), future).await
+    }
+
+    /// The invocations recorded so far, in order.
+    pub fn calls(&self) -> Vec<Call> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record(command: Command, outcome: CallOutcome) {
+        let recorded = CALLS.try_with(|log| {
+            log.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Call { command, outcome });
+        });
+        recorded.ok();
+    }
+}
+
+fn outcome(result: &Result<Output, RunError>) -> CallOutcome {
+    match result {
+        Ok(Output {
+            stdout: _,
+            stderr: _,
+            status,
+        }) => match status.code() {
+            Some(code) => CallOutcome::Exited(code),
+            None => CallOutcome::Signalled,
+        },
+        Err(RunError::Spawn(_)) => CallOutcome::NotStarted,
+        Err(RunError::Timeout) => CallOutcome::TimedOut,
+        Err(RunError::Io(_) | RunError::OutputTooLarge) => CallOutcome::Killed,
     }
 }
 
@@ -356,11 +423,13 @@ impl Runner {
     }
 
     async fn run(&self, invocation: &Invocation) -> Result<Vec<u8>, RemindctlError> {
+        let result = subprocess::run(&self.program, &invocation.args, self.timeout).await;
+        CallLog::record(invocation.command, outcome(&result));
         let Output {
             stdout,
             stderr,
             status,
-        } = subprocess::run(&self.program, &invocation.args, self.timeout).await?;
+        } = result?;
         if status.success() {
             return Ok(stdout);
         }
@@ -977,5 +1046,72 @@ mod tests {
             fake.log(),
             "info start\ninfo end\ndelete start\ndelete end\nlist start\nlist end\n"
         );
+    }
+
+    #[tokio::test]
+    async fn call_log_records_calls_made_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = Runner::new(
+            dir.path().join("remindctl"),
+            Duration::from_secs(5),
+            StoreLock::default(),
+        );
+        let not_found = Fake::new("echo 'Reminder not found: \"x\".' >&2\nexit 1");
+        let not_found = not_found.remindctl_runner(StoreLock::default());
+        let ok = Fake::printing("remindctl_status.json");
+        let ok = ok.remindctl_runner(StoreLock::default());
+        let log = CallLog::default();
+        log.scope(async {
+            ok.session().await.status().await.unwrap();
+            not_found
+                .session()
+                .await
+                .info(&reminder_id())
+                .await
+                .unwrap_err();
+            missing.session().await.list().await.unwrap_err();
+            ok.session().await.list().await.unwrap_err();
+        })
+        .await;
+        ok.session().await.status().await.unwrap();
+        let calls = log.calls();
+        assert_eq!(
+            calls[0],
+            Call {
+                command: Command::Status,
+                outcome: CallOutcome::Exited(0),
+            }
+        );
+        let mut rendered = Vec::new();
+        for call in calls {
+            rendered.push(call.to_string());
+        }
+        assert_eq!(
+            rendered,
+            vec!["status=0", "info=1", "list=not started", "list=0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn call_log_outcomes_for_killed_children() {
+        let signalled = Fake::new("kill -9 $$");
+        let signalled = signalled.remindctl_runner(StoreLock::default());
+        let slow = Fake::new("sleep 2");
+        let slow = Runner::new(
+            slow.program().to_path_buf(),
+            Duration::from_millis(100),
+            StoreLock::default(),
+        );
+        let log = CallLog::default();
+        log.scope(async {
+            signalled.session().await.status().await.unwrap_err();
+            slow.session().await.status().await.unwrap_err();
+        })
+        .await;
+        let mut rendered = Vec::new();
+        for call in log.calls() {
+            rendered.push(call.to_string());
+        }
+        assert_eq!(rendered, vec!["status=signalled", "status=timeout"]);
     }
 }

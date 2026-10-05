@@ -14,7 +14,8 @@ use tracing::Level;
 use eventkit_bridge::config::{Config, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
-use eventkit_bridge::server::{self, App, SHUTDOWN_GRACE};
+use eventkit_bridge::remindctl;
+use eventkit_bridge::server::{self, App, Runners, SHUTDOWN_GRACE};
 use eventkit_bridge::service::{
     Agent, Housing, Installed, Service, SystemLaunchctl, Uninstalled, UnloadWait,
 };
@@ -130,13 +131,22 @@ fn run_daemon() -> Result<(), String> {
     let executable = resolve_executable()?;
     let identity = Identity::of(&executable)
         .map_err(|err| format!("cannot stat {}: {err}", executable.display()))?;
-    let runner = Runner::new(config.ekctl_path(&executable), DEFAULT_TIMEOUT);
+    let calendars = Runner::new(config.ekctl_path(&executable), DEFAULT_TIMEOUT);
+    let reminders = remindctl::Runner::new(
+        config.remindctl_path(&executable),
+        DEFAULT_TIMEOUT,
+        calendars.lock(),
+    );
+    let runners = Runners {
+        calendars,
+        reminders,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("cannot start the runtime: {err}"))?;
     let shutdown = shutdown(executable, identity);
-    runtime.block_on(daemon(config, runner, shutdown))
+    runtime.block_on(daemon(config, runners, shutdown))
 }
 
 fn resolve_executable() -> Result<PathBuf, String> {
@@ -145,17 +155,20 @@ fn resolve_executable() -> Result<PathBuf, String> {
 
 async fn daemon(
     config: Config,
-    runner: Runner,
+    runners: Runners,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|err| format!("cannot listen on {}: {err}", config.listen))?;
     tracing::info!(listen = %config.listen, version = env!("CARGO_PKG_VERSION"), "listening");
-    let app = Arc::new(App::new(&config, runner));
+    let app = Arc::new(App::new(&config, runners));
     let announcer = {
         let app = Arc::clone(&app);
-        tokio::spawn(async move { app.announce_calendars(ANNOUNCE_RETRY).await })
+        tokio::spawn(async move {
+            app.announce_calendars(ANNOUNCE_RETRY).await;
+            app.announce_lists(ANNOUNCE_RETRY).await;
+        })
     };
     let result = server::serve(
         listener,
@@ -468,8 +481,17 @@ mod tests {
         let listen = taken.local_addr().unwrap();
         let config = Config::from_toml(&format!("listen = \"{listen}\"")).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let runner = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
-        let result = daemon(config, runner, std::future::pending()).await;
+        let calendars = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
+        let reminders = remindctl::Runner::new(
+            dir.path().join("remindctl"),
+            DEFAULT_TIMEOUT,
+            calendars.lock(),
+        );
+        let runners = Runners {
+            calendars,
+            reminders,
+        };
+        let result = daemon(config, runners, std::future::pending()).await;
         let Err(message) = result else {
             panic!("the daemon started on an address in use");
         };

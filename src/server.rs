@@ -15,16 +15,19 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::Local;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{self, Instant};
 
-use crate::config::{Config, HostName};
-use crate::ekctl::{CallLog, EkctlError, Runner};
-use crate::health::{HEALTH_TTL, HealthCheck};
+use crate::config::{Config, HostName, Place};
+use crate::ekctl::{self, EkctlError};
+use crate::health::{HEALTH_TTL, HealthCheck, Probe};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
-use crate::policy::{GuardError, Policy, PolicyError};
+use crate::policy::{GuardError, Policy, PolicyError, ReminderGuardError};
+use crate::remindctl::{self, RemindctlError};
+use crate::reminders_model::{Conversion, RcReminder, Reminder, ReminderId};
 use crate::request::{self, Invalid};
 
 /// The largest request body the bridge accepts.
@@ -81,21 +84,38 @@ impl KnownHosts {
     }
 }
 
+/// The runners for the two EventKit CLIs; they share one lock.
+#[derive(Debug)]
+pub struct Runners {
+    /// Runs `ekctl` for calendars.
+    pub calendars: ekctl::Runner,
+    /// Runs `remindctl` for reminders.
+    pub reminders: remindctl::Runner,
+}
+
 /// The state every route shares.
 #[derive(Debug)]
 pub struct App {
-    runner: Runner,
+    runner: ekctl::Runner,
+    reminders: remindctl::Runner,
     policy: Policy,
+    places: Vec<Place>,
     health: HealthCheck,
     hosts: KnownHosts,
 }
 
 impl App {
-    /// The bridge for `config`, running `ekctl` through `runner`.
-    pub fn new(config: &Config, runner: Runner) -> Self {
+    /// The bridge for `config`, running `ekctl` and `remindctl` through `runners`.
+    pub fn new(config: &Config, runners: Runners) -> Self {
+        let Runners {
+            calendars,
+            reminders,
+        } = runners;
         Self {
-            runner,
+            runner: calendars,
+            reminders,
             policy: Policy::new(config),
+            places: config.places.clone(),
             health: HealthCheck::new(config, HEALTH_TTL),
             hosts: KnownHosts {
                 ip: config.listen.ip(),
@@ -134,6 +154,47 @@ impl App {
             }
         }
     }
+
+    /// Logs every configured place by name, then every reminder list with its access once
+    /// `remindctl list` succeeds, retrying every `retry` until it does. Addresses are never logged.
+    pub async fn announce_lists(&self, retry: Duration) {
+        for Place {
+            name,
+            address: _,
+            radius,
+        } in &self.places
+        {
+            tracing::info!(name = %name, radius, "place");
+        }
+        loop {
+            let lists = self.reminders.session().await.list().await;
+            match lists {
+                Ok(lists) => {
+                    for list in lists {
+                        tracing::info!(
+                            id = %list.id,
+                            title = list.title,
+                            readable = self.policy.readable_list(&list.id),
+                            writable = self.policy.writable_list(&list.id),
+                            "reminder list"
+                        );
+                    }
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "cannot list reminder lists yet, retrying");
+                    time::sleep(retry).await;
+                }
+            }
+        }
+    }
+
+    fn reminder(&self, reminder: RcReminder) -> Reminder {
+        reminder.into_reminder(Conversion {
+            places: &self.places,
+            zone: &Local,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -141,6 +202,7 @@ enum ApiError {
     BadRequest(String),
     Policy(PolicyError),
     Ekctl(EkctlError),
+    Remindctl(RemindctlError),
     Status(StatusCode, String),
 }
 
@@ -171,6 +233,21 @@ impl From<GuardError> for ApiError {
     }
 }
 
+impl From<RemindctlError> for ApiError {
+    fn from(err: RemindctlError) -> Self {
+        ApiError::Remindctl(err)
+    }
+}
+
+impl From<ReminderGuardError> for ApiError {
+    fn from(err: ReminderGuardError) -> Self {
+        match err {
+            ReminderGuardError::Denied(err) => ApiError::Policy(err),
+            ReminderGuardError::Remindctl(err) => ApiError::Remindctl(err),
+        }
+    }
+}
+
 impl From<PathRejection> for ApiError {
     fn from(rejection: PathRejection) -> Self {
         ApiError::Status(rejection.status(), rejection.body_text())
@@ -196,6 +273,19 @@ fn ekctl_status(err: &EkctlError) -> StatusCode {
     }
 }
 
+fn remindctl_status(err: &RemindctlError) -> StatusCode {
+    match err {
+        RemindctlError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        RemindctlError::NotFound(_) => StatusCode::NOT_FOUND,
+        RemindctlError::Spawn(_)
+        | RemindctlError::Io(_)
+        | RemindctlError::OutputTooLarge
+        | RemindctlError::ListNotFound(_)
+        | RemindctlError::Exit { code: _, reason: _ }
+        | RemindctlError::UnexpectedOutput => StatusCode::BAD_GATEWAY,
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -205,6 +295,7 @@ impl IntoResponse for ApiError {
                 (policy_status(&err), err.to_string())
             }
             ApiError::Ekctl(err) => (ekctl_status(&err), err.to_string()),
+            ApiError::Remindctl(err) => (remindctl_status(&err), err.to_string()),
             ApiError::Status(status, message) => (status, message),
         };
         (status, Json(json!({"error": message}))).into_response()
@@ -253,6 +344,18 @@ pub fn router(app: Arc<App>) -> Router {
                 .delete(delete_event),
         )
         .route("/v1/free", get(free))
+        .route("/v1/lists", get(list_lists))
+        .route("/v1/places", get(list_places))
+        .route(
+            "/v1/reminders",
+            get(list_reminders).post(create_reminder.layer(middleware::from_fn(require_json))),
+        )
+        .route(
+            "/v1/reminders/{id}",
+            get(show_reminder)
+                .patch(update_reminder.layer(middleware::from_fn(require_json)))
+                .delete(delete_reminder),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -311,24 +414,42 @@ async fn log_request(request: Request, next: Next) -> Response {
         None => "unmatched".to_owned(),
     };
     let started = Instant::now();
-    let calls = CallLog::default();
-    let response = calls.scope(next.run(request)).await;
+    let ekctl_calls = ekctl::CallLog::default();
+    let remindctl_calls = remindctl::CallLog::default();
+    let response = ekctl_calls
+        .scope(remindctl_calls.scope(next.run(request)))
+        .await;
     let status = response.status().as_u16();
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let calls = calls.calls();
-    if calls.is_empty() {
-        tracing::info!(%method, %route, status, duration_ms, "request");
-        return response;
-    }
-    let mut ekctl = String::new();
-    for call in calls {
-        if !ekctl.is_empty() {
-            ekctl.push_str(", ");
+    let ekctl = joined(ekctl_calls.calls());
+    let remindctl = joined(remindctl_calls.calls());
+    match (ekctl, remindctl) {
+        (None, None) => tracing::info!(%method, %route, status, duration_ms, "request"),
+        (Some(ekctl), None) => {
+            tracing::info!(%method, %route, status, duration_ms, ekctl, "request");
         }
-        ekctl.push_str(&call.to_string());
+        (None, Some(remindctl)) => {
+            tracing::info!(%method, %route, status, duration_ms, remindctl, "request");
+        }
+        (Some(ekctl), Some(remindctl)) => {
+            tracing::info!(%method, %route, status, duration_ms, ekctl, remindctl, "request");
+        }
     }
-    tracing::info!(%method, %route, status, duration_ms, ekctl, "request");
     response
+}
+
+fn joined<T: ToString>(calls: Vec<T>) -> Option<String> {
+    let mut text = String::new();
+    for call in calls {
+        if !text.is_empty() {
+            text.push_str(", ");
+        }
+        text.push_str(&call.to_string());
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some(text)
 }
 
 fn event_id(id: &str) -> Result<EventId, ApiError> {
@@ -338,9 +459,20 @@ fn event_id(id: &str) -> Result<EventId, ApiError> {
     }
 }
 
+fn reminder_id(id: &str) -> Result<ReminderId, ApiError> {
+    match ReminderId::parse(id) {
+        Ok(id) => Ok(id),
+        Err(err) => Err(ApiError::BadRequest(err.to_string())),
+    }
+}
+
 async fn healthz(State(app): Shared) -> Response {
     app.health
-        .check(&app.runner, &app.policy)
+        .check(Probe {
+            calendars: &app.runner,
+            reminders: &app.reminders,
+            policy: &app.policy,
+        })
         .await
         .into_response()
 }
@@ -457,6 +589,92 @@ async fn delete_event(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+async fn list_lists(State(app): Shared) -> Result<Response, ApiError> {
+    if !app.policy.any_readable_list() {
+        return Ok(Json(json!({ "lists": [] })).into_response());
+    }
+    let lists = app.reminders.session().await.list().await?;
+    let lists = app.policy.filter_lists(lists);
+    Ok(Json(json!({ "lists": lists })).into_response())
+}
+
+async fn list_places(State(app): Shared) -> Response {
+    let mut places = Vec::new();
+    for Place {
+        name,
+        address: _,
+        radius,
+    } in &app.places
+    {
+        places.push(json!({"name": name, "radius": radius}));
+    }
+    Json(json!({ "places": places })).into_response()
+}
+
+async fn list_reminders(
+    State(app): Shared,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let request::RemindersQuery { status, lists } = request::reminders_query(query.as_deref())?;
+    let lists = app.policy.require_readable_lists(lists)?;
+    let session = app.reminders.session().await;
+    let mut reminders = Vec::new();
+    for list in &lists {
+        for reminder in session.show(status, list).await? {
+            reminders.push(app.reminder(reminder));
+        }
+    }
+    Ok(Json(json!({ "reminders": reminders })).into_response())
+}
+
+async fn show_reminder(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Response, ApiError> {
+    let Path(id) = id?;
+    let id = reminder_id(&id)?;
+    let reminder = app.reminders.session().await.info(&id).await?;
+    app.policy.require_reminder_readable(&reminder)?;
+    Ok(Json(app.reminder(reminder)).into_response())
+}
+
+async fn create_reminder(
+    State(app): Shared,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let reminder = request::create_reminder_body(&body?, &app.places)?;
+    app.policy.require_writable_list(&reminder.list)?;
+    let created = app.reminders.session().await.add(&reminder).await?;
+    Ok((StatusCode::CREATED, Json(app.reminder(created))).into_response())
+}
+
+async fn update_reminder(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let Path(id) = id?;
+    let id = reminder_id(&id)?;
+    let changes = request::update_reminder_body(&body?)?;
+    let session = app.reminders.session().await;
+    let existing = app.policy.guard_reminder_write(&session, &id).await?;
+    request::merged_repeat(&changes, &existing)?;
+    let updated = session.edit(&id, &changes).await?;
+    Ok(Json(app.reminder(updated)).into_response())
+}
+
+async fn delete_reminder(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Response, ApiError> {
+    let Path(id) = id?;
+    let id = reminder_id(&id)?;
+    let session = app.reminders.session().await;
+    app.policy.guard_reminder_write(&session, &id).await?;
+    session.delete(&id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 async fn empty_event_id() -> ApiError {
     ApiError::BadRequest(InvalidEventId::Empty.to_string())
 }
@@ -476,10 +694,12 @@ async fn method_not_allowed() -> ApiError {
 mod tests {
     use std::cell::RefCell;
     use std::io::Write;
+    use std::path::PathBuf;
     use std::sync::{Mutex, Once};
 
     use axum::body::Body;
     use axum::http::Method;
+    use chrono::{DateTime, SecondsFormat};
     use http_body_util::BodyExt;
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -489,6 +709,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::ekctl::Runner;
     use crate::fake_ekctl::{Fake, fixture, fixture_text};
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
@@ -517,8 +738,20 @@ mod tests {
         Config::from_toml("listen = \"127.0.0.1:8790\"").unwrap()
     }
 
+    fn runners(runner: Runner) -> Runners {
+        let reminders = remindctl::Runner::new(
+            PathBuf::from("/nonexistent/remindctl"),
+            Duration::from_secs(5),
+            runner.lock(),
+        );
+        Runners {
+            calendars: runner,
+            reminders,
+        }
+    }
+
     fn app(config: &Config, runner: Runner) -> Router {
-        router(Arc::new(App::new(config, runner)))
+        router(Arc::new(App::new(config, runners(runner))))
     }
 
     fn show_in(calendar: &str) -> String {
@@ -1515,7 +1748,7 @@ esac"#,
     async fn unknown_route_and_method() {
         let fake = Fake::printing("list_calendars.json");
         let router = app(&configured(), fake.runner());
-        let (status, body) = get(&router, "/v1/reminders").await;
+        let (status, body) = get(&router, "/v1/tasks").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, error("not found"));
         let (status, body) = send(
@@ -1804,7 +2037,7 @@ esac"#,
             "if [ -e \"$LOG\" ]; then cat '{}'; else touch \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
         ));
-        let app = App::new(&configured(), fake.runner());
+        let app = App::new(&configured(), runners(fake.runner()));
         app.announce_calendars(Duration::from_millis(10)).await;
         let log = captured.text();
         assert!(log.contains("cannot list calendars yet"), "{log}");
@@ -1825,7 +2058,7 @@ esac"#,
             "if [ -s \"$LOG\" ]; then cat '{}'; else echo failed >> \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
         ));
-        let app = Arc::new(App::new(&configured(), fake.runner()));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner())));
         let announcer = tokio::spawn({
             let app = Arc::clone(&app);
             async move { app.announce_calendars(Duration::from_secs(30)).await }
@@ -1846,7 +2079,7 @@ esac"#,
         let fake = Fake::new("sleep 5");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Arc::new(App::new(&configured(), fake.runner()));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner())));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve(
             listener,
@@ -1882,7 +2115,7 @@ esac"#,
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Arc::new(App::new(&configured(), fake.runner()));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner())));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve(
             listener,
@@ -1909,5 +2142,1069 @@ esac"#,
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         server.await.unwrap().unwrap();
+    }
+
+    const REMINDER_ID: &str = "1B2C3D4E-5F6A-4B7C-9D8E-0F1A2B3C4D5E";
+    const REMINDER_PATH: &str = "/v1/reminders/1B2C3D4E-5F6A-4B7C-9D8E-0F1A2B3C4D5E";
+    const SHOP_ADDRESS: &str = "1 Example Street, Exampletown";
+
+    fn lists_config() -> Config {
+        Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\nread_lists = [\"{READ_ID}\"]\nwrite_lists = [\"{WRITE_ID}\"]\n[places]\nshop = {{ address = \"{SHOP_ADDRESS}\", radius = 150 }}\nhome = {{ address = \"2 Home Lane, Hometown\" }}\n"
+        ))
+        .unwrap()
+    }
+
+    fn read_lists_only() -> Config {
+        Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\nread_lists = [\"{READ_ID}\"]"
+        ))
+        .unwrap()
+    }
+
+    fn reminder_app(config: &Config, fake: &Fake) -> Router {
+        let calendars = fake.runner();
+        let reminders = fake.remindctl_runner(calendars.lock());
+        router(Arc::new(App::new(
+            config,
+            Runners {
+                calendars,
+                reminders,
+            },
+        )))
+    }
+
+    fn info_in(list: &str) -> String {
+        fixture_text("remindctl_info.json").replace(WRITE_ID, list)
+    }
+
+    fn reminders_fake_with_info(info: &str) -> Fake {
+        Fake::scripted(&[
+            ("list --json", &fixture_text("remindctl_list.json")),
+            ("show open", &fixture_text("remindctl_show.json")),
+            ("show completed", &fixture_text("remindctl_show.json")),
+            ("show all", &fixture_text("remindctl_show.json")),
+            ("info --json", info),
+            ("add --json", &fixture_text("remindctl_add.json")),
+            ("edit --json", &fixture_text("remindctl_edit.json")),
+            ("delete --json", &fixture_text("remindctl_delete.json")),
+            ("status --json", &fixture_text("remindctl_status.json")),
+            ("list calendars", &fixture_text("list_calendars.json")),
+        ])
+    }
+
+    fn reminders_fake() -> Fake {
+        reminders_fake_with_info(&info_in(WRITE_ID))
+    }
+
+    fn reminder_body() -> Value {
+        json!({"list": WRITE_ID, "title": "Eggs"})
+    }
+
+    fn local(utc: &str) -> String {
+        DateTime::parse_from_rfc3339(utc)
+            .unwrap()
+            .with_timezone(&Local)
+            .to_rfc3339_opts(SecondsFormat::Secs, false)
+    }
+
+    fn local_day(utc: &str) -> String {
+        DateTime::parse_from_rfc3339(utc)
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn info_call() -> String {
+        format!("info --json --no-input -- {REMINDER_ID}")
+    }
+
+    fn assert_no_reminder_writes(fake: &Fake) {
+        for call in fake.calls() {
+            assert!(
+                !call.starts_with("add")
+                    && !call.starts_with("edit")
+                    && !call.starts_with("delete"),
+                "{call}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reminder_lists() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, "/v1/lists").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"lists": [
+                {"id": WRITE_ID, "title": "Shopping", "open": 4, "writable": true},
+                {"id": READ_ID, "title": "Personal", "open": 2, "writable": false}
+            ]})
+        );
+        assert_eq!(fake.calls(), vec!["list --json --no-input"]);
+    }
+
+    #[tokio::test]
+    async fn places_are_names_and_radii_only() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, "/v1/places").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"places": [
+                {"name": "home", "radius": 100},
+                {"name": "shop", "radius": 150}
+            ]})
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reminders_default_to_open_in_every_readable_list() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, "/v1/reminders").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("show open --json --no-input --list-id={READ_ID}"),
+                format!("show open --json --no-input --list-id={WRITE_ID}"),
+            ]
+        );
+        let reminders = body["reminders"].as_array().unwrap();
+        assert_eq!(reminders.len(), 10);
+        assert_eq!(
+            reminders[0],
+            json!({
+                "id": "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D",
+                "title": "Milk",
+                "notes": null,
+                "completed": false,
+                "completed_at": null,
+                "due": null,
+                "all_day": false,
+                "repeat": null,
+                "priority": "none",
+                "list": {"id": WRITE_ID, "title": "Shopping"},
+                "location": null,
+            })
+        );
+        assert_eq!(reminders[1]["due"], json!(local("2026-10-06T07:00:00Z")));
+        assert_eq!(reminders[1]["repeat"], json!("monthly"));
+        assert_eq!(
+            reminders[2]["due"],
+            json!(local_day("2026-10-06T22:00:00Z"))
+        );
+        assert_eq!(reminders[2]["all_day"], json!(true));
+        assert_eq!(
+            reminders[3]["location"],
+            json!({"place": "shop", "proximity": "arriving"})
+        );
+        assert_eq!(reminders[3]["repeat"], json!("custom"));
+        assert_eq!(
+            reminders[4]["location"],
+            json!({"place": null, "proximity": "leaving"})
+        );
+        assert_eq!(
+            reminders[4]["completed_at"],
+            json!(local("2026-10-04T16:45:10Z"))
+        );
+        let text = body.to_string();
+        for secret in [
+            "Example Street",
+            "Elsewhere",
+            "50.000",
+            "latitude",
+            "radius",
+        ] {
+            assert!(!text.contains(secret), "{secret} returned in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reminders_for_named_lists_and_status() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, _) = get(
+            &router,
+            &format!("/v1/reminders?status=completed&list={WRITE_ID}&list={WRITE_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, &format!("/v1/reminders?list={READ_ID}&status=all")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("show completed --json --no-input --list-id={WRITE_ID}"),
+                format!("show all --json --no-input --list-id={READ_ID}"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reminders_query_validation_and_policy() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let cases = [
+            (
+                "/v1/reminders?status=done",
+                "`status` must be open, completed or all",
+            ),
+            (
+                "/v1/reminders?status=open&status=all",
+                "`status` is given more than once",
+            ),
+            ("/v1/reminders?list=1", "`list` must be a list id"),
+            ("/v1/reminders?list=8C1E2A44", "`list` must be a list id"),
+            ("/v1/reminders?limit=3", "unknown query parameter `limit`"),
+        ];
+        for (uri, message) in cases {
+            let (status, body) = get(&router, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body, error(message), "{uri}");
+        }
+        let (status, body) = get(&router, &format!("/v1/reminders?list={OTHER_ID}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error(&format!("list not readable: {OTHER_ID}")));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reminders_off_never_run_remindctl() {
+        let fake = reminders_fake();
+        let router = reminder_app(&configured(), &fake);
+        let (status, body) = get(&router, "/v1/lists").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"lists": []}));
+        let (status, body) = get(&router, "/v1/reminders").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error("no readable lists configured"));
+        let (status, body) = send(
+            &router,
+            json_request(Method::POST, "/v1/reminders", &reminder_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error("no write lists configured"));
+        for method in [Method::PATCH, Method::DELETE] {
+            let (status, body) = send(
+                &router,
+                json_request(method.clone(), REMINDER_PATH, &json!({"title": "x"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+            assert_eq!(body, error("no write lists configured"), "{method}");
+        }
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.get("lists"), None);
+        assert_eq!(fake.calls(), vec!["list calendars"]);
+    }
+
+    #[tokio::test]
+    async fn show_reminder() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, REMINDER_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], json!(REMINDER_ID));
+        assert_eq!(body["title"], json!("Pay for the box"));
+        assert_eq!(body["due"], json!(local("2026-10-06T07:00:00Z")));
+        assert_eq!(body["repeat"], json!("weekly"));
+        assert_eq!(fake.calls(), vec![info_call()]);
+    }
+
+    #[tokio::test]
+    async fn show_reminder_with_a_place() {
+        let fake = reminders_fake_with_info(&fixture_text("remindctl_info_location.json"));
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, REMINDER_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["location"],
+            json!({"place": "shop", "proximity": "leaving"})
+        );
+        assert!(!body.to_string().contains("Example Street"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn show_reminder_in_unreadable_list() {
+        let fake = reminders_fake_with_info(&info_in(OTHER_ID));
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, REMINDER_PATH).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error("reminder is not in a readable list"));
+    }
+
+    fn not_found_fake() -> Fake {
+        Fake::new(&format!(
+            "printf '%s\\n' \"$*\" >> \"$LOG\"\necho 'Reminder not found: \"{REMINDER_ID}\".' >&2\nexit 1"
+        ))
+    }
+
+    #[tokio::test]
+    async fn reminder_not_found() {
+        let fake = not_found_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let not_found = error(&format!("Reminder not found: \"{REMINDER_ID}\"."));
+        let (status, body) = get(&router, REMINDER_PATH).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, not_found);
+        let (status, body) = send(
+            &router,
+            json_request(Method::PATCH, REMINDER_PATH, &json!({"title": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, not_found);
+        let (status, body) = send(
+            &router,
+            build_request(Method::DELETE, REMINDER_PATH, Body::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, not_found);
+        assert_eq!(fake.calls(), vec![info_call(), info_call(), info_call()]);
+    }
+
+    #[tokio::test]
+    async fn invalid_reminder_ids() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        for path in [
+            "/v1/reminders/1",
+            "/v1/reminders/1B2C3D4E",
+            "/v1/reminders/--force",
+            "/v1/reminders/1B2C3D4E-5F6A-4B7C-9D8E-0F1A2B3C4D5E%0A",
+        ] {
+            for method in [Method::GET, Method::PATCH, Method::DELETE] {
+                let (status, body) = send(
+                    &router,
+                    json_request(method.clone(), path, &json!({"title": "x"})),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+                assert_eq!(
+                    body,
+                    error("reminder id must be a full UUID"),
+                    "{method} {path}"
+                );
+            }
+        }
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_reminder_minimal() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = send(
+            &router,
+            json_request(Method::POST, "/v1/reminders", &reminder_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["title"], json!("Eggs"));
+        assert_eq!(body["list"], json!({"id": WRITE_ID, "title": "Shopping"}));
+        assert_eq!(
+            fake.calls(),
+            vec![format!(
+                "add --json --no-input --title=Eggs --list-id={WRITE_ID}"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_reminder_with_every_field() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, _) = send(
+            &router,
+            json_request(
+                Method::POST,
+                "/v1/reminders",
+                &json!({
+                    "list": WRITE_ID,
+                    "title": "-Eggs",
+                    "notes": "--json",
+                    "due": "2026-10-06T09:00:00+02:00",
+                    "repeat": "weekly",
+                    "priority": "high",
+                    "place": "shop",
+                    "proximity": "leaving"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = send(
+            &router,
+            json_request(
+                Method::POST,
+                "/v1/reminders",
+                &json!({
+                    "list": WRITE_ID,
+                    "title": "Eggs",
+                    "due": "2026-10-07",
+                    "repeat": "biweekly",
+                    "priority": "none",
+                    "place": "home"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!(
+                    "add --json --no-input --title=-Eggs --list-id={WRITE_ID} --notes=--json --due=2026-10-06T09:00:00+02:00 --repeat=weekly --priority=high --location={SHOP_ADDRESS} --radius=150 --leaving"
+                ),
+                format!(
+                    "add --json --no-input --title=Eggs --list-id={WRITE_ID} --due=2026-10-07 --repeat=biweekly --priority=none --location=2 Home Lane, Hometown --radius=100"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_reminder_validation() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let cases = [
+            ("title", json!(" \n "), "`title` must not be blank"),
+            (
+                "title",
+                json!("a".repeat(501)),
+                "`title` must be at most 500 characters",
+            ),
+            (
+                "title",
+                json!("a\u{1b}b"),
+                "`title` must not contain control characters",
+            ),
+            (
+                "notes",
+                json!("a".repeat(10_001)),
+                "`notes` must be at most 10000 characters",
+            ),
+            (
+                "notes",
+                json!("a\u{0}b"),
+                "`notes` must not contain control characters",
+            ),
+            ("list", json!("1"), "`list` must be a list id"),
+            (
+                "due",
+                json!("tomorrow"),
+                "`due` must be an RFC 3339 timestamp or YYYY-MM-DD",
+            ),
+            (
+                "due",
+                json!("2026-10-06T09:00:00"),
+                "`due` must be an RFC 3339 timestamp or YYYY-MM-DD",
+            ),
+            (
+                "due",
+                json!("2026-13-01"),
+                "`due` must be an RFC 3339 timestamp or YYYY-MM-DD",
+            ),
+            (
+                "due",
+                json!("2026-10-06T09:00:00.5+02:00"),
+                "`due` must not have fractional seconds",
+            ),
+            ("repeat", json!("weekly"), "`repeat` needs `due`"),
+            (
+                "priority",
+                json!("urgent"),
+                "`priority` must be none, low, medium or high",
+            ),
+            (
+                "place",
+                json!("office"),
+                "`place` must be a configured place name",
+            ),
+            ("proximity", json!("arriving"), "`proximity` needs `place`"),
+        ];
+        for (key, value, message) in cases {
+            let mut body = reminder_body();
+            body[key] = value;
+            let (status, body) =
+                send(&router, json_request(Method::POST, "/v1/reminders", &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
+            assert_eq!(body, error(message), "{key}");
+        }
+        let bodies = [
+            (
+                json!({"list": WRITE_ID, "title": "x", "due": "2026-10-07", "repeat": "hourly"}),
+                "`repeat` must be daily, weekly, biweekly, monthly or yearly",
+            ),
+            (
+                json!({"list": WRITE_ID, "title": "x", "place": "shop", "proximity": "near"}),
+                "`proximity` must be arriving or leaving",
+            ),
+        ];
+        for (body, message) in bodies {
+            let (status, body) =
+                send(&router, json_request(Method::POST, "/v1/reminders", &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+            assert_eq!(body, error(message));
+        }
+        let (status, body) = send(
+            &router,
+            json_request(
+                Method::POST,
+                "/v1/reminders",
+                &json!({"list": WRITE_ID, "title": "x", "url": "https://example.com/"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown field `url`"),
+            "{body}"
+        );
+        let (status, body) = send(
+            &router,
+            json_request(Method::POST, "/v1/reminders", &json!({"title": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("missing field"));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_reminder_in_a_list_that_is_not_writable() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        for list in [READ_ID, OTHER_ID] {
+            let (status, body) = send(
+                &router,
+                json_request(
+                    Method::POST,
+                    "/v1/reminders",
+                    &json!({"list": list, "title": "Eggs"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{list}");
+            assert_eq!(body, error(&format!("list not writable: {list}")));
+        }
+        let router = reminder_app(&read_lists_only(), &fake);
+        let (status, body) = send(
+            &router,
+            json_request(Method::POST, "/v1/reminders", &reminder_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error("no write lists configured"));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reminder_writes_require_a_json_content_type() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        for (method, uri) in [
+            (Method::POST, "/v1/reminders"),
+            (Method::PATCH, REMINDER_PATH),
+        ] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header("host", HOST)
+                .header("content-type", "text/plain")
+                .body(Body::from(serde_json::to_vec(&reminder_body()).unwrap()))
+                .unwrap();
+            let (status, body) = send(&router, request).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{method}");
+            assert_eq!(body, error("content type must be application/json"));
+        }
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_reminder() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = send(
+            &router,
+            json_request(
+                Method::PATCH,
+                REMINDER_PATH,
+                &json!({"title": "-Renamed", "completed": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["completed"], json!(true));
+        assert_eq!(body["completed_at"], json!(local("2026-10-05T15:25:02Z")));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                info_call(),
+                format!("edit --json --no-input --title=-Renamed --complete -- {REMINDER_ID}"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_reminder_maps_each_field() {
+        let cases = [
+            (json!({"due": "2026-10-07"}), "--due=2026-10-07"),
+            (
+                json!({"due": "2026-10-06T09:00:00Z"}),
+                "--due=2026-10-06T09:00:00+00:00",
+            ),
+            (
+                json!({"due": null, "repeat": null}),
+                "--clear-due --no-repeat",
+            ),
+            (json!({"repeat": "yearly"}), "--repeat=yearly"),
+            (json!({"repeat": null}), "--no-repeat"),
+            (json!({"priority": "low"}), "--priority=low"),
+            (json!({"notes": "Bring\tbag"}), "--notes=Bring\tbag"),
+            (json!({"completed": false}), "--incomplete"),
+        ];
+        for (body, argv) in cases {
+            let fake = reminders_fake();
+            let router = reminder_app(&lists_config(), &fake);
+            let (status, _) =
+                send(&router, json_request(Method::PATCH, REMINDER_PATH, &body)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                fake.calls(),
+                vec![
+                    info_call(),
+                    format!("edit --json --no-input {argv} -- {REMINDER_ID}"),
+                ],
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_reminder_keeps_repeat_with_a_due_date() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = send(
+            &router,
+            json_request(Method::PATCH, REMINDER_PATH, &json!({"due": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, error("`repeat` needs `due`"));
+        assert_eq!(fake.calls(), vec![info_call()]);
+        let undated = fixture_text("remindctl_add.json")
+            .replace(r#""dueDate" : "2026-10-06T07:00:00Z","#, "");
+        let fake = reminders_fake_with_info(&undated);
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = send(
+            &router,
+            json_request(Method::PATCH, REMINDER_PATH, &json!({"repeat": "daily"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, error("`repeat` needs `due`"));
+        assert_no_reminder_writes(&fake);
+        let (status, _) = send(
+            &router,
+            json_request(Method::PATCH, REMINDER_PATH, &json!({"title": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_reminder_validation() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let cases = [
+            (json!({}), "the update changes no field"),
+            (
+                json!({"title": null, "notes": null}),
+                "the update changes no field",
+            ),
+            (json!({"title": ""}), "`title` must not be blank"),
+            (
+                json!({"priority": "urgent"}),
+                "`priority` must be none, low, medium or high",
+            ),
+            (
+                json!({"due": "2026-10-06T09:00:00.25Z"}),
+                "`due` must not have fractional seconds",
+            ),
+            (
+                json!({"repeat": "hourly"}),
+                "`repeat` must be daily, weekly, biweekly, monthly or yearly",
+            ),
+            (
+                json!({"notes": "a\rb"}),
+                "`notes` must not contain control characters",
+            ),
+        ];
+        for (body, message) in cases {
+            let (status, response) =
+                send(&router, json_request(Method::PATCH, REMINDER_PATH, &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(response, error(message), "{body}");
+        }
+        for (body, fragment) in [
+            (json!({"list": WRITE_ID}), "unknown field `list`"),
+            (json!({"place": "shop"}), "unknown field `place`"),
+            (json!({"completed": "yes"}), "invalid JSON body"),
+        ] {
+            let (status, response) =
+                send(&router, json_request(Method::PATCH, REMINDER_PATH, &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                response["error"].as_str().unwrap().contains(fragment),
+                "{response}"
+            );
+        }
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn writes_to_a_reminder_outside_the_write_lists_are_refused() {
+        for list in [READ_ID, OTHER_ID] {
+            let fake = reminders_fake_with_info(&info_in(list));
+            let router = reminder_app(&lists_config(), &fake);
+            let (status, body) = send(
+                &router,
+                json_request(Method::PATCH, REMINDER_PATH, &json!({"title": "Mine now"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{list}");
+            assert_eq!(body, error("reminder is not in a writable list"));
+            let (status, body) = send(
+                &router,
+                build_request(Method::DELETE, REMINDER_PATH, Body::empty()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{list}");
+            assert_eq!(body, error("reminder is not in a writable list"));
+            assert_eq!(fake.calls(), vec![info_call(), info_call()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn reminder_writes_without_write_lists() {
+        let fake = reminders_fake();
+        let router = reminder_app(&read_lists_only(), &fake);
+        let (status, _) = send(
+            &router,
+            json_request(Method::PATCH, REMINDER_PATH, &json!({"title": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send(
+            &router,
+            build_request(Method::DELETE, REMINDER_PATH, Body::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_reminder() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = send(
+            &router,
+            build_request(Method::DELETE, REMINDER_PATH, Body::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(body, Value::Null);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                info_call(),
+                format!("delete --json --no-input --force -- {REMINDER_ID}"),
+            ]
+        );
+    }
+
+    fn slow_reminder_guard_fake() -> Fake {
+        Fake::new(&format!(
+            r#"case "$1" in
+  info) echo info >> "$LOG"; sleep 0.3; cat <<'JSON'
+{info}
+JSON
+  ;;
+  edit) echo edit >> "$LOG"; cat '{edit}' ;;
+  delete) echo delete >> "$LOG"; cat '{delete}' ;;
+  list) echo list >> "$LOG"; cat '{list}' ;;
+esac"#,
+            info = info_in(WRITE_ID),
+            edit = fixture("remindctl_edit.json").display(),
+            delete = fixture("remindctl_delete.json").display(),
+            list = fixture("list_calendars.json").display(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn reminder_writes_hold_one_session_across_guard_and_write() {
+        let cases = [
+            (
+                Method::DELETE,
+                None,
+                StatusCode::NO_CONTENT,
+                "info\ndelete\nlist\n",
+            ),
+            (
+                Method::PATCH,
+                Some(json!({"title": "Renamed"})),
+                StatusCode::OK,
+                "info\nedit\nlist\n",
+            ),
+        ];
+        for (method, body, expected, log) in cases {
+            let fake = slow_reminder_guard_fake();
+            let router = reminder_app(&lists_config(), &fake);
+            let write = {
+                let router = router.clone();
+                let method = method.clone();
+                tokio::spawn(async move {
+                    match body {
+                        Some(body) => {
+                            send(&router, json_request(method, REMINDER_PATH, &body)).await
+                        }
+                        None => {
+                            send(&router, build_request(method, REMINDER_PATH, Body::empty())).await
+                        }
+                    }
+                })
+            };
+            while fake.log().is_empty() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            let (status, _) = get(&router, "/v1/calendars").await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = write.await.unwrap();
+            assert_eq!(status, expected, "{method}");
+            assert_eq!(fake.log(), log, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remindctl_failures_map_to_gateway_errors() {
+        let cases = [
+            (
+                format!("echo 'List not found: \"{WRITE_ID}\".' >&2\nexit 1"),
+                StatusCode::BAD_GATEWAY,
+                format!("remindctl: List not found: \"{WRITE_ID}\"."),
+            ),
+            (
+                "echo 'access denied' >&2\nexit 1".to_owned(),
+                StatusCode::BAD_GATEWAY,
+                "remindctl exited with code 1: access denied".to_owned(),
+            ),
+            (
+                "echo garbage".to_owned(),
+                StatusCode::BAD_GATEWAY,
+                "unexpected remindctl output".to_owned(),
+            ),
+        ];
+        for (script, expected, message) in cases {
+            let fake = Fake::new(&script);
+            let router = reminder_app(&lists_config(), &fake);
+            let (status, body) = get(&router, "/v1/reminders").await;
+            assert_eq!(status, expected, "{script}");
+            assert_eq!(body, error(&message), "{script}");
+        }
+        let fake = Fake::new("sleep 2");
+        let calendars = fake.runner();
+        let reminders = remindctl::Runner::new(
+            fake.program().to_path_buf(),
+            Duration::from_millis(200),
+            calendars.lock(),
+        );
+        let router = router(Arc::new(App::new(
+            &lists_config(),
+            Runners {
+                calendars,
+                reminders,
+            },
+        )));
+        let (status, body) = get(&router, "/v1/lists").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body, error("remindctl timed out"));
+    }
+
+    #[tokio::test]
+    async fn healthz_with_lists() {
+        let fake = reminders_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "lists": 2})
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "list calendars",
+                "status --json --no-input",
+                "list --json --no-input"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_reminders_access_missing() {
+        let fake = Fake::scripted(&[
+            ("list calendars", &fixture_text("list_calendars.json")),
+            (
+                "status --json",
+                r#"{"authorized": false, "status": "denied"}"#,
+            ),
+        ]);
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({"status": "degraded", "reason": "reminders access missing"})
+        );
+    }
+
+    #[tokio::test]
+    async fn reminder_request_log_carries_remindctl_but_no_content() {
+        let (captured, _guard) = capture();
+        let fake = reminders_fake_with_info(&fixture_text("remindctl_info_location.json"));
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, _) = send(
+            &router,
+            json_request(
+                Method::POST,
+                "/v1/reminders",
+                &json!({
+                    "list": WRITE_ID,
+                    "title": "Secret title",
+                    "notes": "Secret notes",
+                    "due": "2026-10-06T09:00:00+02:00",
+                    "place": "shop"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = get(&router, "/v1/reminders").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, REMINDER_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(
+            &router,
+            json_request(
+                Method::PATCH,
+                REMINDER_PATH,
+                &json!({"title": "Secret rename", "notes": "Secret change"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, "/v1/places").await;
+        assert_eq!(status, StatusCode::OK);
+        let log = captured.text();
+        for secret in [
+            "Secret",
+            "Example Street",
+            "Exampletown",
+            "Home Lane",
+            "Elsewhere",
+            "50.000",
+            "10.000",
+            "latitude",
+            "Milk",
+            "Pay for the box",
+            "Example notes",
+            "Batteries",
+            "Bread",
+            "Eggs",
+            REMINDER_ID,
+        ] {
+            assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
+        assert!(
+            log.contains(r#"method=POST route=/v1/reminders status=201"#),
+            "{log}"
+        );
+        assert!(log.contains(r#"remindctl="add=0""#), "{log}");
+        assert!(log.contains(r#"remindctl="show=0, show=0""#), "{log}");
+        assert!(log.contains(r#"remindctl="info=0, edit=0""#), "{log}");
+        assert!(
+            log.contains("method=GET route=/v1/reminders/{id} status=200"),
+            "{log}"
+        );
+        assert!(!log.contains("ekctl="), "{log}");
+    }
+
+    #[tokio::test]
+    async fn reminder_not_found_is_logged_with_its_exit_code() {
+        let (captured, _guard) = capture();
+        let fake = not_found_fake();
+        let router = reminder_app(&lists_config(), &fake);
+        get(&router, REMINDER_PATH).await;
+        let log = captured.text();
+        assert!(log.contains(r#"remindctl="info=1""#), "{log}");
+        assert!(log.contains("status=404"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn startup_listing_logs_lists_and_place_names() {
+        let (captured, _guard) = capture();
+        let fake = Fake::new(&format!(
+            "if [ -e \"$LOG\" ]; then cat '{}'; else touch \"$LOG\"; exit 1; fi",
+            fixture("remindctl_list.json").display()
+        ));
+        let calendars = fake.runner();
+        let reminders = fake.remindctl_runner(calendars.lock());
+        let app = App::new(
+            &lists_config(),
+            Runners {
+                calendars,
+                reminders,
+            },
+        );
+        app.announce_lists(Duration::from_millis(10)).await;
+        let log = captured.text();
+        assert!(log.contains("cannot list reminder lists yet"), "{log}");
+        assert!(
+            log.contains(&format!(
+                "id={WRITE_ID} title=\"Shopping\" readable=true writable=true"
+            )),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "id={READ_ID} title=\"Personal\" readable=true writable=false"
+            )),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "id={OTHER_ID} title=\"Work\" readable=false writable=false"
+            )),
+            "{log}"
+        );
+        assert!(log.contains("name=home radius=100"), "{log}");
+        assert!(log.contains("name=shop radius=150"), "{log}");
+        assert!(!log.contains("Example Street"), "{log}");
+        assert!(!log.contains("Home Lane"), "{log}");
     }
 }

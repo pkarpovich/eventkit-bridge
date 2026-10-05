@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -24,6 +25,33 @@ impl StoreLock {
     /// Waits until no other holder has the lock and takes it.
     pub async fn acquire(&self) -> MutexGuard<'_, ()> {
         self.0.lock().await
+    }
+}
+
+/// How one EventKit CLI invocation ended, as the request log reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// The CLI could not be started.
+    NotStarted,
+    /// The CLI exited with this code.
+    Exited(i32),
+    /// A signal ended the CLI.
+    Signalled,
+    /// The CLI ran past its deadline and was killed.
+    TimedOut,
+    /// The bridge stopped reading and killed the CLI.
+    Killed,
+}
+
+impl fmt::Display for CallOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CallOutcome::NotStarted => f.write_str("not started"),
+            CallOutcome::Exited(code) => write!(f, "{code}"),
+            CallOutcome::Signalled => f.write_str("signalled"),
+            CallOutcome::TimedOut => f.write_str("timeout"),
+            CallOutcome::Killed => f.write_str("killed"),
+        }
     }
 }
 
