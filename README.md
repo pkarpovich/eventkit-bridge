@@ -546,7 +546,7 @@ A message is a summary plus:
 - `has_body` is false when Mail has no file for the message; `body` is then `null`.
 - `body` is the first `text/plain` part, or else the first `text/html` part converted to plain text. It is cut at 100 000 characters, with `body_truncated: true`.
 - `partial` is true when Mail holds only part of the message, such as the headers and the start of the body. `body` is then whatever could be recovered.
-- `attachments` lists names, content types and sizes in bytes. Attachment contents are never served.
+- `attachments` lists names, content types and sizes in bytes; `name` is `null` when the message gives none. Attachment contents are never served.
 
 ### `GET /v1/mail/accounts`
 
@@ -567,7 +567,7 @@ Lists message summaries, newest first by the time they were received.
 | Parameter | Meaning |
 | --- | --- |
 | `account` | Optional and repeatable. A configured account name. Without it, every configured account is read. |
-| `mailbox` | Optional. A mailbox path within those accounts, such as `Inbox` or `[Gmail]/All Mail`, compared case-insensitively. |
+| `mailbox` | Optional, at most 1 000 characters. A mailbox path within those accounts, such as `Inbox` or `[Gmail]/All Mail`, compared case-insensitively. |
 | `since`, `until` | Optional RFC 3339 timestamps. Messages received at or after `since` and before `until`. `until` must be after `since`. |
 | `q` | Optional, at most 500 characters. A case-insensitive substring of the subject, the sender's name or address, a recipient's address, or Mail's summary. Case folding covers every script, not only ASCII. |
 | `unread` | `true` lists unread messages only; `false`, the default, lists both. |
