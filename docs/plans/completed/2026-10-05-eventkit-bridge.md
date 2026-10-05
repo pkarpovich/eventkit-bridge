@@ -44,11 +44,11 @@ Distribution follows the same pattern as the author's other Mac daemons:
 ## Context (verified on the target Mac, macOS 27, Apple Silicon)
 
 - **`ekctl` v1.8.0:**
-  - `list calendars` returns 27 event calendars plus reminder lists on the author's Mac.
+  - `list calendars` returns every event calendar plus the reminder lists.
   - `list events` across all of them for a week takes 0.18 s.
   - `free` exists only since v1.7.0; the Homebrew tap still ships v1.6.0.
   - Recurring occurrences are expanded and share the series `id`.
-  - One work event carries 14 attendees and 2 KB of notes.
+  - A single event can carry dozens of attendees and kilobytes of notes.
   - **Errors exit `0`** with `{"status":"error","error":"..."}` on stdout.
   - Options in `--name=value` form parse, values starting with `-` included. Positional ids after a literal `--` parse.
   - `--calendar` is required by `list events` and takes a comma-separated list of ids.
@@ -56,7 +56,7 @@ Distribution follows the same pattern as the author's other Mac daemons:
 - **`ekctl` license:** MIT, stated in its README; the repository has no LICENSE file. The app ships that statement and the upstream URL as `Contents/Resources/ekctl-LICENSE.txt`.
 - **`ekctl`'s own entitlements file** declares `com.apple.security.personal-information.calendars` and `com.apple.security.personal-information.reminders`. Under the hardened runtime, which notarization requires, these are the entitlements that let a signed binary use EventKit.
 - **TCC** grants a privacy permission to the *responsible* process. A child spawned by an app launched by launchd is attributed to that app, so `ekctl` inside `EventKitBridge.app` should be attributed to the bundle. Gate 0 verifies this before any code is written.
-- **Signing:** `Developer ID Application: Pavel Karpovich (GGG699AY79)`. Release secrets (certificate p12, password, team id, App Store Connect key for notarization, tap token) live in the 1Password item `nhop release signing` and already feed two other repositories.
+- **Signing:** a `Developer ID Application` identity. Release secrets (certificate p12, password, team id, App Store Connect key for notarization, tap token) are kept outside the repository and already feed other repositories.
 - **Toolchain:** Rust 1.99.0 is the newest stable (`mise ls-remote rust`); edition 2024.
 
 ## Development Approach
@@ -108,7 +108,7 @@ Distribution follows the same pattern as the author's other Mac daemons:
 ### Config: `~/.config/eventkit-bridge/config.toml`
 
 ```toml
-listen = "100.108.208.81:8790"
+listen = "100.64.0.1:8790"
 read_calendars = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
 write_calendar = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"
 # ekctl = "/path/to/ekctl"   optional, for development outside the bundle
@@ -307,7 +307,7 @@ Steps:
 
 If step 2 attributes the grant to anything other than the app, or no prompt appears, stop. The fallback is a small Swift helper inside the bundle that calls EventKit itself. Record the outcome here with ⚠️ and revise the plan before the first release.
 
-**Gate 0 result (2026-10-05, macOS 27, `pavels-macbook-pro-2021`): passed.**
+**Gate 0 result (2026-10-05, macOS 27): passed.**
 
 - **Attribution.** The spike was a compiled arm64 binary `spike` that `posix_spawn`s `Contents/MacOS/ekctl list calendars`. It was signed inside out with the Developer ID, `--options runtime`, the calendars entitlement and `--timestamp`, and started by a LaunchAgent with `AssociatedBundleIdentifiers`. The Calendars prompt named the app; after approval, `ekctl` listed every calendar.
 - **Rebuild.** Recompiled and re-signed (new cdhash, same identifier and team), the app listed calendars again with no new prompt.
@@ -516,13 +516,13 @@ Error, exit code 0: `{"status":"error","error":"Event not found with ID: nonexis
 
 *On the Mac.*
 
-- Before tagging: `scripts/build-signed.sh GGG699AY79` produces a bundle that passes `codesign --verify --strict --deep`, and `codesign -d --entitlements - dist/EventKitBridge.app` shows the calendars entitlement.
+- Before tagging: `scripts/build-signed.sh <team-id>` produces a bundle that passes `codesign --verify --strict --deep`, and `codesign -d --entitlements - dist/EventKitBridge.app` shows the calendars entitlement.
 - Set the seven release secrets (README, Releasing), tag `v0.1.0`, and watch the release.
 
 - Create the write calendar the client will use (for turtle-hub, an iCloud calendar named "Agent") and decide which calendars are readable.
-- `brew install --cask pkarpovich/apps/eventkit-bridge`, then follow the README first-run flow with `listen = "100.108.208.81:8790"`.
-- `curl http://100.108.208.81:8790/healthz` reports ok.
+- `brew install --cask pkarpovich/apps/eventkit-bridge`, then follow the README first-run flow with `listen = "100.64.0.1:8790"`.
+- `curl http://100.64.0.1:8790/healthz` reports ok.
 - One create, update and delete in the write calendar through the API; check the `add`/`update` fixtures against the real output and correct them if they differ. Watch the event appear on the iPhone.
 - Try `PATCH` and `DELETE` on a user event and confirm `403`.
 - `brew upgrade --cask eventkit-bridge` across a version bump: the daemon restarts by itself and the grant holds with no prompt.
-- Add a Gatus probe on `http://100.108.208.81:8790/healthz` (`[BODY].status == ok`) in home-environment.
+- Add a Gatus probe on `http://100.64.0.1:8790/healthz` (`[BODY].status == ok`).

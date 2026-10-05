@@ -536,7 +536,7 @@ It needs seven repository secrets:
 | `ASC_KEY_CONTENT` | The contents of the downloaded `AuthKey_<key id>.p8` file. |
 | `HOMEBREW_TAP_TOKEN` | A GitHub token with write access to `pkarpovich/homebrew-apps`. |
 
-The maintainer keeps these in the 1Password item `nhop release signing`, which feeds other repositories too.
+The maintainer keeps these in a password manager, outside the repository.
 
 For a local signed build, run `scripts/build-signed.sh <team-id>`. It builds the release binary, fetches `ekctl` and `remindctl`, and signs `dist/EventKitBridge.app` with the Developer ID identity from your login keychain.
 

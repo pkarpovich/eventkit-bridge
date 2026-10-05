@@ -668,7 +668,7 @@ mod tests {
     fn valid_config() {
         let config = Config::from_toml(&format!(
             r#"
-            listen = "100.108.208.81:8790"
+            listen = "100.64.0.1:8790"
             hosts = ["Mac.tail1234.ts.net"]
             read_calendars = ["{READ_ID}"]
             write_calendars = ["{WRITE_ID}"]
@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(
             config,
             Config {
-                listen: "100.108.208.81:8790".parse().unwrap(),
+                listen: "100.64.0.1:8790".parse().unwrap(),
                 hosts: vec![HostName("mac.tail1234.ts.net".to_owned())],
                 read_calendars: vec![id(READ_ID)],
                 write_calendars: vec![id(WRITE_ID)],
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn listen_without_port() {
-        let err = Config::from_toml(r#"listen = "100.108.208.81""#).unwrap_err();
+        let err = Config::from_toml(r#"listen = "100.64.0.1""#).unwrap_err();
         let ConfigError::ListenNotLiteral(_) = err else {
             panic!("unexpected error: {err:?}");
         };
