@@ -22,5 +22,7 @@
 	<string>14.0</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>eventkit-bridge reads the calendars you allow and manages events in the one calendar you choose for it.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>eventkit-bridge reads the reminder lists you allow and manages reminders in the lists you choose for it.</string>
 </dict>
 </plist>

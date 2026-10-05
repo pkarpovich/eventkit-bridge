@@ -1,12 +1,13 @@
 # eventkit-bridge
 
-`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in exactly one calendar that you choose.
+`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger.
 
 ```
-HTTP client (on the tailnet) --HTTP--> eventkit-bridge (LaunchAgent, EventKitBridge.app) --exec--> ekctl --EventKit--> CalendarAgent
+HTTP client (on the tailnet) --HTTP--> eventkit-bridge (LaunchAgent, EventKitBridge.app) --exec--> ekctl     --EventKit--> calendars
+                                                                                          --exec--> remindctl --EventKit--> reminders
 ```
 
-The bridge does not call EventKit itself. It ships a pinned copy of [`ekctl`](https://github.com/schappim/ekctl), a native Swift command-line tool over EventKit, inside its app bundle. Each API request is turned into an `ekctl` invocation, and `ekctl`'s JSON output is turned into the bridge's own JSON. Clients never see `ekctl` and never pass it arguments.
+The bridge does not call EventKit itself. It ships pinned copies of two native Swift command-line tools over EventKit inside its app bundle: [`ekctl`](https://github.com/schappim/ekctl) for calendars and [`remindctl`](https://github.com/openclaw/remindctl) for reminders. Each API request is turned into an `ekctl` or `remindctl` invocation, and the tool's JSON output is turned into the bridge's own JSON. Clients never see either tool and never pass it arguments.
 
 It requires macOS 14 Sonoma or later on Apple Silicon.
 
@@ -17,8 +18,10 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **Reads touch only the calendars you list.** A request for any other calendar is refused with `403`, and events from other calendars are never returned.
 - **Writes touch only the write calendars.** A new event must name one of them. Before every update or delete, the bridge looks up the event and refuses the change unless the event is in a write calendar. A bug in a client cannot change an event in any other calendar.
 - **Recurring events are not changed.** `ekctl` looks an event up by id, and for a recurring event that is the first occurrence of the series, so an update or delete would silently hit the wrong occurrence. The bridge refuses both with `409` until `ekctl` can address a single occurrence.
-- **The bridge builds every `ekctl` command itself.** There is no generic passthrough, so a client cannot inject options into `ekctl`.
-- **Event contents are never logged.** Request logs carry the method, route, status and timing, but never titles, notes, locations, URLs or attendees.
+- **Reminders follow the same rules.** Reads touch only the reminder lists you list, and writes only the write lists. Before every change or delete, the bridge looks up the reminder and refuses unless it is in a write list.
+- **Location triggers name a place from the config.** A client picks a place such as `shop` by name; street addresses and coordinates never cross the API in either direction.
+- **The bridge builds every `ekctl` and `remindctl` command itself.** There is no generic passthrough, so a client cannot inject options into either tool. Reminder and list ids must be full UUIDs, because `remindctl` reads a short number as a row index from its last listing.
+- **Contents are never logged.** Request logs carry the method, route, status and timing, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, or place addresses and coordinates.
 
 ## Install
 
@@ -30,7 +33,7 @@ This installs `EventKitBridge.app` into `/Applications` and puts the `eventkit-b
 
 ## First run
 
-The bridge runs as a LaunchAgent in your login session and needs a config before it first starts. You do not know your calendar ids yet, so the first run only sets the listen address; the bridge then lists your calendars in its log.
+The bridge runs as a LaunchAgent in your login session and needs a config before it first starts. You do not know your calendar and list ids yet, so the first run only sets the listen address; the bridge then lists your calendars and reminder lists in its log.
 
 1. Create `~/.config/eventkit-bridge/config.toml` with the address to listen on, a literal IP such as your tailscale IP:
 
@@ -52,7 +55,7 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
    eventkit-bridge install
    ```
 
-4. Approve the Calendars prompt for EventKitBridge.
+4. Approve the Calendars prompt for EventKitBridge, then the Reminders prompt. Reminders is a separate permission, so macOS asks twice.
 
 5. Find your calendar ids in `~/Library/Logs/eventkit-bridge.log`. After it first reads your calendars, the daemon logs one line per calendar:
 
@@ -63,7 +66,15 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 
    Until the permission is granted, the log shows `cannot list calendars yet, retrying` instead. The daemon retries every 30 seconds, so the listing appears within half a minute of approving the prompt.
 
-   Add `read_calendars` and `write_calendars` to the config, then run
+   After the calendars, the daemon logs one line per reminder list, in the same way:
+
+   ```
+   2026-10-05T09:00:02.318040Z  INFO eventkit_bridge::server: reminder list id=2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37 title="Shopping" readable=false writable=false
+   ```
+
+   Until the Reminders prompt is approved, it shows `cannot list reminder lists yet, retrying`.
+
+   Add `read_calendars` and `write_calendars` to the config, and `read_lists` and `write_lists` if you want reminders, then run
 
    ```sh
    eventkit-bridge install
@@ -71,7 +82,7 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 
    again. The daemon restarts with the new config, and the log lines show which calendars are now readable and writable.
 
-Upgrades need no action: the daemon restarts on the new version by itself.
+Upgrades need no action: the daemon restarts on the new version by itself. After upgrading from a version without reminders, the first reminders call shows the Reminders prompt once; approve it.
 
 ### Config reference
 
@@ -80,7 +91,14 @@ listen = "100.64.0.1:8790"
 # hosts = ["mac.tail1234.ts.net"]
 read_calendars = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
 write_calendars = ["8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"]
+read_lists = ["5E2B8D17-3C4A-4F90-A6B1-7D8E9F0A1B2C"]
+write_lists = ["2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37"]
 # ekctl = "/path/to/ekctl"
+# remindctl = "/path/to/remindctl"
+
+[places]
+shop = { address = "1 Example Street, Exampletown", radius = 150 }
+home = { address = "2 Example Road, Exampletown" }
 ```
 
 | Key | Required | Meaning |
@@ -90,8 +108,18 @@ write_calendars = ["8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"]
 | `read_calendars` | no | The calendar ids reads may touch. Empty by default, which leaves the bridge unconfigured. |
 | `write_calendars` | no | The calendar ids writes may touch. They are always readable as well. Empty by default, which refuses every write with `403`. |
 | `ekctl` | no | The `ekctl` binary to run. Defaults to the `ekctl` next to the `eventkit-bridge` binary, which is the one inside the app bundle. Only useful for development. |
+| `read_lists` | no | The reminder list ids reads may touch, as full UUIDs. Empty by default. With no lists at all, reminders are off and `remindctl` is only run for the startup listing. |
+| `write_lists` | no | The reminder list ids writes may touch. They are always readable as well. Empty by default, which refuses every reminder write with `403`. |
+| `places` | no | Named places for location triggers. A name is 1 to 40 characters of lowercase letters, digits and `-`, starting with a letter or digit. `address` is a street address and must not be empty; `radius` is in meters, 50 to 2000, default 100. |
+| `remindctl` | no | The `remindctl` binary to run. Defaults to the `remindctl` next to the `eventkit-bridge` binary. Only useful for development. |
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
+
+`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged.
+
+#### Why places are named
+
+A location trigger names a place from the config rather than taking an address from the client. CoreLocation, which `remindctl` uses to geocode, resolves street addresses but not store names: `Some Store` fails, its street address works. Named places keep geocoding predictable, and they keep home and shop addresses out of client logs and agent context. Give each place a street address, not a business name.
 
 ### Command line
 
@@ -103,7 +131,7 @@ Unknown keys are rejected. The config is read once at startup; after changing it
 | `eventkit-bridge --check-config` | Validates the config and exits `0` or `1`. |
 | `eventkit-bridge --version` | Prints the version. |
 
-`install` points the LaunchAgent at the real binary inside `EventKitBridge.app`, not at the Homebrew symlink, because the Calendars permission belongs to the app bundle. It warns when the binary is not inside an `.app` bundle, since the permission would then not survive an upgrade.
+`install` points the LaunchAgent at the real binary inside `EventKitBridge.app`, not at the Homebrew symlink, because the Calendars and Reminders permissions belong to the app bundle. It warns when the binary is not inside an `.app` bundle, since the permission would then not survive an upgrade.
 
 To remove the bridge completely, run `eventkit-bridge uninstall`, then `brew uninstall --cask --zap eventkit-bridge`, which also deletes the config, the LaunchAgent plist and the log.
 
@@ -275,10 +303,137 @@ A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: 
 | `413` | The request body is larger than 64 KiB. |
 | `415` | A `POST` or `PATCH` without `Content-Type: application/json`. |
 | `421` | The `Host` header is missing or names neither the listen IP nor an entry in `hosts`. |
-| `502` | `ekctl` failed: it could not start, exited with an error, reported an error, wrote more than 8 MiB, or wrote output the bridge does not understand. |
-| `504` | `ekctl` did not finish within 20 seconds. |
+| `502` | `ekctl` or `remindctl` failed: it could not start, exited with an error, reported an error, wrote more than 8 MiB, or wrote output the bridge does not understand. A configured reminder list that no longer exists is also `502`. |
+| `504` | `ekctl` or `remindctl` did not finish within 20 seconds. |
 
-Requests are handled one `ekctl` call at a time. A week across every calendar takes about 0.2 seconds.
+Requests are handled one `ekctl` or `remindctl` call at a time; both tools share one lock because they write to the same EventKit store. A week across every calendar takes about 0.2 seconds.
+
+## Reminders API
+
+The reminder routes follow the same rules as the calendar routes: the `Host` check, `Content-Type: application/json` on `POST` and `PATCH`, the 64 KiB body limit, `{"error": ...}` errors, and `400` for unknown query parameters, unknown body fields and control characters other than newline and tab.
+
+### Types
+
+A list:
+
+```json
+{"id":"2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37","title":"Shopping","open":12,"writable":true}
+```
+
+`open` is the number of incomplete reminders.
+
+A reminder:
+
+```json
+{
+  "id": "3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A",
+  "title": "Milk",
+  "notes": null,
+  "completed": false,
+  "completed_at": null,
+  "due": "2026-10-06T09:00:00+02:00",
+  "all_day": false,
+  "repeat": "weekly",
+  "priority": "none",
+  "list": {"id": "2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37", "title": "Shopping"},
+  "location": {"place": "shop", "proximity": "arriving"}
+}
+```
+
+- `due` is `null` without a due date. A timed reminder's `due` is RFC 3339 in the Mac's time zone. An all-day reminder's `due` is `YYYY-MM-DD` with `all_day: true`. `completed_at` is RFC 3339 in the Mac's time zone, or `null`.
+- `repeat` is `null` or one of `daily`, `weekly`, `biweekly`, `monthly` and `yearly`. A rule set elsewhere with another frequency or interval is reported as `custom`.
+- `priority` is `none`, `low`, `medium` or `high`.
+- `location` is `null` without a location trigger. `place` is the config name whose address matches the trigger; a trigger that matches no configured place, such as one set on a phone, has `"place": null` and only its `proximity`. Addresses and coordinates are never returned.
+
+Reminder and list ids are full UUIDs, such as `3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A`. Anything else is `400`.
+
+### `GET /v1/lists`
+
+Lists the readable reminder lists. `writable` is true for the write lists.
+
+```sh
+curl http://100.64.0.1:8790/v1/lists
+```
+
+```json
+{"lists":[{"id":"2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37","title":"Shopping","open":12,"writable":true}]}
+```
+
+With no lists configured it answers `{"lists":[]}` without running `remindctl`.
+
+### `GET /v1/places`
+
+Lists the configured places by name and radius in meters.
+
+```json
+{"places":[{"name":"shop","radius":150},{"name":"home","radius":100}]}
+```
+
+### `GET /v1/reminders`
+
+Lists reminders in `remindctl`'s order.
+
+| Parameter | Meaning |
+| --- | --- |
+| `status` | `open` (default), `completed` or `all`. |
+| `list` | Optional and repeatable, one list id per parameter. Without it, every readable list is read. |
+
+```sh
+curl 'http://100.64.0.1:8790/v1/reminders?status=all&list=2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37'
+```
+
+```json
+{"reminders":[{"id":"3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A","title":"Milk","notes":null,"completed":false,"completed_at":null,"due":null,"all_day":false,"repeat":null,"priority":"none","list":{"id":"2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37","title":"Shopping"},"location":null}]}
+```
+
+A `list` outside the readable set is `403 list not readable: <id>`. A request without `list` when nothing is readable is `403 no readable lists configured`.
+
+### `GET /v1/reminders/{id}`
+
+Returns one reminder. It is `404` when the reminder does not exist and `403 reminder is not in a readable list` when it lives in a list the bridge may not read.
+
+### `POST /v1/reminders`
+
+Creates a reminder in the write list named by `list` and answers `201` with the reminder.
+
+```sh
+curl -X POST http://100.64.0.1:8790/v1/reminders \
+  -H 'Content-Type: application/json' \
+  -d '{"list":"2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37","title":"Call the dentist","due":"2026-10-06T09:00:00+02:00","priority":"high"}'
+```
+
+| Field | Rules |
+| --- | --- |
+| `list` | Required. A write list; any other list is `403 list not writable: <id>`, and with no `write_lists` at all the answer is `403 no write lists configured`. |
+| `title` | Required. Not blank, at most 500 characters. |
+| `notes` | At most 10 000 characters. |
+| `due` | An RFC 3339 date-time with an offset and whole seconds, which makes a timed reminder that notifies at that time, or `YYYY-MM-DD`, which makes an all-day reminder without a notification. |
+| `repeat` | `daily`, `weekly`, `biweekly`, `monthly` or `yearly`. Needs `due`. |
+| `priority` | `none`, `low`, `medium` or `high`. |
+| `place` | The name of a configured place, which adds a location trigger. Geocoding the place's address needs the Mac to be online. |
+| `proximity` | `arriving` (default) or `leaving`. Only allowed with `place`. |
+
+A location trigger can only be set when the reminder is created.
+
+### `PATCH /v1/reminders/{id}`
+
+Changes any non-empty subset of `title`, `notes`, `due`, `repeat`, `priority` and `completed`, and answers `200` with the reminder. The fields follow the `POST` rules. `due: null` removes the due date and `repeat: null` removes the repeat rule; for the other fields, `null` or an absent field leaves the value unchanged. `completed: true` completes the reminder, `false` reopens it.
+
+```sh
+curl -X PATCH http://100.64.0.1:8790/v1/reminders/3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A \
+  -H 'Content-Type: application/json' \
+  -d '{"completed":true}'
+```
+
+The bridge first looks the reminder up. It answers `403 reminder is not in a writable list` unless the reminder is in a write list, and `404` when it does not exist. A change that would leave a repeat rule without a due date is `400`. A body that changes nothing is `400`.
+
+### `DELETE /v1/reminders/{id}`
+
+Deletes a reminder in a write list and answers `204` with no body. The same lookup and `403`/`404` rules as `PATCH` apply.
+
+### Not available
+
+Reminder sections, tags, subtasks, smart lists, the Groceries list type and the Urgent toggle have no public EventKit API, so neither `remindctl` nor the bridge can read or set them. Alarms separate from the due time, URLs, custom repeat rules, moving a reminder between lists, and creating or renaming lists are not supported either.
 
 ## Health check
 
@@ -289,10 +444,10 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.1.0","calendars":2}
+{"status":"ok","version":"0.3.0","calendars":2,"lists":1}
 ```
 
-`calendars` is the number of readable calendars that exist. Otherwise it answers `503`:
+`calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Otherwise it answers `503`:
 
 ```json
 {"status":"degraded","reason":"ekctl failed"}
@@ -304,22 +459,25 @@ When the bridge can read every configured calendar, it answers `200`:
 | `timeout` | `ekctl` did not answer in time. |
 | `ekctl failed` | `ekctl` could not list calendars. This is how a missing or revoked Calendars permission shows up. |
 | `calendar missing` | A configured calendar id does not exist, or is not an event calendar. |
+| `reminders access missing` | Reminder lists are configured, but `remindctl status` reports no Reminders permission. |
+| `remindctl failed` | Reminder lists are configured and `remindctl` could not report its status or list the reminder lists. |
 
-The check runs `ekctl` at most once every 10 seconds and reuses the result in between, so it is safe to poll.
+`timeout` covers `remindctl` as well. The check runs `ekctl` (and `remindctl`) at most once every 10 seconds and reuses the result in between, so it is safe to poll.
 
 ## Upgrades
 
-There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars permission belongs to the app bundle and carries over.
+There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars and Reminders permissions belong to the app bundle and carry over.
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` ran, each subcommand with its exit code:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
+2026-10-05T09:13:02.104377Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/reminders/{id} status=200 duration_ms=164 remindctl="info=0, edit=0"
 ```
 
-Policy refusals log their reason. Event titles, notes, locations, URLs and attendees are never logged; the only calendar details in the log are the startup listing of ids, titles and accounts.
+Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, and place addresses and coordinates are never logged. The only calendar and reminder details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, and place names with their radii.
 
 The log is not rotated. To truncate it:
 
@@ -336,9 +494,17 @@ The log is not rotated. To truncate it:
   eventkit-bridge install
   ```
 
+- **`/healthz` says `reminders access missing`.** The bridge has no Reminders permission. Check System Settings, Privacy & Security, Reminders, or reset it to get a fresh prompt:
+
+  ```sh
+  tccutil reset Reminders dev.pkarpovich.eventkit-bridge
+  eventkit-bridge install
+  ```
+
+- **A reminder with a `place` fails with `502`.** `remindctl` could not geocode the place's address. Check that the Mac is online and that the address is a street address, not a business name.
 - **`/healthz` says `calendar missing`.** A calendar in the config was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
-- **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars permission is tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.
+- **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars and Reminders permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.
 
 ## Releasing
 
@@ -350,7 +516,7 @@ The log is not rotated. To truncate it:
    git push origin v0.1.1
    ```
 
-The release workflow checks that the tag matches `Cargo.toml`, runs the checks, builds the Apple Silicon binary, fetches and verifies the pinned `ekctl`, signs the app with the Developer ID certificate and the hardened runtime, notarizes and staples it, publishes a GitHub release with the zip and `checksums.txt`, and writes the new cask into `pkarpovich/homebrew-apps`.
+The release workflow checks that the tag matches `Cargo.toml`, runs the checks, builds the Apple Silicon binary, fetches and verifies the pinned `ekctl` and `remindctl`, signs both tools and the app with the Developer ID certificate and the hardened runtime, notarizes and staples it, publishes a GitHub release with the zip and `checksums.txt`, and writes the new cask into `pkarpovich/homebrew-apps`.
 
 It needs seven repository secrets:
 
@@ -366,11 +532,11 @@ It needs seven repository secrets:
 
 The maintainer keeps these in the 1Password item `nhop release signing`, which feeds other repositories too.
 
-For a local signed build, run `scripts/build-signed.sh <team-id>`. It builds the release binary, fetches `ekctl`, and signs `dist/EventKitBridge.app` with the Developer ID identity from your login keychain.
+For a local signed build, run `scripts/build-signed.sh <team-id>`. It builds the release binary, fetches `ekctl` and `remindctl`, and signs `dist/EventKitBridge.app` with the Developer ID identity from your login keychain.
 
 ## Development
 
-The crate builds and its tests pass on macOS and Linux; no test runs `ekctl` or `launchctl` for real.
+The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl` or `launchctl` for real.
 
 ```sh
 mise run check
@@ -378,11 +544,11 @@ mise run check
 
 runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. CI also runs `shellcheck scripts/*.sh`.
 
-Do not run the daemon or `ekctl` from a terminal against your real calendars: TCC would grant Calendars access to the terminal app, not to EventKitBridge. Test on the Mac with the bundled app started by the LaunchAgent.
+Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars or reminders: TCC would grant access to the terminal app, not to EventKitBridge. Test on the Mac with the bundled app started by the LaunchAgent.
 
 ## Credits
 
-The bridge runs [`ekctl`](https://github.com/schappim/ekctl) by schappim, released under the MIT License. The app bundle includes its license as `Contents/Resources/ekctl-LICENSE.txt`.
+The bridge runs [`ekctl`](https://github.com/schappim/ekctl) by schappim and [`remindctl`](https://github.com/openclaw/remindctl) by OpenClaw, both released under the MIT License. The app bundle includes their licenses as `Contents/Resources/ekctl-LICENSE.txt` and `Contents/Resources/remindctl-LICENSE.txt`.
 
 ## License
 

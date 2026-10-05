@@ -25,4 +25,5 @@ fi
 cd "$root"
 cargo build --release
 ekctl="$("${root}/scripts/fetch-ekctl.sh" "${root}/target/ekctl")"
-"${root}/scripts/bundle.sh" "${root}/target/release/eventkit-bridge" "$ekctl" "${root}/dist" "$identity"
+remindctl="$("${root}/scripts/fetch-remindctl.sh" "${root}/target/remindctl")"
+"${root}/scripts/bundle.sh" "${root}/target/release/eventkit-bridge" "$ekctl" "$remindctl" "${root}/dist" "$identity"

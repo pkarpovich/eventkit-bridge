@@ -261,19 +261,19 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 - Create: `scripts/fetch-remindctl.sh`, `remindctl-LICENSE.txt` (the MIT text from the `remindctl` repository)
 - Modify: `scripts/bundle.sh`, `scripts/build-signed.sh`, `.github/workflows/release.yml`, `entitlements.plist`, `Info.plist.template`, `README.md`, `CLAUDE.md`, `Cargo.toml`
 
-- [ ] the bundle and release changes from Solution Overview; `shellcheck` clean; both plists parse
-- [ ] README:
+- [x] the bundle and release changes from Solution Overview; `shellcheck` clean; both plists parse
+- [x] README:
   - the reminder routes;
   - lists and places in the config;
   - why places are named rather than free-form;
   - the second permission prompt;
   - that sections and the Groceries list type are not available
-- [ ] CLAUDE.md:
+- [x] CLAUDE.md:
   - only `remindctl.rs` builds `remindctl` argv;
   - ids must be full UUIDs because `remindctl` reads short numbers as row indexes;
   - addresses and coordinates are never logged or returned
-- [ ] version 0.3.0
-- [ ] gate passes
+- [x] version 0.3.0
+- [x] gate passes
 
 ### Task 6: Verify acceptance criteria
 

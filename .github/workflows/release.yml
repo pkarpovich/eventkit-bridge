@@ -42,6 +42,10 @@ jobs:
         id: ekctl
         run: echo "path=$(scripts/fetch-ekctl.sh target/ekctl)" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch remindctl
+        id: remindctl
+        run: echo "path=$(scripts/fetch-remindctl.sh target/remindctl)" >> "$GITHUB_OUTPUT"
+
       - uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
@@ -51,6 +55,7 @@ jobs:
         env:
           TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
           EKCTL: ${{ steps.ekctl.outputs.path }}
+          REMINDCTL: ${{ steps.remindctl.outputs.path }}
         run: |
           identity="$(security find-identity -v -p codesigning |
             awk -v suffix="(${TEAM_ID})\"" 'index($0, "\"Developer ID Application: ") && substr($0, length($0) - length(suffix) + 1) == suffix { print $2; exit }')"
@@ -58,7 +63,7 @@ jobs:
             echo "no Developer ID Application (${TEAM_ID}) identity" >&2
             exit 1
           fi
-          scripts/bundle.sh target/aarch64-apple-darwin/release/eventkit-bridge "$EKCTL" dist "$identity"
+          scripts/bundle.sh target/aarch64-apple-darwin/release/eventkit-bridge "$EKCTL" "$REMINDCTL" dist "$identity"
           codesign -d --entitlements - "$APP"
 
       - name: Notarize and staple
@@ -122,7 +127,7 @@ jobs:
 
             url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v#{version}/EventKitBridge-arm64-#{version}.zip"
             name "EventKitBridge"
-            desc "HTTP API over the Mac's calendars through EventKit"
+            desc "HTTP API over the Mac's calendars and reminders through EventKit"
             homepage "https://github.com/${GITHUB_REPOSITORY}"
 
             livecheck do
@@ -153,13 +158,16 @@ jobs:
                    eventkit-bridge --check-config
               3. Install and start the LaunchAgent:
                    eventkit-bridge install
-              4. Approve the Calendars prompt for EventKitBridge.
-              5. Find your calendar ids in ~/Library/Logs/eventkit-bridge.log, add
-                 read_calendars and write_calendars to the config, then run
+              4. Approve the Calendars prompt for EventKitBridge, then the Reminders prompt.
+              5. Find your calendar and reminder list ids in ~/Library/Logs/eventkit-bridge.log,
+                 add read_calendars and write_calendars (and read_lists and write_lists for
+                 reminders) to the config, then run
                    eventkit-bridge install
                  again.
 
               Upgrades need no action: the daemon restarts on the new version by itself.
+              After upgrading from a version without reminders, approve the Reminders
+              prompt once.
             EOS
           end
           EOF
