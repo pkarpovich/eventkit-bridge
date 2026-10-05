@@ -386,4 +386,35 @@ mod tests {
         assert!(text.contains("ekctl: /opt/ekctl\n"));
         assert!(!text.contains("unconfigured"));
     }
+
+    #[tokio::test]
+    async fn daemon_fails_when_listen_cannot_be_bound() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = taken.local_addr().unwrap();
+        let config = Config::from_toml(&format!("listen = \"{listen}\"")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
+        let result = daemon(config, runner, std::future::pending()).await;
+        let Err(message) = result else {
+            panic!("the daemon started on an address in use");
+        };
+        assert!(
+            message.starts_with(&format!("cannot listen on {listen}: ")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_follows_a_removed_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eventkit-bridge");
+        std::fs::write(&path, "binary").unwrap();
+        let identity = Identity::of(&path).unwrap();
+        let stopping = tokio::spawn(shutdown(path.clone(), identity));
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(SWAP_POLL * 3, stopping)
+            .await
+            .expect("the daemon kept running without its executable")
+            .unwrap();
+    }
 }

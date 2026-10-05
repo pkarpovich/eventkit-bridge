@@ -459,8 +459,10 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] every route, rule and status in Solution Overview has a test
-- [ ] `mise run check` green, `shellcheck` clean
+- [x] every route, rule and status in Solution Overview has a test
+- [x] `mise run check` green, `shellcheck` clean
+- ⚠️ the audit found two untested daemon paths in `src/main.rs`; tests now cover a `listen` address that cannot be bound (the daemon returns `cannot listen on <addr>: ...`) and the shutdown future resolving when the executable is removed
+- ⚠️ `mise run check` works in this container now (198 + 13 tests); shellcheck 0.11.0 is clean
 
 ### Task 9: [Final] Documentation
 
