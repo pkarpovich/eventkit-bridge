@@ -447,8 +447,9 @@ async fn method_not_allowed() -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::Write;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, Once};
 
     use axum::body::Body;
     use axum::http::Method;
@@ -1539,24 +1540,42 @@ esac"#,
         }
     }
 
-    impl<'a> MakeWriter<'a> for Captured {
+    thread_local! {
+        static SINK: RefCell<Option<Captured>> = const { RefCell::new(None) };
+    }
+
+    struct ThreadSink;
+
+    impl<'a> MakeWriter<'a> for ThreadSink {
         type Writer = Captured;
 
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            SINK.with_borrow(|sink| sink.clone().unwrap_or_default())
         }
     }
 
-    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .with_max_level(Level::TRACE)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            SINK.set(None);
+        }
+    }
+
+    fn capture() -> (Captured, CaptureGuard) {
+        static SUBSCRIBER: Once = Once::new();
+        SUBSCRIBER.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ThreadSink)
+                .with_ansi(false)
+                .with_max_level(Level::TRACE)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
         tracing::callsite::rebuild_interest_cache();
-        (captured, guard)
+        let captured = Captured::default();
+        SINK.set(Some(captured.clone()));
+        (captured, CaptureGuard)
     }
 
     #[tokio::test]
