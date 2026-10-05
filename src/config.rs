@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -11,8 +12,21 @@ use serde::{Deserialize, Serialize};
 const CONFIG_RELATIVE_PATH: &str = ".config/eventkit-bridge/config.toml";
 const EKCTL_FILE_NAME: &str = "ekctl";
 const REMINDCTL_FILE_NAME: &str = "remindctl";
-const PLACE_NAME_MAX_LEN: usize = 40;
+const NAME_MAX_LEN: usize = 40;
 const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+const MAIL_RELATIVE_PATH: &str = "Library/Mail";
+const MAIL_INDEX_RELATIVE_PATH: &str = "MailData/Envelope Index";
+
+/// The mailboxes left out when `[mail]` has no `exclude_mailboxes`.
+pub const DEFAULT_EXCLUDED_MAILBOXES: [&str; 7] = [
+    "Trash",
+    "Deleted Items",
+    "Junk",
+    "Junk Email",
+    "Spam",
+    "[Gmail]/Trash",
+    "[Gmail]/Spam",
+];
 
 /// The radius in meters a place gets when the config gives none.
 pub const DEFAULT_RADIUS: u32 = 100;
@@ -102,20 +116,7 @@ pub struct PlaceName(String);
 impl PlaceName {
     /// Accepts 1 to 40 lowercase letters, digits and `-`, starting with a letter or digit.
     pub fn parse(value: &str) -> Result<Self, &'static str> {
-        let Some(first) = value.chars().next() else {
-            return Err("empty");
-        };
-        if value.len() > PLACE_NAME_MAX_LEN {
-            return Err("longer than 40 characters");
-        }
-        if first == '-' {
-            return Err("must start with a letter or digit");
-        }
-        for c in value.chars() {
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
-                return Err("must contain only lowercase letters, digits and `-`");
-            }
-        }
+        check_name(value)?;
         Ok(Self(value.to_owned()))
     }
 
@@ -157,6 +158,181 @@ pub struct Place {
     pub address: Address,
     /// The trigger radius in meters.
     pub radius: u32,
+}
+
+/// A Mail account identifier, the `ZIDENTIFIER` in `Accounts4.sqlite`, stored uppercase.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccountId(String);
+
+impl AccountId {
+    /// Accepts a full hyphenated UUID in either case.
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        if !is_full_uuid(value) {
+            return Err("must be a full UUID");
+        }
+        Ok(Self(value.to_ascii_uppercase()))
+    }
+
+    /// Returns the identifier as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The name clients use for a configured Mail account.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AccountName(String);
+
+impl AccountName {
+    /// Accepts 1 to 40 lowercase letters, digits and `-`, starting with a letter or digit.
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        check_name(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A Mail account clients may read, and the name they see it under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailAccount {
+    /// The account uuid in Mail's mailbox URLs.
+    pub id: AccountId,
+    /// The name clients use.
+    pub name: AccountName,
+}
+
+/// The `[mail]` table; its presence turns mail on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailConfig {
+    /// The accounts clients may read, sorted by name; every other account is invisible.
+    pub accounts: Vec<MailAccount>,
+    /// Decoded mailbox paths never shown, compared case-insensitively.
+    pub exclude_mailboxes: Vec<String>,
+    /// An explicit `~/Library/Mail/V<n>` directory; `None` means the highest one with an index.
+    pub root: Option<PathBuf>,
+}
+
+/// Why the mail root could not be found.
+#[derive(Debug, thiserror::Error)]
+pub enum MailRootError {
+    /// `$HOME` is unset or empty, so `~/Library/Mail` is unknown.
+    #[error("HOME is not set, cannot locate ~/Library/Mail")]
+    NoHome,
+    /// The mail directory could not be listed, which is how a missing Full Disk Access grant shows up.
+    #[error("cannot list {}: {source}", path.display())]
+    List {
+        /// The directory that could not be listed.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+    /// No `V<n>` directory holds `MailData/Envelope Index`.
+    #[error("no V<n> directory with MailData/Envelope Index under {}", .0.display())]
+    NotFound(PathBuf),
+}
+
+impl MailConfig {
+    /// The account configured under `id`, if any.
+    pub fn account(&self, id: &AccountId) -> Option<&MailAccount> {
+        self.accounts.iter().find(|account| account.id == *id)
+    }
+
+    /// Whether the decoded mailbox `path` is excluded, ignoring case.
+    pub fn is_excluded(&self, path: &str) -> bool {
+        let path = path.to_lowercase();
+        for excluded in &self.exclude_mailboxes {
+            if excluded.to_lowercase() == path {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The mail data directory: the configured `root`, or the highest `~/Library/Mail/V<n>` with an index.
+    pub fn root(&self) -> Result<PathBuf, MailRootError> {
+        if let Some(root) = &self.root {
+            return Ok(root.clone());
+        }
+        mail_root_under_home(env::var_os("HOME"))
+    }
+}
+
+fn mail_root_under_home(home: Option<OsString>) -> Result<PathBuf, MailRootError> {
+    let Some(home) = home else {
+        return Err(MailRootError::NoHome);
+    };
+    if home.is_empty() {
+        return Err(MailRootError::NoHome);
+    }
+    discover_mail_root(&PathBuf::from(home).join(MAIL_RELATIVE_PATH))
+}
+
+/// The highest `V<n>` directory under `mail` that contains `MailData/Envelope Index`.
+pub fn discover_mail_root(mail: &Path) -> Result<PathBuf, MailRootError> {
+    let entries = match fs::read_dir(mail) {
+        Ok(entries) => entries,
+        Err(source) => {
+            return Err(MailRootError::List {
+                path: mail.to_owned(),
+                source,
+            });
+        }
+    };
+    let mut best: Option<(u32, PathBuf)> = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                return Err(MailRootError::List {
+                    path: mail.to_owned(),
+                    source,
+                });
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(version) = name.strip_prefix('V') else {
+            continue;
+        };
+        if !is_decimal(version) {
+            continue;
+        }
+        let Ok(version) = version.parse::<u32>() else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.join(MAIL_INDEX_RELATIVE_PATH).is_file() {
+            continue;
+        }
+        if let Some((highest, _)) = &best
+            && *highest >= version
+        {
+            continue;
+        }
+        best = Some((version, path));
+    }
+    let Some((_, root)) = best else {
+        return Err(MailRootError::NotFound(mail.to_owned()));
+    };
+    Ok(root)
 }
 
 /// A DNS name clients may use to reach the bridge, stored lowercase.
@@ -204,6 +380,8 @@ pub struct Config {
     pub places: Vec<Place>,
     /// An explicit `remindctl` path; `None` means `remindctl` next to the running executable.
     pub remindctl: Option<PathBuf>,
+    /// The `[mail]` table; `None` turns mail off.
+    pub mail: Option<MailConfig>,
 }
 
 /// Why a config file was rejected; every rule violation names its key.
@@ -322,6 +500,36 @@ pub enum ConfigError {
     /// `remindctl` is set to an empty path.
     #[error("`remindctl` must not be empty")]
     EmptyRemindctl,
+    /// A key in `[mail.accounts]` is not a full UUID.
+    #[error("`mail.accounts` contains an invalid account id {value:?}: {reason}")]
+    InvalidMailAccountId {
+        /// The id as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A value in `[mail.accounts]` is not a valid account name.
+    #[error("`mail.accounts.{id}` has an invalid name {value:?}: {reason}")]
+    InvalidMailAccountName {
+        /// The account the name is given to.
+        id: AccountId,
+        /// The name as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// Two keys in `[mail.accounts]` name the same account uuid in different case.
+    #[error("`mail.accounts` lists the account {0} twice")]
+    DuplicateMailAccountId(AccountId),
+    /// Two accounts in `[mail.accounts]` share a name.
+    #[error("`mail.accounts` gives the name {0:?} to more than one account")]
+    DuplicateMailAccountName(AccountName),
+    /// An entry in `mail.exclude_mailboxes` is blank.
+    #[error("`mail.exclude_mailboxes` must not contain an empty path")]
+    EmptyExcludedMailbox,
+    /// `mail.root` is set to an empty path.
+    #[error("`mail.root` must not be empty")]
+    EmptyMailRoot,
 }
 
 #[derive(Deserialize)]
@@ -341,6 +549,16 @@ struct RawConfig {
     write_lists: Vec<String>,
     places: Option<toml::Value>,
     remindctl: Option<PathBuf>,
+    mail: Option<RawMail>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMail {
+    exclude_mailboxes: Option<Vec<String>>,
+    root: Option<PathBuf>,
+    #[serde(default)]
+    accounts: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -367,6 +585,7 @@ impl Config {
             write_lists,
             places,
             remindctl,
+            mail,
         } = match toml::from_str(text) {
             Ok(raw) => raw,
             Err(err) => return Err(parse_error(text, &err)),
@@ -440,6 +659,11 @@ impl Config {
             return Err(ConfigError::EmptyRemindctl);
         }
 
+        let mail = match mail {
+            None => None,
+            Some(mail) => Some(parse_mail(mail)?),
+        };
+
         Ok(Self {
             listen,
             hosts: names,
@@ -450,6 +674,7 @@ impl Config {
             write_lists: lists_write,
             places: configured,
             remindctl,
+            mail,
         })
     }
 
@@ -623,6 +848,99 @@ fn parse_place(name: String, place: toml::Value) -> Result<Place, ConfigError> {
     })
 }
 
+fn parse_mail(mail: RawMail) -> Result<MailConfig, ConfigError> {
+    let RawMail {
+        exclude_mailboxes,
+        root,
+        accounts,
+    } = mail;
+    let mut configured: Vec<MailAccount> = Vec::new();
+    for (id, name) in accounts {
+        let id = match AccountId::parse(&id) {
+            Ok(parsed) => parsed,
+            Err(reason) => return Err(ConfigError::InvalidMailAccountId { value: id, reason }),
+        };
+        let name = match AccountName::parse(&name) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                return Err(ConfigError::InvalidMailAccountName {
+                    id,
+                    value: name,
+                    reason,
+                });
+            }
+        };
+        for account in &configured {
+            if account.id == id {
+                return Err(ConfigError::DuplicateMailAccountId(id));
+            }
+            if account.name == name {
+                return Err(ConfigError::DuplicateMailAccountName(name));
+            }
+        }
+        configured.push(MailAccount { id, name });
+    }
+    configured.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let exclude_mailboxes = match exclude_mailboxes {
+        Some(paths) => paths,
+        None => {
+            let mut paths = Vec::new();
+            for path in DEFAULT_EXCLUDED_MAILBOXES {
+                paths.push(path.to_owned());
+            }
+            paths
+        }
+    };
+    for path in &exclude_mailboxes {
+        if path.trim().is_empty() {
+            return Err(ConfigError::EmptyExcludedMailbox);
+        }
+    }
+
+    if let Some(path) = &root
+        && path.as_os_str().is_empty()
+    {
+        return Err(ConfigError::EmptyMailRoot);
+    }
+
+    Ok(MailConfig {
+        accounts: configured,
+        exclude_mailboxes,
+        root,
+    })
+}
+
+fn is_decimal(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    for c in value.chars() {
+        if !c.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn check_name(value: &str) -> Result<(), &'static str> {
+    let Some(first) = value.chars().next() else {
+        return Err("empty");
+    };
+    if value.len() > NAME_MAX_LEN {
+        return Err("longer than 40 characters");
+    }
+    if first == '-' {
+        return Err("must start with a letter or digit");
+    }
+    for c in value.chars() {
+        if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+            return Err("must contain only lowercase letters, digits and `-`");
+        }
+    }
+    Ok(())
+}
+
 /// Whether `value` is a full hyphenated UUID, the only id form `remindctl` never reads as a row index.
 pub fn is_full_uuid(value: &str) -> bool {
     let mut groups = 0;
@@ -689,6 +1007,7 @@ mod tests {
                 write_lists: Vec::new(),
                 places: Vec::new(),
                 remindctl: None,
+                mail: None,
             }
         );
     }
@@ -1358,6 +1677,312 @@ mod tests {
         .unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.read_calendars, vec![id(READ_ID)]);
+    }
+
+    fn with_mail(mail: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!("listen = \"127.0.0.1:8790\"\n[mail]\n{mail}\n"))
+    }
+
+    fn mail_account(id: &str, name: &str) -> MailAccount {
+        MailAccount {
+            id: AccountId(id.to_owned()),
+            name: AccountName(name.to_owned()),
+        }
+    }
+
+    #[test]
+    fn valid_mail_config() {
+        let config = with_mail(&format!(
+            r#"
+            exclude_mailboxes = ["Trash", "Archive/2019"]
+            root = "/tmp/Mail/V10"
+
+            [mail.accounts]
+            "{READ_ID}" = "main"
+            "{}" = "gmail-2"
+            "#,
+            WRITE_ID.to_ascii_lowercase()
+        ))
+        .unwrap();
+        assert_eq!(
+            config.mail,
+            Some(MailConfig {
+                accounts: vec![
+                    mail_account(WRITE_ID, "gmail-2"),
+                    mail_account(READ_ID, "main"),
+                ],
+                exclude_mailboxes: vec!["Trash".to_owned(), "Archive/2019".to_owned()],
+                root: Some(PathBuf::from("/tmp/Mail/V10")),
+            })
+        );
+    }
+
+    #[test]
+    fn absent_mail_is_off() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        assert_eq!(config.mail, None);
+    }
+
+    #[test]
+    fn empty_mail_table_uses_defaults() {
+        let config = with_mail("").unwrap();
+        let mail = config.mail.unwrap();
+        assert!(mail.accounts.is_empty());
+        assert_eq!(mail.exclude_mailboxes, DEFAULT_EXCLUDED_MAILBOXES);
+        assert_eq!(mail.root, None);
+    }
+
+    #[test]
+    fn empty_exclude_mailboxes_excludes_nothing() {
+        let mail = with_mail("exclude_mailboxes = []").unwrap().mail.unwrap();
+        assert!(mail.exclude_mailboxes.is_empty());
+        assert!(!mail.is_excluded("Trash"));
+    }
+
+    #[test]
+    fn invalid_mail_account_names() {
+        for (name, expected) in [
+            ("", "empty"),
+            (
+                "Main",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            (
+                "my_mail",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            (
+                "my mail",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            (
+                "почта",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            ("-main", "must start with a letter or digit"),
+            (
+                "a1234567890123456789012345678901234567890",
+                "longer than 40 characters",
+            ),
+        ] {
+            let err =
+                with_mail(&format!("[mail.accounts]\n\"{READ_ID}\" = \"{name}\"")).unwrap_err();
+            let ConfigError::InvalidMailAccountName { id, value, reason } = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(id.as_str(), READ_ID);
+            assert_eq!(value, name);
+            assert_eq!(*reason, expected, "{name}");
+            assert!(
+                err.to_string()
+                    .contains(&format!("`mail.accounts.{READ_ID}`")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn longest_mail_account_name() {
+        let name = format!("9{}b", "a-".repeat(19));
+        let mail = with_mail(&format!("[mail.accounts]\n\"{READ_ID}\" = \"{name}\""))
+            .unwrap()
+            .mail
+            .unwrap();
+        assert_eq!(mail.accounts[0].name.as_str(), name);
+    }
+
+    #[test]
+    fn invalid_mail_account_ids() {
+        for value in [
+            "main",
+            "",
+            "4F7D9489",
+            "4F7D9489-A78F-4369-A951-213207DCFEEZ",
+        ] {
+            let err = with_mail(&format!("[mail.accounts]\n\"{value}\" = \"main\"")).unwrap_err();
+            let ConfigError::InvalidMailAccountId {
+                value: written,
+                reason,
+            } = &err
+            else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(written, value);
+            assert_eq!(*reason, "must be a full UUID");
+            assert!(err.to_string().contains("`mail.accounts`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_mail_account_name() {
+        let err = with_mail(&format!(
+            "[mail.accounts]\n\"{READ_ID}\" = \"main\"\n\"{WRITE_ID}\" = \"main\""
+        ))
+        .unwrap_err();
+        let ConfigError::DuplicateMailAccountName(name) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(name.as_str(), "main");
+    }
+
+    #[test]
+    fn duplicate_mail_account_id_in_other_case() {
+        let lower = READ_ID.to_ascii_lowercase();
+        let err = with_mail(&format!(
+            "[mail.accounts]\n\"{READ_ID}\" = \"main\"\n\"{lower}\" = \"other\""
+        ))
+        .unwrap_err();
+        let ConfigError::DuplicateMailAccountId(id) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(id.as_str(), READ_ID);
+    }
+
+    #[test]
+    fn empty_excluded_mailbox() {
+        for path in ["", " "] {
+            let err =
+                with_mail(&format!("exclude_mailboxes = [\"Trash\", \"{path}\"]")).unwrap_err();
+            let ConfigError::EmptyExcludedMailbox = err else {
+                panic!("unexpected error: {err:?}");
+            };
+        }
+    }
+
+    #[test]
+    fn empty_mail_root() {
+        let err = with_mail(r#"root = """#).unwrap_err();
+        let ConfigError::EmptyMailRoot = err else {
+            panic!("unexpected error: {err:?}");
+        };
+    }
+
+    #[test]
+    fn unknown_mail_key() {
+        let err = with_mail("accounts_dir = \"/tmp\"").unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(err.to_string().contains("accounts_dir"), "{err}");
+    }
+
+    #[test]
+    fn mail_account_name_wrong_type() {
+        let err = with_mail(&format!("[mail.accounts]\n\"{READ_ID}\" = 1")).unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+    }
+
+    #[test]
+    fn excluded_mailboxes_ignore_case() {
+        let mail = with_mail(r#"exclude_mailboxes = ["Junk", "[Gmail]/Spam", "Корзина"]"#)
+            .unwrap()
+            .mail
+            .unwrap();
+        assert!(mail.is_excluded("Junk"));
+        assert!(mail.is_excluded("JUNK"));
+        assert!(mail.is_excluded("[gmail]/spam"));
+        assert!(mail.is_excluded("КОРЗИНА"));
+        assert!(!mail.is_excluded("Junk/Old"));
+        assert!(!mail.is_excluded("Inbox"));
+    }
+
+    #[test]
+    fn default_exclusions_cover_trash() {
+        let mail = with_mail("").unwrap().mail.unwrap();
+        assert!(mail.is_excluded("trash"));
+        assert!(mail.is_excluded("[GMAIL]/TRASH"));
+        assert!(!mail.is_excluded("INBOX"));
+    }
+
+    #[test]
+    fn mail_account_lookup() {
+        let mail = with_mail(&format!("[mail.accounts]\n\"{READ_ID}\" = \"main\""))
+            .unwrap()
+            .mail
+            .unwrap();
+        let found = mail.account(&AccountId::parse(&READ_ID.to_ascii_lowercase()).unwrap());
+        assert_eq!(found, Some(&mail_account(READ_ID, "main")));
+        assert_eq!(mail.account(&AccountId::parse(WRITE_ID).unwrap()), None);
+    }
+
+    fn mail_version(mail: &Path, name: &str, with_index: bool) {
+        let data = mail.join(name).join("MailData");
+        fs::create_dir_all(&data).unwrap();
+        if with_index {
+            fs::write(data.join("Envelope Index"), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn root_discovery_picks_highest_version_with_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mail = dir.path();
+        mail_version(mail, "V2", true);
+        mail_version(mail, "V9", true);
+        mail_version(mail, "V10", true);
+        mail_version(mail, "V11", false);
+        mail_version(mail, "V", true);
+        mail_version(mail, "Vx", true);
+        mail_version(mail, "V+12", true);
+        mail_version(mail, "v13", true);
+        mail_version(mail, "MailData", true);
+        fs::write(mail.join("V14"), "").unwrap();
+        fs::create_dir_all(mail.join("V15/MailData/Envelope Index")).unwrap();
+        assert_eq!(discover_mail_root(mail).unwrap(), mail.join("V10"));
+    }
+
+    #[test]
+    fn root_discovery_without_index() {
+        let dir = tempfile::tempdir().unwrap();
+        mail_version(dir.path(), "V10", false);
+        let err = discover_mail_root(dir.path()).unwrap_err();
+        let MailRootError::NotFound(path) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(path, dir.path());
+    }
+
+    #[test]
+    fn root_discovery_unlistable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("Mail");
+        let err = discover_mail_root(&missing).unwrap_err();
+        let MailRootError::List { path, source } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(path, &missing);
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn root_discovery_under_home() {
+        let dir = tempfile::tempdir().unwrap();
+        mail_version(&dir.path().join("Library/Mail"), "V10", true);
+        assert_eq!(
+            mail_root_under_home(Some(dir.path().as_os_str().to_owned())).unwrap(),
+            dir.path().join("Library/Mail/V10")
+        );
+    }
+
+    #[test]
+    fn root_discovery_without_home() {
+        let MailRootError::NoHome = mail_root_under_home(None).unwrap_err() else {
+            panic!("expected NoHome");
+        };
+        let MailRootError::NoHome = mail_root_under_home(Some(OsString::new())).unwrap_err() else {
+            panic!("expected NoHome");
+        };
+    }
+
+    #[test]
+    fn configured_root_is_not_discovered() {
+        let mail = with_mail(r#"root = "/nonexistent/Mail/V10""#)
+            .unwrap()
+            .mail
+            .unwrap();
+        assert_eq!(mail.root().unwrap(), PathBuf::from("/nonexistent/Mail/V10"));
     }
 
     #[test]

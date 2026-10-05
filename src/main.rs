@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
 
-use eventkit_bridge::config::{Config, Place};
+use eventkit_bridge::config::{Config, MailAccount, MailConfig, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
 use eventkit_bridge::remindctl;
@@ -280,6 +280,7 @@ fn describe(path: &Path, config: &Config) -> String {
         write_lists,
         places,
         remindctl: _,
+        mail,
     } = config;
     let (ekctl, remindctl) = match executable::canonical() {
         Ok(executable) => (
@@ -326,6 +327,37 @@ fn describe(path: &Path, config: &Config) -> String {
         out.push_str(&format!("place: {name} (radius {radius} m)\n"));
     }
     out.push_str(&format!("remindctl: {remindctl}\n"));
+    match mail {
+        None => out.push_str("mail: off\n"),
+        Some(mail) => out.push_str(&describe_mail(mail)),
+    }
+    out
+}
+
+fn describe_mail(mail: &MailConfig) -> String {
+    let MailConfig {
+        accounts,
+        exclude_mailboxes,
+        root,
+    } = mail;
+    let mut out = String::from("mail: on\n");
+    if accounts.is_empty() {
+        out.push_str("mail accounts: none (every account invisible)\n");
+    }
+    for MailAccount { id, name } in accounts {
+        out.push_str(&format!("mail account: {name} ({id})\n"));
+    }
+    if exclude_mailboxes.is_empty() {
+        out.push_str("mail excluded mailboxes: none\n");
+    }
+    for path in exclude_mailboxes {
+        out.push_str(&format!("mail excluded mailbox: {path}\n"));
+    }
+    match root {
+        Some(root) => out.push_str(&format!("mail root: {}\n", root.display())),
+        None => out
+            .push_str("mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\n"),
+    }
     out
 }
 
@@ -473,6 +505,74 @@ mod tests {
         assert!(!text.contains("Springfield"), "{text}");
         assert!(!text.contains("reminders off"), "{text}");
         assert!(!text.contains("reminder writes refused"), "{text}");
+    }
+
+    #[test]
+    fn describe_mail_off() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.ends_with("mail: off\n"), "{text}");
+    }
+
+    #[test]
+    fn describe_mail_defaults() {
+        let config = Config::from_toml("listen = \"127.0.0.1:8790\"\n[mail]\n").unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.contains("mail: on\n"), "{text}");
+        assert!(
+            text.contains("mail accounts: none (every account invisible)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mail excluded mailbox: Trash\nmail excluded mailbox: Deleted Items\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mail excluded mailbox: [Gmail]/Spam\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn describe_mail_configured() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+
+            [mail]
+            exclude_mailboxes = ["Archive"]
+            root = "/tmp/Mail/V10"
+
+            [mail.accounts]
+            "8c1e2a44-0d6b-4f7e-9c11-5b2f3a9e7d10" = "main"
+            "4F7D9489-A78F-4369-A951-213207DCFEE3" = "gmail"
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(
+            text.contains(
+                "mail: on\nmail account: gmail (4F7D9489-A78F-4369-A951-213207DCFEE3)\nmail account: main (8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10)\nmail excluded mailbox: Archive\nmail root: /tmp/Mail/V10\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Trash"), "{text}");
+        assert!(!text.contains("invisible"), "{text}");
+    }
+
+    #[test]
+    fn describe_mail_without_exclusions() {
+        let config =
+            Config::from_toml("listen = \"127.0.0.1:8790\"\n[mail]\nexclude_mailboxes = []\n")
+                .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.contains("mail excluded mailboxes: none\n"), "{text}");
     }
 
     #[tokio::test]
