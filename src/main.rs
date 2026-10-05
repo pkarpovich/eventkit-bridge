@@ -261,7 +261,7 @@ fn describe(path: &Path, config: &Config) -> String {
         listen,
         hosts,
         read_calendars,
-        write_calendar,
+        write_calendars,
         ekctl: _,
     } = config;
     let ekctl = match executable::canonical() {
@@ -278,9 +278,11 @@ fn describe(path: &Path, config: &Config) -> String {
     for id in config.readable_calendars() {
         out.push_str(&format!("readable: {id}\n"));
     }
-    match write_calendar {
-        Some(id) => out.push_str(&format!("write_calendar: {id}\n")),
-        None => out.push_str("write_calendar: none (writes refused)\n"),
+    if write_calendars.is_empty() {
+        out.push_str("write_calendars: none (writes refused)\n");
+    }
+    for id in write_calendars {
+        out.push_str(&format!("writable: {id}\n"));
     }
     out.push_str(&format!("ekctl: {ekctl}\n"));
     out
@@ -378,7 +380,7 @@ mod tests {
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.starts_with("config ok: /tmp/config.toml\nlisten: 127.0.0.1:8790\n"));
         assert!(text.contains("read_calendars: none (unconfigured)\n"));
-        assert!(text.contains("write_calendar: none (writes refused)\n"));
+        assert!(text.contains("write_calendars: none (writes refused)\n"));
     }
 
     #[test]
@@ -388,7 +390,7 @@ mod tests {
             listen = "127.0.0.1:8790"
             hosts = ["mac.example.ts.net"]
             read_calendars = ["READ"]
-            write_calendar = "WRITE"
+            write_calendars = ["WRITE"]
             ekctl = "/opt/ekctl"
             "#,
         )
@@ -396,7 +398,7 @@ mod tests {
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.contains("listen: 127.0.0.1:8790\nhost: mac.example.ts.net\n"));
         assert!(text.contains("readable: READ\nreadable: WRITE\n"));
-        assert!(text.contains("write_calendar: WRITE\n"));
+        assert!(text.contains("writable: WRITE\n"));
         assert!(text.contains("ekctl: /opt/ekctl\n"));
         assert!(!text.contains("unconfigured"));
     }

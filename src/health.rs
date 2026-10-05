@@ -145,7 +145,7 @@ mod tests {
         }
         toml.push_str("]\n");
         if let Some(write) = write {
-            toml.push_str(&format!("write_calendar = \"{write}\"\n"));
+            toml.push_str(&format!("write_calendars = [\"{write}\"]\n"));
         }
         Config::from_toml(&toml).unwrap()
     }

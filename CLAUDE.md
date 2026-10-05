@@ -24,7 +24,7 @@ A Rust daemon inside `EventKitBridge.app` that serves an HTTP API over the Mac's
 
 - **Only `src/ekctl.rs` builds `ekctl` argv.** Every option is `--name=value`, every event id goes after a literal `--`, and `ekctl` is run directly, never through a shell. No route ever passes client input to `ekctl` except through these typed builders.
 - Every `ekctl` call goes through the runner's single mutex. A write holds one session across its `show event` policy check and the write itself.
-- Writes go only to `write_calendar`. `PATCH` and `DELETE` run `show event` first and refuse unless the event is in the write calendar.
+- Writes go only to `write_calendars`. `POST` names its calendar, and `PATCH` and `DELETE` run `show event` first and refuse unless the event is in a write calendar. They also refuse a recurring event with `409`: `ekctl` resolves an id to the series' first occurrence and saves with `.thisEvent`, so the change would land on the wrong occurrence. Keep that refusal until `ekctl` can address one occurrence.
 - The bridge never listens on an unspecified address.
 - Every request's `Host` (and absolute-form authority) must be the listen IP or a configured `hosts` name; the check runs before any route, so DNS rebinding from a tailnet browser cannot reach a handler.
 - **Never logged:** event titles, notes, locations, urls or attendees, from requests or from `ekctl` output. The only exception is the startup calendar listing (calendar id, title and source), which the user needs to fill in the config. A test in `src/server.rs` asserts this; keep it passing when adding routes or log lines.
