@@ -163,6 +163,12 @@ impl Serialize for Due {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalTime(DateTime<FixedOffset>);
 
+impl From<DateTime<FixedOffset>> for LocalTime {
+    fn from(value: DateTime<FixedOffset>) -> Self {
+        Self(value)
+    }
+}
+
 impl Serialize for LocalTime {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0.to_rfc3339_opts(SecondsFormat::Secs, false))

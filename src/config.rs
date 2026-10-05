@@ -15,7 +15,9 @@ const REMINDCTL_FILE_NAME: &str = "remindctl";
 const NAME_MAX_LEN: usize = 40;
 const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
 const MAIL_RELATIVE_PATH: &str = "Library/Mail";
-const MAIL_INDEX_RELATIVE_PATH: &str = "MailData/Envelope Index";
+
+/// Where the Envelope Index lives under a `V<n>` mail root.
+pub const MAIL_INDEX_RELATIVE_PATH: &str = "MailData/Envelope Index";
 
 /// The mailboxes left out when `[mail]` has no `exclude_mailboxes`.
 pub const DEFAULT_EXCLUDED_MAILBOXES: [&str; 7] = [
