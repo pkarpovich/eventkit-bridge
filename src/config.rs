@@ -60,12 +60,13 @@ impl fmt::Display for CalendarId {
 pub struct ListId(String);
 
 impl ListId {
-    /// Accepts a full UUID such as `4F7D9489-A78F-4369-A951-213207DCFEE3`.
+    /// Accepts a full UUID such as `4F7D9489-A78F-4369-A951-213207DCFEE3`, in uppercase as
+    /// `remindctl` reports it.
     pub fn parse(value: String) -> Result<Self, &'static str> {
         if !is_full_uuid(&value) {
             return Err("must be a full UUID");
         }
-        Ok(Self(value))
+        Ok(Self(value.to_ascii_uppercase()))
     }
 
     /// Returns the identifier as a string slice.
@@ -690,13 +691,13 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_list_id_is_a_uuid() {
+    fn lowercase_list_id_is_stored_in_uppercase() {
         let lower = READ_ID.to_ascii_lowercase();
         let config = Config::from_toml(&format!(
             "listen = \"127.0.0.1:8790\"\nread_lists = [\"{lower}\"]"
         ))
         .unwrap();
-        assert_eq!(config.read_lists, vec![list(&lower)]);
+        assert_eq!(config.read_lists, vec![list(READ_ID)]);
     }
 
     #[test]

@@ -359,8 +359,18 @@ fn edit(id: &ReminderId, changes: &ReminderChanges) -> Invocation {
     invocation.optional("notes", notes.as_deref());
     match due {
         None => {}
-        Some(Change::Set(due)) => invocation.option("due", &due.to_string()),
-        Some(Change::Clear) => invocation.flag("clear-due"),
+        Some(Change::Set(due @ Due::At(_))) => {
+            invocation.option("due", &due.to_string());
+            invocation.option("alarm", &due.to_string());
+        }
+        Some(Change::Set(due @ Due::Day(_))) => {
+            invocation.option("due", &due.to_string());
+            invocation.flag("clear-alarm");
+        }
+        Some(Change::Clear) => {
+            invocation.flag("clear-due");
+            invocation.flag("clear-alarm");
+        }
     }
     match repeat {
         None => {}
@@ -375,6 +385,27 @@ fn edit(id: &ReminderId, changes: &ReminderChanges) -> Invocation {
     }
     invocation.reminder_id(id);
     invocation
+}
+
+fn redact_address(err: RemindctlError, place: &Place) -> RemindctlError {
+    let Place {
+        name,
+        address,
+        radius: _,
+    } = place;
+    match err {
+        RemindctlError::Exit { code, reason } => RemindctlError::Exit {
+            code,
+            reason: reason.replace(address.as_str(), &format!("place {name}")),
+        },
+        err @ (RemindctlError::Spawn(_)
+        | RemindctlError::Io(_)
+        | RemindctlError::Timeout
+        | RemindctlError::OutputTooLarge
+        | RemindctlError::NotFound(_)
+        | RemindctlError::ListNotFound(_)
+        | RemindctlError::UnexpectedOutput) => err,
+    }
 }
 
 fn delete(id: &ReminderId) -> Invocation {
@@ -467,9 +498,19 @@ impl Session<'_> {
         self.execute(&info(id)).await
     }
 
-    /// Creates `reminder` and returns it as `remindctl` stored it.
+    /// Creates `reminder` and returns it as `remindctl` stored it. A failure never carries the
+    /// trigger's address: `remindctl` names it when geocoding fails, so it is replaced by the
+    /// place name.
     pub async fn add(&self, reminder: &NewReminder) -> Result<RcReminder, RemindctlError> {
-        self.execute(&add(reminder)).await
+        let result = self.execute(&add(reminder)).await;
+        let Some(Trigger {
+            place,
+            proximity: _,
+        }) = &reminder.location
+        else {
+            return result;
+        };
+        result.map_err(|err| redact_address(err, place))
     }
 
     /// Applies `changes` to the reminder `id` and returns it.
@@ -511,7 +552,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::fake_ekctl::{Fake, fixture};
-    use crate::subprocess::STDERR_TAIL;
+    use crate::subprocess::{STDERR_TAIL, STDOUT_CAP};
 
     const WRITE_LIST: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
     const REMINDER: &str = "1B2C3D4E-5F6A-4B7C-9D8E-0F1A2B3C4D5E";
@@ -677,6 +718,7 @@ mod tests {
                 "--title=-Renamed",
                 "--notes=Bring\tbag",
                 "--due=2026-10-07",
+                "--clear-alarm",
                 "--repeat=yearly",
                 "--priority=none",
                 "--complete",
@@ -701,8 +743,31 @@ mod tests {
                 "--json",
                 "--no-input",
                 "--clear-due",
+                "--clear-alarm",
                 "--no-repeat",
                 "--incomplete",
+                "--",
+                REMINDER,
+            ])
+        );
+    }
+
+    #[test]
+    fn edit_argv_timed_due_moves_the_alarm() {
+        let changes = ReminderChanges {
+            due: Some(Change::Set(Due::At(
+                DateTime::parse_from_rfc3339("2026-10-06T15:00:00+02:00").unwrap(),
+            ))),
+            ..ReminderChanges::default()
+        };
+        assert_eq!(
+            edit(&reminder_id(), &changes).args,
+            strings(&[
+                "edit",
+                "--json",
+                "--no-input",
+                "--due=2026-10-06T15:00:00+02:00",
+                "--alarm=2026-10-06T15:00:00+02:00",
                 "--",
                 REMINDER,
             ])
@@ -897,6 +962,48 @@ mod tests {
         assert!(
             err.to_string()
                 .starts_with("remindctl exited with code 1: ")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_add_never_reports_the_place_address() {
+        let fake = Fake::new(&format!(
+            "echo 'Error: Could not geocode location: {SHOP_ADDRESS}' >&2\nexit 1"
+        ));
+        let runner = fake.remindctl_runner(StoreLock::default());
+        let reminder = NewReminder {
+            location: Some(Trigger {
+                place: shop(),
+                proximity: Proximity::Arriving,
+            }),
+            ..new_reminder()
+        };
+        let err = runner.session().await.add(&reminder).await.unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains(SHOP_ADDRESS), "{message}");
+        assert_eq!(
+            message,
+            "remindctl exited with code 1: Error: Could not geocode location: place shop"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_over_the_cap_is_killed() {
+        let fake = Fake::new(&format!("exec head -c {} /dev/zero", STDOUT_CAP + 1));
+        let runner = fake.remindctl_runner(StoreLock::default());
+        let log = CallLog::default();
+        let err = log
+            .scope(async { runner.session().await.list().await.unwrap_err() })
+            .await;
+        let RemindctlError::OutputTooLarge = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(
+            log.calls(),
+            vec![Call {
+                command: Command::List,
+                outcome: CallOutcome::Killed,
+            }]
         );
     }
 

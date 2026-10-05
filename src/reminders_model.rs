@@ -17,12 +17,13 @@ pub struct ReminderId(String);
 pub struct InvalidReminderId;
 
 impl ReminderId {
-    /// Accepts a full UUID such as `0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D`.
+    /// Accepts a full UUID such as `0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D`, in uppercase as
+    /// `remindctl` reports it.
     pub fn parse(value: &str) -> Result<Self, InvalidReminderId> {
         if !is_full_uuid(value) {
             return Err(InvalidReminderId);
         }
-        Ok(Self(value.to_owned()))
+        Ok(Self(value.to_ascii_uppercase()))
     }
 
     /// Returns the identifier as a string slice.
@@ -161,13 +162,6 @@ impl Serialize for Due {
 /// An instant in the Mac's local zone, written as RFC 3339 with whole seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalTime(DateTime<FixedOffset>);
-
-impl LocalTime {
-    /// The instant with its local offset.
-    pub fn as_datetime(self) -> DateTime<FixedOffset> {
-        self.0
-    }
-}
 
 impl Serialize for LocalTime {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -365,19 +359,10 @@ pub struct Reminder {
     pub location: Option<ReminderLocation>,
 }
 
-/// What converting a `remindctl` reminder needs from the bridge.
-#[derive(Debug, Clone, Copy)]
-pub struct Conversion<'a, Tz> {
-    /// The configured places, matched against trigger addresses.
-    pub places: &'a [Place],
-    /// The zone due dates are reported in.
-    pub zone: &'a Tz,
-}
-
 impl RcReminder {
-    /// Converts to the bridge's reminder, dropping addresses and coordinates.
-    pub fn into_reminder<Tz: TimeZone>(self, conversion: Conversion<'_, Tz>) -> Reminder {
-        let Conversion { places, zone } = conversion;
+    /// Converts to the bridge's reminder, naming the trigger by its matching place in `places`
+    /// and reporting due dates in `zone`. Addresses and coordinates are dropped.
+    pub fn into_reminder<Tz: TimeZone>(self, places: &[Place], zone: &Tz) -> Reminder {
         let RcReminder {
             id,
             title,
@@ -483,10 +468,7 @@ mod tests {
     fn convert(reminder: RcReminder) -> Value {
         let places = places();
         let zone = plus_two();
-        let reminder = reminder.into_reminder(Conversion {
-            places: &places,
-            zone: &zone,
-        });
+        let reminder = reminder.into_reminder(&places, &zone);
         serde_json::to_value(reminder).unwrap()
     }
 
@@ -669,7 +651,12 @@ mod tests {
     #[test]
     fn reminder_id_must_be_a_full_uuid() {
         assert!(ReminderId::parse("0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D").is_ok());
-        assert!(ReminderId::parse("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d").is_ok());
+        assert_eq!(
+            ReminderId::parse("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+                .unwrap()
+                .as_str(),
+            "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D"
+        );
         for bad in [
             "",
             "1",
@@ -708,6 +695,5 @@ mod tests {
             serde_json::to_value(LocalTime(at)).unwrap(),
             json!("2026-10-06T09:00:00+02:00")
         );
-        assert_eq!(LocalTime(at).as_datetime(), at);
     }
 }

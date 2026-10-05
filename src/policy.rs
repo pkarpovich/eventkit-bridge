@@ -658,6 +658,19 @@ mod tests {
     }
 
     #[test]
+    fn lowercase_config_ids_match_listed_lists() {
+        let policy = policy(&format!(
+            "listen = \"127.0.0.1:8790\"\nwrite_lists = [\"{}\"]",
+            WRITE_ID.to_ascii_lowercase()
+        ));
+        assert!(policy.writable_list(&list_id(WRITE_ID)));
+        let lists = policy.filter_lists(listed_lists());
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].id, list_id(WRITE_ID));
+        assert!(lists[0].writable);
+    }
+
+    #[test]
     fn filter_lists_with_nothing_configured_is_empty() {
         assert!(read_and_write().filter_lists(listed_lists()).is_empty());
     }

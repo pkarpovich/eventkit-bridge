@@ -93,7 +93,6 @@ pub struct Probe<'a> {
 #[derive(Debug)]
 pub struct HealthCheck {
     configured: bool,
-    lists_configured: bool,
     ttl: Duration,
     cache: Mutex<Option<(Instant, Health)>>,
 }
@@ -103,7 +102,6 @@ impl HealthCheck {
     pub fn new(config: &Config, ttl: Duration) -> Self {
         Self {
             configured: !config.read_calendars.is_empty(),
-            lists_configured: !config.readable_lists().is_empty(),
             ttl,
             cache: Mutex::new(None),
         }
@@ -120,13 +118,13 @@ impl HealthCheck {
         {
             return health;
         }
-        let health = run_probe(probe, self.lists_configured).await;
+        let health = run_probe(probe).await;
         *cache = Some((Instant::now(), health));
         health
     }
 }
 
-async fn run_probe(probe: Probe<'_>, lists_configured: bool) -> Health {
+async fn run_probe(probe: Probe<'_>) -> Health {
     let Probe {
         calendars,
         reminders,
@@ -140,7 +138,7 @@ async fn run_probe(probe: Probe<'_>, lists_configured: bool) -> Health {
     if existing < policy.default_read_set().len() {
         return Health::Degraded(DegradedReason::CalendarMissing);
     }
-    if !lists_configured {
+    if !policy.any_readable_list() {
         return Health::Ok {
             calendars: existing,
             lists: None,

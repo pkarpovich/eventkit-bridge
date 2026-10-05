@@ -27,7 +27,7 @@ use crate::health::{HEALTH_TTL, HealthCheck, Probe};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
 use crate::policy::{GuardError, Policy, PolicyError, ReminderGuardError};
 use crate::remindctl::{self, RemindctlError};
-use crate::reminders_model::{Conversion, RcReminder, Reminder, ReminderId};
+use crate::reminders_model::{RcReminder, Reminder, ReminderId};
 use crate::request::{self, Invalid};
 
 /// The largest request body the bridge accepts.
@@ -190,10 +190,7 @@ impl App {
     }
 
     fn reminder(&self, reminder: RcReminder) -> Reminder {
-        reminder.into_reminder(Conversion {
-            places: &self.places,
-            zone: &Local,
-        })
+        reminder.into_reminder(&self.places, &Local)
     }
 }
 
@@ -423,18 +420,7 @@ async fn log_request(request: Request, next: Next) -> Response {
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let ekctl = joined(ekctl_calls.calls());
     let remindctl = joined(remindctl_calls.calls());
-    match (ekctl, remindctl) {
-        (None, None) => tracing::info!(%method, %route, status, duration_ms, "request"),
-        (Some(ekctl), None) => {
-            tracing::info!(%method, %route, status, duration_ms, ekctl, "request");
-        }
-        (None, Some(remindctl)) => {
-            tracing::info!(%method, %route, status, duration_ms, remindctl, "request");
-        }
-        (Some(ekctl), Some(remindctl)) => {
-            tracing::info!(%method, %route, status, duration_ms, ekctl, remindctl, "request");
-        }
-    }
+    tracing::info!(%method, %route, status, duration_ms, ekctl, remindctl, "request");
     response
 }
 
@@ -621,7 +607,9 @@ async fn list_reminders(
     let mut reminders = Vec::new();
     for list in &lists {
         for reminder in session.show(status, list).await? {
-            reminders.push(app.reminder(reminder));
+            if app.policy.readable_list(&reminder.list_id) {
+                reminders.push(app.reminder(reminder));
+            }
         }
     }
     Ok(Json(json!({ "reminders": reminders })).into_response())
@@ -633,6 +621,9 @@ async fn show_reminder(
 ) -> Result<Response, ApiError> {
     let Path(id) = id?;
     let id = reminder_id(&id)?;
+    if !app.policy.any_readable_list() {
+        return Err(PolicyError::NoReadableLists.into());
+    }
     let reminder = app.reminders.session().await.info(&id).await?;
     app.policy.require_reminder_readable(&reminder)?;
     Ok(Json(app.reminder(reminder)).into_response())
@@ -2327,6 +2318,18 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn reminders_from_unreadable_lists_are_dropped() {
+        let fake = Fake::scripted(&[(
+            "show open",
+            &fixture_text("remindctl_show.json").replace(WRITE_ID, OTHER_ID),
+        )]);
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = get(&router, &format!("/v1/reminders?list={WRITE_ID}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"reminders": []}));
+    }
+
+    #[tokio::test]
     async fn reminders_for_named_lists_and_status() {
         let fake = reminders_fake();
         let router = reminder_app(&lists_config(), &fake);
@@ -2383,6 +2386,9 @@ esac"#,
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"lists": []}));
         let (status, body) = get(&router, "/v1/reminders").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error("no readable lists configured"));
+        let (status, body) = get(&router, REMINDER_PATH).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, error("no readable lists configured"));
         let (status, body) = send(
@@ -2685,6 +2691,28 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn failed_geocode_never_returns_the_place_address() {
+        let fake = Fake::new(&format!(
+            "echo 'Error: Could not geocode location: {SHOP_ADDRESS}' >&2\nexit 1"
+        ));
+        let router = reminder_app(&lists_config(), &fake);
+        let (status, body) = send(
+            &router,
+            json_request(
+                Method::POST,
+                "/v1/reminders",
+                &json!({"list": WRITE_ID, "title": "Eggs", "place": "shop"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body,
+            error("remindctl exited with code 1: Error: Could not geocode location: place shop")
+        );
+    }
+
+    #[tokio::test]
     async fn create_reminder_in_a_list_that_is_not_writable() {
         let fake = reminders_fake();
         let router = reminder_app(&lists_config(), &fake);
@@ -2804,14 +2832,17 @@ esac"#,
     #[tokio::test]
     async fn update_reminder_maps_each_field() {
         let cases = [
-            (json!({"due": "2026-10-07"}), "--due=2026-10-07"),
+            (
+                json!({"due": "2026-10-07"}),
+                "--due=2026-10-07 --clear-alarm",
+            ),
             (
                 json!({"due": "2026-10-06T09:00:00Z"}),
-                "--due=2026-10-06T09:00:00+00:00",
+                "--due=2026-10-06T09:00:00+00:00 --alarm=2026-10-06T09:00:00+00:00",
             ),
             (
                 json!({"due": null, "repeat": null}),
-                "--clear-due --no-repeat",
+                "--clear-due --clear-alarm --no-repeat",
             ),
             (json!({"repeat": "yearly"}), "--repeat=yearly"),
             (json!({"repeat": null}), "--no-repeat"),
@@ -3089,6 +3120,7 @@ esac"#,
 
     #[tokio::test]
     async fn healthz_with_lists() {
+        let (captured, _guard) = capture();
         let fake = reminders_fake();
         let router = reminder_app(&lists_config(), &fake);
         let (status, body) = get(&router, "/healthz").await;
@@ -3104,6 +3136,11 @@ esac"#,
                 "status --json --no-input",
                 "list --json --no-input"
             ]
+        );
+        let log = captured.text();
+        assert!(
+            log.contains(r#"ekctl="list calendars=0" remindctl="status=0, list=0""#),
+            "{log}"
         );
     }
 

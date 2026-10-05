@@ -17,7 +17,7 @@ A Rust daemon inside `EventKitBridge.app` that serves an HTTP API over the Mac's
 - Tests live inline in a `#[cfg(test)] mod tests` block in the file they cover, and cover success and error paths.
 - No comments. `///` doc comments on `pub` items only.
 - No function with 4 or more parameters: pass a struct.
-- Every subprocess call has a deadline and is killed when it expires (`kill_on_drop(true)`).
+- Every subprocess call has a deadline and is killed when it expires (`kill_on_drop(true)`). Both runners (`src/ekctl.rs`, `src/remindctl.rs`) spawn through `src/subprocess.rs`, which owns the deadline, the stdout cap, the stderr tail and `CallOutcome`; never copy that into a runner.
 - HTTP tests drive the real `axum::Router` with `tower::ServiceExt::oneshot`; no sockets.
 
 ## Rules that protect the security model
@@ -31,7 +31,7 @@ A Rust daemon inside `EventKitBridge.app` that serves an HTTP API over the Mac's
 - The bridge never listens on an unspecified address.
 - Every request's `Host` (and absolute-form authority) must be the listen IP or a configured `hosts` name; the check runs before any route, so DNS rebinding from a tailnet browser cannot reach a handler.
 - **Never logged:** event titles, notes, locations, urls or attendees, and reminder titles or notes, from requests or from `ekctl`/`remindctl` output. The only exception is the startup listing (calendar id, title and source; reminder list id and title; place names and radii), which the user needs to fill in the config. A test in `src/server.rs` asserts this; keep it passing when adding routes or log lines.
-- **Place addresses and coordinates are never logged or returned**, not in the startup listing, `--check-config`, `/v1/places` or a reminder's `location`. A location trigger is reported only by its config place name and proximity.
+- **Place addresses and coordinates are never logged or returned**, not in the startup listing, `--check-config`, `/v1/places`, a reminder's `location` or a `remindctl` error (a failed geocode names the address, so `Session::add` replaces it with the place name). A location trigger is reported only by its config place name and proximity. Types holding an address (`config::Address`, `RcLocationTrigger`) implement `Debug` by hand to print `<redacted>`; never derive it.
 
 ## Bundle id
 

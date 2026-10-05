@@ -7,7 +7,7 @@ HTTP client (on the tailnet) --HTTP--> eventkit-bridge (LaunchAgent, EventKitBri
                                                                                           --exec--> remindctl --EventKit--> reminders
 ```
 
-The bridge does not call EventKit itself. It ships pinned copies of two native Swift command-line tools over EventKit inside its app bundle: [`ekctl`](https://github.com/schappim/ekctl) for calendars and [`remindctl`](https://github.com/openclaw/remindctl) for reminders. Each API request is turned into an `ekctl` or `remindctl` invocation, and the tool's JSON output is turned into the bridge's own JSON. Clients never see either tool and never pass it arguments.
+The bridge does not call EventKit itself. It ships pinned copies of two native Swift command-line tools over EventKit inside its app bundle: [`ekctl`](https://github.com/schappim/ekctl) v1.8.0 for calendars and [`remindctl`](https://github.com/openclaw/remindctl) v0.3.8 for reminders. Each API request is turned into an `ekctl` or `remindctl` invocation, and the tool's JSON output is turned into the bridge's own JSON. Clients never see either tool and never pass it arguments.
 
 It requires macOS 14 Sonoma or later on Apple Silicon.
 
@@ -298,7 +298,7 @@ A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: 
 | --- | --- |
 | `400` | The request is invalid; the message names the parameter or field. |
 | `403` | The security policy refused the request. |
-| `404` | The event or the route does not exist. |
+| `404` | The event, the reminder or the route does not exist. |
 | `409` | `PATCH` or `DELETE` on a recurring event. |
 | `405` | The route does not accept the method. |
 | `413` | The request body is larger than 64 KiB. |
@@ -346,7 +346,7 @@ A reminder:
 - `priority` is `none`, `low`, `medium` or `high`.
 - `location` is `null` without a location trigger. `place` is the config name whose address matches the trigger; a trigger that matches no configured place, such as one set on a phone, has `"place": null` and only its `proximity`. Addresses and coordinates are never returned.
 
-Reminder and list ids are full UUIDs, such as `3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A`. Anything else is `400`.
+Reminder and list ids are full UUIDs, such as `3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A`. Anything else is `400`. Letter case does not matter; the bridge reports ids in uppercase, as `remindctl` does.
 
 ### `GET /v1/lists`
 
@@ -395,7 +395,7 @@ A `list` outside the readable set is `403 list not readable: <id>`. A request wi
 
 ### `GET /v1/reminders/{id}`
 
-Returns one reminder. It is `404` when the reminder does not exist and `403 reminder is not in a readable list` when it lives in a list the bridge may not read.
+Returns one reminder. It is `404` when the reminder does not exist and `403 reminder is not in a readable list` when it lives in a list the bridge may not read. With no lists configured it answers `403 no readable lists configured` without running `remindctl`.
 
 ### `POST /v1/reminders`
 
@@ -422,7 +422,7 @@ A location trigger can only be set when the reminder is created.
 
 ### `PATCH /v1/reminders/{id}`
 
-Changes any non-empty subset of `title`, `notes`, `due`, `repeat`, `priority` and `completed`, and answers `200` with the reminder. The fields follow the `POST` rules. `due: null` removes the due date and `repeat: null` removes the repeat rule; for the other fields, `null` or an absent field leaves the value unchanged. `completed: true` completes the reminder, `false` reopens it.
+Changes any non-empty subset of `title`, `notes`, `due`, `repeat`, `priority` and `completed`, and answers `200` with the reminder. The fields follow the `POST` rules. Changing `due` moves the notification with it: a new date-time notifies at that time, and a new `YYYY-MM-DD` or `due: null` removes the timed notification. `due: null` removes the due date and `repeat: null` removes the repeat rule; for the other fields, `null` or an absent field leaves the value unchanged. `completed: true` completes the reminder, `false` reopens it.
 
 ```sh
 curl -X PATCH http://100.64.0.1:8790/v1/reminders/3D4E5F6A-7B8C-4D9E-BF0A-2B3C4D5E6F7A \
@@ -452,7 +452,7 @@ When the bridge can read every configured calendar, it answers `200`:
 {"status":"ok","version":"0.3.0","calendars":2,"lists":1}
 ```
 
-`calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Otherwise it answers `503`:
+`calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config. Otherwise it answers `503`:
 
 ```json
 {"status":"degraded","reason":"ekctl failed"}
@@ -507,6 +507,7 @@ The log is not rotated. To truncate it:
   ```
 
 - **A reminder with a `place` fails with `502`.** `remindctl` could not geocode the place's address. Check that the Mac is online and that the address is a street address, not a business name.
+- **A reminder request fails with `502 remindctl: List not found`.** A list in `read_lists` or `write_lists` was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **`/healthz` says `calendar missing`.** A calendar in the config was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
 - **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars and Reminders permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.

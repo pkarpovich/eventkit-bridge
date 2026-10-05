@@ -239,6 +239,11 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 - ⚠️ `App::new` takes `Runners { calendars, reminders }`, and `HealthCheck::check` takes a `Probe` struct (clippy's argument limit). Health also runs `remindctl list` to count the readable lists that exist, and reports `remindctl failed` (or `timeout`) when `remindctl` itself fails.
 - ⚠️ `PATCH` also refuses with `400 `repeat` needs `due`` when the change would leave a repeat rule without a due date, checked against the `info` result.
 - ⚠️ The startup listing of reminder lists runs even with no lists configured, because it is how the user finds the list ids.
+- ⚠️ The startup listing logs the place names (with radii) first, then the reminder lists.
+- ⚠️ Unlike a missing calendar, a configured list that no longer exists does not make health degraded; it only lowers the `lists` count.
+- ⚠️ `PATCH` with `due` also passes `--alarm=<same date-time>` for a timed due, and `--clear-alarm` for an all-day due or `due: null`, because `remindctl edit --due` leaves date alarms unchanged (unlike `add`). Location alarms are kept.
+- ⚠️ A failed `add` with a place reports `remindctl`'s stderr with the address replaced by the place name, since a geocoding failure names the address.
+- ⚠️ List and reminder ids are stored in uppercase, as `remindctl` reports them, so a lowercase id in the config or a request still matches.
 
 - [x] the six routes with validation and status mapping; the write guard in one session; startup listing of lists and place names
 - [x] health: `remindctl status` when lists are configured; the `lists` count; the new degraded reason
