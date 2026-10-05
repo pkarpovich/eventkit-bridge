@@ -11,10 +11,11 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
 
-use eventkit_bridge::config::Config;
+use eventkit_bridge::config::{Config, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
-use eventkit_bridge::server::{self, App, SHUTDOWN_GRACE};
+use eventkit_bridge::remindctl;
+use eventkit_bridge::server::{self, App, Runners, SHUTDOWN_GRACE};
 use eventkit_bridge::service::{
     Agent, Housing, Installed, Service, SystemLaunchctl, Uninstalled, UnloadWait,
 };
@@ -130,13 +131,22 @@ fn run_daemon() -> Result<(), String> {
     let executable = resolve_executable()?;
     let identity = Identity::of(&executable)
         .map_err(|err| format!("cannot stat {}: {err}", executable.display()))?;
-    let runner = Runner::new(config.ekctl_path(&executable), DEFAULT_TIMEOUT);
+    let calendars = Runner::new(config.ekctl_path(&executable), DEFAULT_TIMEOUT);
+    let reminders = remindctl::Runner::new(
+        config.remindctl_path(&executable),
+        DEFAULT_TIMEOUT,
+        calendars.lock(),
+    );
+    let runners = Runners {
+        calendars,
+        reminders,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("cannot start the runtime: {err}"))?;
     let shutdown = shutdown(executable, identity);
-    runtime.block_on(daemon(config, runner, shutdown))
+    runtime.block_on(daemon(config, runners, shutdown))
 }
 
 fn resolve_executable() -> Result<PathBuf, String> {
@@ -145,17 +155,20 @@ fn resolve_executable() -> Result<PathBuf, String> {
 
 async fn daemon(
     config: Config,
-    runner: Runner,
+    runners: Runners,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|err| format!("cannot listen on {}: {err}", config.listen))?;
     tracing::info!(listen = %config.listen, version = env!("CARGO_PKG_VERSION"), "listening");
-    let app = Arc::new(App::new(&config, runner));
+    let app = Arc::new(App::new(&config, runners));
     let announcer = {
         let app = Arc::clone(&app);
-        tokio::spawn(async move { app.announce_calendars(ANNOUNCE_RETRY).await })
+        tokio::spawn(async move {
+            app.announce_calendars(ANNOUNCE_RETRY).await;
+            app.announce_lists(ANNOUNCE_RETRY).await;
+        })
     };
     let result = server::serve(
         listener,
@@ -263,10 +276,17 @@ fn describe(path: &Path, config: &Config) -> String {
         read_calendars,
         write_calendars,
         ekctl: _,
+        read_lists,
+        write_lists,
+        places,
+        remindctl: _,
     } = config;
-    let ekctl = match executable::canonical() {
-        Ok(executable) => config.ekctl_path(&executable).display().to_string(),
-        Err(err) => format!("unknown ({err})"),
+    let (ekctl, remindctl) = match executable::canonical() {
+        Ok(executable) => (
+            config.ekctl_path(&executable).display().to_string(),
+            config.remindctl_path(&executable).display().to_string(),
+        ),
+        Err(err) => (format!("unknown ({err})"), format!("unknown ({err})")),
     };
     let mut out = format!("config ok: {}\nlisten: {listen}\n", path.display());
     for host in hosts {
@@ -285,6 +305,27 @@ fn describe(path: &Path, config: &Config) -> String {
         out.push_str(&format!("writable: {id}\n"));
     }
     out.push_str(&format!("ekctl: {ekctl}\n"));
+    if read_lists.is_empty() && write_lists.is_empty() {
+        out.push_str("read_lists: none (reminders off)\n");
+    }
+    for id in config.readable_lists() {
+        out.push_str(&format!("readable list: {id}\n"));
+    }
+    if write_lists.is_empty() {
+        out.push_str("write_lists: none (reminder writes refused)\n");
+    }
+    for id in write_lists {
+        out.push_str(&format!("writable list: {id}\n"));
+    }
+    for Place {
+        name,
+        address: _,
+        radius,
+    } in places
+    {
+        out.push_str(&format!("place: {name} (radius {radius} m)\n"));
+    }
+    out.push_str(&format!("remindctl: {remindctl}\n"));
     out
 }
 
@@ -381,6 +422,9 @@ mod tests {
         assert!(text.starts_with("config ok: /tmp/config.toml\nlisten: 127.0.0.1:8790\n"));
         assert!(text.contains("read_calendars: none (unconfigured)\n"));
         assert!(text.contains("write_calendars: none (writes refused)\n"));
+        assert!(text.contains("read_lists: none (reminders off)\n"));
+        assert!(text.contains("write_lists: none (reminder writes refused)\n"));
+        assert!(!text.contains("place:"));
     }
 
     #[test]
@@ -403,14 +447,51 @@ mod tests {
         assert!(!text.contains("unconfigured"));
     }
 
+    #[test]
+    fn describe_reminders() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+            read_lists = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
+            write_lists = ["8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"]
+            remindctl = "/opt/remindctl"
+
+            [places]
+            shop = { address = "1 Market Street, Springfield", radius = 150 }
+            home = { address = "2 Elm Street, Springfield" }
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.contains(
+            "readable list: 4F7D9489-A78F-4369-A951-213207DCFEE3\nreadable list: 8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10\n"
+        ));
+        assert!(text.contains("writable list: 8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10\n"));
+        assert!(text.contains("place: home (radius 100 m)\nplace: shop (radius 150 m)\n"));
+        assert!(text.contains("remindctl: /opt/remindctl\n"));
+        assert!(!text.contains("Street"), "{text}");
+        assert!(!text.contains("Springfield"), "{text}");
+        assert!(!text.contains("reminders off"), "{text}");
+        assert!(!text.contains("reminder writes refused"), "{text}");
+    }
+
     #[tokio::test]
     async fn daemon_fails_when_listen_cannot_be_bound() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = taken.local_addr().unwrap();
         let config = Config::from_toml(&format!("listen = \"{listen}\"")).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let runner = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
-        let result = daemon(config, runner, std::future::pending()).await;
+        let calendars = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
+        let reminders = remindctl::Runner::new(
+            dir.path().join("remindctl"),
+            DEFAULT_TIMEOUT,
+            calendars.lock(),
+        );
+        let runners = Runners {
+            calendars,
+            reminders,
+        };
+        let result = daemon(config, runners, std::future::pending()).await;
         let Err(message) = result else {
             panic!("the daemon started on an address in use");
         };

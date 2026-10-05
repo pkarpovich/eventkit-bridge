@@ -1,0 +1,20 @@
+[
+  {
+    "id" : "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
+    "overdueCount" : 0,
+    "reminderCount" : 4,
+    "title" : "Shopping"
+  },
+  {
+    "id" : "4F7D9489-A78F-4369-A951-213207DCFEE3",
+    "overdueCount" : 1,
+    "reminderCount" : 2,
+    "title" : "Personal"
+  },
+  {
+    "id" : "11111111-2222-3333-4444-555555555555",
+    "overdueCount" : 0,
+    "reminderCount" : 7,
+    "title" : "Work"
+  }
+]

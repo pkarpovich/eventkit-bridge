@@ -187,9 +187,9 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 **Files:**
 - Modify: `src/config.rs`, `src/main.rs` (`--check-config` output)
 
-- [ ] `read_lists`, `write_lists`, `[places]` and `remindctl` keys with the rules above; errors name the key
-- [ ] `readable_lists()` = read plus write lists without duplicates; `remindctl_path(executable)` like `ekctl_path`
-- [ ] tests:
+- [x] `read_lists`, `write_lists`, `[places]` and `remindctl` keys with the rules above; errors name the key
+- [x] `readable_lists()` = read plus write lists without duplicates; `remindctl_path(executable)` like `ekctl_path`
+- [x] tests:
   - valid config;
   - invalid list id;
   - invalid place name;
@@ -198,7 +198,8 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - default radius;
   - write list implied readable;
   - `--check-config` lists places by name without addresses
-- [ ] gate passes
+- ⚠️ `[places]` is read as a plain TOML table and checked by hand, and a TOML parse error reports only its message with line and column, never the source line. A toml error prints the offending line, and a serde type error quotes the value, so either would put an address in `--check-config` output and the daemon log.
+- [x] gate passes
 
 ### Task 2: remindctl runner, argv and parsing
 
@@ -206,11 +207,12 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 - Create: `src/remindctl.rs`, `src/reminders_model.rs`
 - Create: `fixtures/remindctl_list.json`, `remindctl_show.json`, `remindctl_info.json`, `remindctl_info_location.json`, `remindctl_add.json`, `remindctl_edit.json`, `remindctl_delete.json`, `remindctl_status.json` (shapes from Context, with placeholder ids, titles and coordinates)
 - Modify: `src/ekctl.rs` (share the lock)
+- ⚠️ Create: `src/subprocess.rs`. The spawn, deadline, output cap and stderr tail moved here from `ekctl.rs`, together with the `StoreLock` both runners share, so `remindctl.rs` reuses them instead of copying them.
 
-- [ ] a runner for `remindctl` sharing the `ekctl` runner's lock; the error mapping from Solution Overview
-- [ ] argv builders for every command, plus the UUID check
-- [ ] serde types and conversion to `List`/`Reminder`: `due` converted from UTC to the local zone, or to a date for all-day; `repeat` mapped or `custom`. Place resolution by exact address match against the config; addresses and coordinates dropped
-- [ ] tests:
+- [x] a runner for `remindctl` sharing the `ekctl` runner's lock; the error mapping from Solution Overview
+- [x] argv builders for every command, plus the UUID check
+- [x] serde types and conversion to `List`/`Reminder`: `due` converted from UTC to the local zone, or to a date for all-day; `repeat` mapped or `custom`. Place resolution by exact address match against the config; addresses and coordinates dropped
+- [x] tests:
   - each fixture parses;
   - exact argv per builder, including a `-`-leading title and `--` before ids;
   - an index-like id (`1`, a prefix) rejected before exec;
@@ -218,26 +220,36 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - other stderr -> upstream error with the tail;
   - timeout;
   - a reminder call and a calendar call never overlap (the fake records start and end)
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 3: Policy for lists
 
 **Files:**
-- Modify: `src/policy.rs`
+- Modify: `src/policy.rs`, `src/server.rs` (the new refusals map to `403`)
+- ⚠️ Also added `require_writable_list` (for `POST`) and `require_reminder_readable` (for `GET /v1/reminders/{id}`), so Task 4's routes take every list decision from `policy.rs`. The guard returns `ReminderGuardError` (`Denied` or `Remindctl`).
 
-- [ ] `readable_list`, `writable_list`, `filter_lists`, `require_readable_lists`, and `guard_reminder_write` (`info` first, refuse a non-writable list)
-- [ ] tests: filtering, refusals, guard allows and refuses, not-found passes through
-- [ ] gate passes
+- [x] `readable_list`, `writable_list`, `filter_lists`, `require_readable_lists`, and `guard_reminder_write` (`info` first, refuse a non-writable list)
+- [x] tests: filtering, refusals, guard allows and refuses, not-found passes through
+- [x] gate passes
 
 ### Task 4: Reminder routes and health
 
 **Files:**
 - Modify: `src/server.rs`, `src/request.rs`, `src/health.rs`, `src/main.rs`
+- ⚠️ Also modified: `src/subprocess.rs` (`CallOutcome` moved here so both runners' call logs share it), `src/remindctl.rs` (its own task-local `CallLog`), `src/policy.rs` (`any_readable_list`, so `GET /v1/lists` answers `[]` without running `remindctl` when no lists are configured).
+- ⚠️ `App::new` takes `Runners { calendars, reminders }`, and `HealthCheck::check` takes a `Probe` struct (clippy's argument limit). Health also runs `remindctl list` to count the readable lists that exist, and reports `remindctl failed` (or `timeout`) when `remindctl` itself fails.
+- ⚠️ `PATCH` also refuses with `400 `repeat` needs `due`` when the change would leave a repeat rule without a due date, checked against the `info` result.
+- ⚠️ The startup listing of reminder lists runs even with no lists configured, because it is how the user finds the list ids.
+- ⚠️ The startup listing logs the place names (with radii) first, then the reminder lists.
+- ⚠️ Unlike a missing calendar, a configured list that no longer exists does not make health degraded; it only lowers the `lists` count.
+- ⚠️ `PATCH` with `due` also passes `--alarm=<same date-time>` for a timed due, and `--clear-alarm` for an all-day due or `due: null`, because `remindctl edit --due` leaves date alarms unchanged (unlike `add`). Location alarms are kept.
+- ⚠️ A failed `add` with a place reports `remindctl`'s stderr with the address replaced by the place name, since a geocoding failure names the address.
+- ⚠️ List and reminder ids are stored in uppercase, as `remindctl` reports them, so a lowercase id in the config or a request still matches.
 
-- [ ] the six routes with validation and status mapping; the write guard in one session; startup listing of lists and place names
-- [ ] health: `remindctl status` when lists are configured; the `lists` count; the new degraded reason
-- [ ] request logging carries `remindctl="<command>=<exit>"`. A test asserts that titles, notes, place addresses and coordinates never reach the log
-- [ ] tests through `oneshot`:
+- [x] the six routes with validation and status mapping; the write guard in one session; startup listing of lists and place names
+- [x] health: `remindctl status` when lists are configured; the `lists` count; the new degraded reason
+- [x] request logging carries `remindctl="<command>=<exit>"`. A test asserts that titles, notes, place addresses and coordinates never reach the log
+- [x] tests through `oneshot`:
   - every route's success;
   - every `400` rule, including `repeat` without `due`, a fractional-second `due` and an unknown priority;
   - `due` as a date-time and as a date map to the right argv, and `null` maps to `--clear-due`;
@@ -247,7 +259,7 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - `proximity` without `place`;
   - health ok and `reminders access missing`;
   - no `remindctl` call when no lists are configured
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 5: Bundle, release and docs
 
@@ -255,29 +267,29 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 - Create: `scripts/fetch-remindctl.sh`, `remindctl-LICENSE.txt` (the MIT text from the `remindctl` repository)
 - Modify: `scripts/bundle.sh`, `scripts/build-signed.sh`, `.github/workflows/release.yml`, `entitlements.plist`, `Info.plist.template`, `README.md`, `CLAUDE.md`, `Cargo.toml`
 
-- [ ] the bundle and release changes from Solution Overview; `shellcheck` clean; both plists parse
-- [ ] README:
+- [x] the bundle and release changes from Solution Overview; `shellcheck` clean; both plists parse
+- [x] README:
   - the reminder routes;
   - lists and places in the config;
   - why places are named rather than free-form;
   - the second permission prompt;
   - that sections and the Groceries list type are not available
-- [ ] CLAUDE.md:
+- [x] CLAUDE.md:
   - only `remindctl.rs` builds `remindctl` argv;
   - ids must be full UUIDs because `remindctl` reads short numbers as row indexes;
   - addresses and coordinates are never logged or returned
-- [ ] version 0.3.0
-- [ ] gate passes
+- [x] version 0.3.0
+- [x] gate passes
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] every route, rule and status above has a test
-- [ ] `mise run check` green, `shellcheck` clean
+- [x] every route, rule and status above has a test
+- [x] `mise run check` green, `shellcheck` clean
 
 ### Task 7: [Final] Documentation
 
-- [ ] README matches the code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README matches the code
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

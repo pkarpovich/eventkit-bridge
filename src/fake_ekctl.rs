@@ -6,6 +6,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::ekctl::Runner;
+use crate::remindctl;
+use crate::subprocess::StoreLock;
 
 pub(crate) struct Fake {
     _dir: TempDir,
@@ -86,6 +88,10 @@ impl Fake {
 
     pub(crate) fn runner_with_timeout(&self, timeout: Duration) -> Runner {
         Runner::new(self.program.clone(), timeout)
+    }
+
+    pub(crate) fn remindctl_runner(&self, lock: StoreLock) -> remindctl::Runner {
+        remindctl::Runner::new(self.program.clone(), Duration::from_secs(10), lock)
     }
 
     pub(crate) fn log(&self) -> String {

@@ -9,15 +9,16 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-if [[ $# -lt 3 || $# -gt 4 ]]; then
-  echo "usage: $0 <binary> <ekctl> <out-dir> [identity]" >&2
+if [[ $# -lt 4 || $# -gt 5 ]]; then
+  echo "usage: $0 <binary> <ekctl> <remindctl> <out-dir> [identity]" >&2
   exit 2
 fi
 
 binary="$1"
 ekctl="$2"
-out_dir="$3"
-identity="${4:-}"
+remindctl="$3"
+out_dir="$4"
+identity="${5:-}"
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 entitlements="${root}/entitlements.plist"
@@ -35,7 +36,9 @@ rm -rf "$app"
 mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
 install -m 755 "$binary" "${app}/Contents/MacOS/eventkit-bridge"
 install -m 755 "$ekctl" "${app}/Contents/MacOS/ekctl"
+install -m 755 "$remindctl" "${app}/Contents/MacOS/remindctl"
 install -m 644 "${root}/ekctl-LICENSE.txt" "${app}/Contents/Resources/ekctl-LICENSE.txt"
+install -m 644 "${root}/remindctl-LICENSE.txt" "${app}/Contents/Resources/remindctl-LICENSE.txt"
 sed "s/__VERSION__/${version}/g" "${root}/Info.plist.template" > "${app}/Contents/Info.plist"
 plutil -lint "${app}/Contents/Info.plist" >&2
 
@@ -43,6 +46,9 @@ if [[ -n "$identity" ]]; then
   codesign --force --sign "$identity" --options runtime --timestamp \
     --entitlements "$entitlements" --identifier "${BUNDLE_ID}.ekctl" \
     "${app}/Contents/MacOS/ekctl"
+  codesign --force --sign "$identity" --options runtime --timestamp \
+    --entitlements "$entitlements" --identifier "${BUNDLE_ID}.remindctl" \
+    "${app}/Contents/MacOS/remindctl"
   codesign --force --sign "$identity" --options runtime --timestamp \
     --entitlements "$entitlements" --identifier "$BUNDLE_ID" \
     "$app"

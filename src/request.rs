@@ -1,10 +1,12 @@
-use chrono::{DateTime, FixedOffset, NaiveTime, TimeDelta, Timelike, Weekday};
-use serde::Deserialize;
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeDelta, Timelike, Weekday};
+use serde::{Deserialize, Deserializer};
 use url::Url;
 
-use crate::config::CalendarId;
+use crate::config::{CalendarId, ListId, Place};
 use crate::ekctl::{EventChanges, EventRange, FreeQuery, NewEvent, Weekdays, WorkingHours};
 use crate::model::Event;
+use crate::remindctl::{Change, Completion, NewReminder, ReminderChanges, ShowFilter, Trigger};
+use crate::reminders_model::{Due, Priority, Proximity, RcReminder, Repeat};
 
 const MAX_SPAN_DAYS: i64 = 62;
 const MAX_TITLE: usize = 500;
@@ -517,6 +519,300 @@ pub fn merged_range(changes: &EventChanges, existing: &Event) -> Result<(), Inva
         None => existing.end.as_datetime(),
     };
     check_range(START_END, start, end)
+}
+
+/// The query of `GET /v1/reminders`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemindersQuery {
+    /// Which reminders to return.
+    pub status: ShowFilter,
+    /// The requested lists, empty for every readable list.
+    pub lists: Vec<ListId>,
+}
+
+/// Parses the query of `GET /v1/reminders`.
+pub fn reminders_query(raw: Option<&str>) -> Result<RemindersQuery, Invalid> {
+    let mut query = RemindersQuery {
+        status: ShowFilter::Open,
+        lists: Vec::new(),
+    };
+    let Some(raw) = raw else {
+        return Ok(query);
+    };
+    let mut status_seen = false;
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        match key.as_ref() {
+            "list" => {
+                let Ok(id) = ListId::parse(value.into_owned()) else {
+                    return Err(Invalid::new("`list` must be a list id"));
+                };
+                query.lists.push(id);
+            }
+            "status" => {
+                if status_seen {
+                    return Err(Invalid::new("`status` is given more than once"));
+                }
+                status_seen = true;
+                query.status = match value.as_ref() {
+                    "open" => ShowFilter::Open,
+                    "completed" => ShowFilter::Completed,
+                    "all" => ShowFilter::All,
+                    _other => {
+                        return Err(Invalid::new("`status` must be open, completed or all"));
+                    }
+                };
+            }
+            unknown => {
+                return Err(Invalid::new(format!("unknown query parameter `{unknown}`")));
+            }
+        }
+    }
+    Ok(query)
+}
+
+/// The body of `POST /v1/reminders`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateReminderBody {
+    /// The list to create the reminder in; must be a write list.
+    pub list: String,
+    /// The title.
+    pub title: String,
+    /// The notes.
+    pub notes: Option<String>,
+    /// The due date: RFC 3339 date-time or `YYYY-MM-DD`.
+    pub due: Option<String>,
+    /// The repeat rule; needs `due`.
+    pub repeat: Option<String>,
+    /// The priority.
+    pub priority: Option<String>,
+    /// A configured place for a location trigger.
+    pub place: Option<String>,
+    /// When the location trigger fires; needs `place`.
+    pub proximity: Option<String>,
+}
+
+/// The body of `PATCH /v1/reminders/{id}`; `due` and `repeat` set to `null` are removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateReminderBody {
+    /// The new title.
+    pub title: Option<String>,
+    /// The new notes.
+    pub notes: Option<String>,
+    /// The new due date, or `null` to remove it.
+    #[serde(default, deserialize_with = "present")]
+    pub due: Option<Option<String>>,
+    /// The new repeat rule, or `null` to remove it.
+    #[serde(default, deserialize_with = "present")]
+    pub repeat: Option<Option<String>>,
+    /// The new priority.
+    pub priority: Option<String>,
+    /// The new completion state.
+    pub completed: Option<bool>,
+}
+
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+fn parse_due(value: &str) -> Result<Due, Invalid> {
+    if value.len() == 10 {
+        let Ok(day) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
+            return Err(Invalid::new(
+                "`due` must be an RFC 3339 timestamp or YYYY-MM-DD",
+            ));
+        };
+        return Ok(Due::Day(day));
+    }
+    let Ok(at) = DateTime::parse_from_rfc3339(value) else {
+        return Err(Invalid::new(
+            "`due` must be an RFC 3339 timestamp or YYYY-MM-DD",
+        ));
+    };
+    if at.nanosecond() != 0 {
+        return Err(Invalid::new("`due` must not have fractional seconds"));
+    }
+    Ok(Due::At(at))
+}
+
+fn parse_repeat(value: &str) -> Result<Repeat, Invalid> {
+    match value {
+        "daily" => Ok(Repeat::Daily),
+        "weekly" => Ok(Repeat::Weekly),
+        "biweekly" => Ok(Repeat::Biweekly),
+        "monthly" => Ok(Repeat::Monthly),
+        "yearly" => Ok(Repeat::Yearly),
+        _other => Err(Invalid::new(
+            "`repeat` must be daily, weekly, biweekly, monthly or yearly",
+        )),
+    }
+}
+
+fn parse_priority(value: &str) -> Result<Priority, Invalid> {
+    match value {
+        "none" => Ok(Priority::None),
+        "low" => Ok(Priority::Low),
+        "medium" => Ok(Priority::Medium),
+        "high" => Ok(Priority::High),
+        _other => Err(Invalid::new("`priority` must be none, low, medium or high")),
+    }
+}
+
+fn parse_proximity(value: &str) -> Result<Proximity, Invalid> {
+    match value {
+        "arriving" => Ok(Proximity::Arriving),
+        "leaving" => Ok(Proximity::Leaving),
+        _other => Err(Invalid::new("`proximity` must be arriving or leaving")),
+    }
+}
+
+fn parse_place(value: &str, places: &[Place]) -> Result<Place, Invalid> {
+    for place in places {
+        if place.name.as_str() == value {
+            return Ok(place.clone());
+        }
+    }
+    Err(Invalid::new("`place` must be a configured place name"))
+}
+
+fn parse_trigger(
+    place: Option<String>,
+    proximity: Option<String>,
+    places: &[Place],
+) -> Result<Option<Trigger>, Invalid> {
+    let Some(place) = place else {
+        if proximity.is_some() {
+            return Err(Invalid::new("`proximity` needs `place`"));
+        }
+        return Ok(None);
+    };
+    let place = parse_place(&place, places)?;
+    let proximity = match proximity {
+        Some(proximity) => parse_proximity(&proximity)?,
+        None => Proximity::Arriving,
+    };
+    Ok(Some(Trigger { place, proximity }))
+}
+
+fn repeat_needs_due() -> Invalid {
+    Invalid::new("`repeat` needs `due`")
+}
+
+/// Parses and validates a `POST /v1/reminders` body, resolving `place` against `places`.
+pub fn create_reminder_body(body: &[u8], places: &[Place]) -> Result<NewReminder, Invalid> {
+    let body: CreateReminderBody = parse_json(body)?;
+    let CreateReminderBody {
+        list,
+        title,
+        notes,
+        due,
+        repeat,
+        priority,
+        place,
+        proximity,
+    } = body;
+    let Ok(list) = ListId::parse(list) else {
+        return Err(Invalid::new("`list` must be a list id"));
+    };
+    let title = parse_title(title)?;
+    let notes = parse_optional_text("notes", notes, MAX_NOTES)?;
+    let due = match due {
+        Some(due) => Some(parse_due(&due)?),
+        None => None,
+    };
+    let repeat = match repeat {
+        Some(repeat) => Some(parse_repeat(&repeat)?),
+        None => None,
+    };
+    if repeat.is_some() && due.is_none() {
+        return Err(repeat_needs_due());
+    }
+    let priority = match priority {
+        Some(priority) => Some(parse_priority(&priority)?),
+        None => None,
+    };
+    let location = parse_trigger(place, proximity, places)?;
+    Ok(NewReminder {
+        list,
+        title,
+        notes,
+        due,
+        repeat,
+        priority,
+        location,
+    })
+}
+
+/// Parses and validates a `PATCH /v1/reminders/{id}` body, which must change at least one field.
+pub fn update_reminder_body(body: &[u8]) -> Result<ReminderChanges, Invalid> {
+    let body: UpdateReminderBody = parse_json(body)?;
+    let UpdateReminderBody {
+        title,
+        notes,
+        due,
+        repeat,
+        priority,
+        completed,
+    } = body;
+    let title = match title {
+        Some(title) => Some(parse_title(title)?),
+        None => None,
+    };
+    let due = match due {
+        None => None,
+        Some(None) => Some(Change::Clear),
+        Some(Some(due)) => Some(Change::Set(parse_due(&due)?)),
+    };
+    let repeat = match repeat {
+        None => None,
+        Some(None) => Some(Change::Clear),
+        Some(Some(repeat)) => Some(Change::Set(parse_repeat(&repeat)?)),
+    };
+    let priority = match priority {
+        Some(priority) => Some(parse_priority(&priority)?),
+        None => None,
+    };
+    let completion = match completed {
+        None => None,
+        Some(true) => Some(Completion::Complete),
+        Some(false) => Some(Completion::Incomplete),
+    };
+    let changes = ReminderChanges {
+        title,
+        notes: parse_optional_text("notes", notes, MAX_NOTES)?,
+        due,
+        repeat,
+        priority,
+        completion,
+    };
+    if changes == ReminderChanges::default() {
+        return Err(Invalid::new("the update changes no field"));
+    }
+    Ok(changes)
+}
+
+/// Refuses `changes` that would leave `existing` with a repeat rule but no due date.
+pub fn merged_repeat(changes: &ReminderChanges, existing: &RcReminder) -> Result<(), Invalid> {
+    let has_due = match changes.due {
+        Some(Change::Set(_)) => true,
+        Some(Change::Clear) => false,
+        None => existing.due_date.is_some(),
+    };
+    let has_repeat = match changes.repeat {
+        Some(Change::Set(_)) => true,
+        Some(Change::Clear) => false,
+        None => existing.recurrence_rule.is_some(),
+    };
+    let touched = changes.due.is_some() || changes.repeat.is_some();
+    if touched && has_repeat && !has_due {
+        return Err(repeat_needs_due());
+    }
+    Ok(())
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Invalid> {
@@ -1077,5 +1373,166 @@ mod tests {
         );
         assert_eq!(restore_plus_offset("x"), "x");
         assert_eq!(restore_plus_offset("ééé"), "ééé");
+    }
+
+    const LIST_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
+
+    fn places() -> Vec<Place> {
+        crate::config::Config::from_toml(
+            "listen = \"127.0.0.1:8790\"\n[places]\nshop = { address = \"1 Example Street\", radius = 150 }\n",
+        )
+        .unwrap()
+        .places
+    }
+
+    fn existing(due: bool, repeat: bool) -> RcReminder {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&crate::fake_ekctl::fixture_text("remindctl_info.json")).unwrap();
+        if !due {
+            value.as_object_mut().unwrap().remove("dueDate");
+        }
+        if !repeat {
+            value.as_object_mut().unwrap().remove("recurrenceRule");
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn reminders_query_defaults_and_values() {
+        assert_eq!(
+            reminders_query(None),
+            Ok(RemindersQuery {
+                status: ShowFilter::Open,
+                lists: Vec::new(),
+            })
+        );
+        let query =
+            reminders_query(Some(&format!("list={LIST_ID}&status=all&list={READ_ID}"))).unwrap();
+        assert_eq!(query.status, ShowFilter::All);
+        assert_eq!(
+            query.lists,
+            vec![
+                ListId::parse(LIST_ID.to_owned()).unwrap(),
+                ListId::parse(READ_ID.to_owned()).unwrap()
+            ]
+        );
+        assert_eq!(
+            reminders_query(Some("status=completed")).unwrap().status,
+            ShowFilter::Completed
+        );
+    }
+
+    #[test]
+    fn reminders_query_errors() {
+        assert_eq!(
+            message(reminders_query(Some("status=closed"))),
+            "`status` must be open, completed or all"
+        );
+        assert_eq!(
+            message(reminders_query(Some("status=all&status=open"))),
+            "`status` is given more than once"
+        );
+        assert_eq!(
+            message(reminders_query(Some("list=2"))),
+            "`list` must be a list id"
+        );
+        assert_eq!(
+            message(reminders_query(Some("calendar=x"))),
+            "unknown query parameter `calendar`"
+        );
+    }
+
+    #[test]
+    fn due_forms() {
+        assert_eq!(
+            parse_due("2026-10-06T09:00:00+02:00"),
+            Ok(Due::At(at("2026-10-06T09:00:00+02:00")))
+        );
+        assert_eq!(
+            parse_due("2026-10-07"),
+            Ok(Due::Day(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap()))
+        );
+        for bad in ["2026-10-6", "2026-02-30", "2026-10-06 09:00", "soon", ""] {
+            assert_eq!(
+                message(parse_due(bad)),
+                "`due` must be an RFC 3339 timestamp or YYYY-MM-DD",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            message(parse_due("2026-10-06T09:00:00.001Z")),
+            "`due` must not have fractional seconds"
+        );
+    }
+
+    #[test]
+    fn create_reminder_resolves_the_place() {
+        let reminder = create_reminder_body(
+            &body(json!({"list": LIST_ID, "title": "Milk", "place": "shop"})),
+            &places(),
+        )
+        .unwrap();
+        let Some(Trigger { place, proximity }) = reminder.location else {
+            panic!("no trigger");
+        };
+        assert_eq!(place.name.as_str(), "shop");
+        assert_eq!(place.radius, 150);
+        assert_eq!(proximity, Proximity::Arriving);
+        assert_eq!(
+            message(create_reminder_body(
+                &body(json!({"list": LIST_ID, "title": "Milk", "place": "shop"})),
+                &[],
+            )),
+            "`place` must be a configured place name"
+        );
+    }
+
+    #[test]
+    fn update_reminder_tells_null_from_absent() {
+        let changes = update_reminder_body(&body(json!({"due": null}))).unwrap();
+        assert_eq!(changes.due, Some(Change::Clear));
+        assert_eq!(changes.repeat, None);
+        let changes = update_reminder_body(&body(json!({"repeat": null}))).unwrap();
+        assert_eq!(changes.repeat, Some(Change::Clear));
+        assert_eq!(changes.due, None);
+        let changes = update_reminder_body(&body(json!({"repeat": "monthly"}))).unwrap();
+        assert_eq!(changes.repeat, Some(Change::Set(Repeat::Monthly)));
+        assert_eq!(
+            message(update_reminder_body(&body(json!({"priority": null})))),
+            "the update changes no field"
+        );
+    }
+
+    #[test]
+    fn merged_repeat_needs_a_due_date() {
+        let clear_due = ReminderChanges {
+            due: Some(Change::Clear),
+            ..ReminderChanges::default()
+        };
+        let set_repeat = ReminderChanges {
+            repeat: Some(Change::Set(Repeat::Daily)),
+            ..ReminderChanges::default()
+        };
+        let clear_both = ReminderChanges {
+            due: Some(Change::Clear),
+            repeat: Some(Change::Clear),
+            ..ReminderChanges::default()
+        };
+        let rename = ReminderChanges {
+            title: Some("x".to_owned()),
+            ..ReminderChanges::default()
+        };
+        assert_eq!(
+            message(merged_repeat(&clear_due, &existing(true, true))),
+            "`repeat` needs `due`"
+        );
+        assert_eq!(merged_repeat(&clear_due, &existing(true, false)), Ok(()));
+        assert_eq!(merged_repeat(&set_repeat, &existing(true, false)), Ok(()));
+        assert_eq!(
+            message(merged_repeat(&set_repeat, &existing(false, false))),
+            "`repeat` needs `due`"
+        );
+        assert_eq!(merged_repeat(&clear_both, &existing(true, true)), Ok(()));
+        assert_eq!(merged_repeat(&rename, &existing(false, true)), Ok(()));
     }
 }
