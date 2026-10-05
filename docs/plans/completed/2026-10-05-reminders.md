@@ -282,8 +282,8 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 
 ### Task 7: [Final] Documentation
 
-- [ ] README matches the code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README matches the code
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

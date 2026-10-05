@@ -66,9 +66,10 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 
    Until the permission is granted, the log shows `cannot list calendars yet, retrying` instead. The daemon retries every 30 seconds, so the listing appears within half a minute of approving the prompt.
 
-   After the calendars, the daemon logs one line per reminder list, in the same way:
+   After the calendars, the daemon logs one line per configured place, by name and radius, then one line per reminder list, in the same way:
 
    ```
+   2026-10-05T09:00:02.317912Z  INFO eventkit_bridge::server: place name=shop radius=150
    2026-10-05T09:00:02.318040Z  INFO eventkit_bridge::server: reminder list id=2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37 title="Shopping" readable=false writable=false
    ```
 
@@ -110,7 +111,7 @@ home = { address = "2 Example Road, Exampletown" }
 | `ekctl` | no | The `ekctl` binary to run. Defaults to the `ekctl` next to the `eventkit-bridge` binary, which is the one inside the app bundle. Only useful for development. |
 | `read_lists` | no | The reminder list ids reads may touch, as full UUIDs. Empty by default. With no lists at all, reminders are off and `remindctl` is only run for the startup listing. |
 | `write_lists` | no | The reminder list ids writes may touch. They are always readable as well. Empty by default, which refuses every reminder write with `403`. |
-| `places` | no | Named places for location triggers. A name is 1 to 40 characters of lowercase letters, digits and `-`, starting with a letter or digit. `address` is a street address and must not be empty; `radius` is in meters, 50 to 2000, default 100. |
+| `places` | no | Named places for location triggers. A name is 1 to 40 characters of lowercase letters, digits and `-`, starting with a letter or digit. `address` is a street address and must not be blank or contain a control character; `radius` is in meters, 50 to 2000, default 100. |
 | `remindctl` | no | The `remindctl` binary to run. Defaults to the `remindctl` next to the `eventkit-bridge` binary. Only useful for development. |
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
@@ -363,10 +364,14 @@ With no lists configured it answers `{"lists":[]}` without running `remindctl`.
 
 ### `GET /v1/places`
 
-Lists the configured places by name and radius in meters.
+Lists the configured places by name and radius in meters, sorted by name.
+
+```sh
+curl http://100.64.0.1:8790/v1/places
+```
 
 ```json
-{"places":[{"name":"shop","radius":150},{"name":"home","radius":100}]}
+{"places":[{"name":"home","radius":100},{"name":"shop","radius":150}]}
 ```
 
 ### `GET /v1/reminders`
