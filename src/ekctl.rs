@@ -615,84 +615,15 @@ fn reported(subcommand: Subcommand, message: &str) -> EkctlError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
     use std::sync::Arc;
 
-    use tempfile::TempDir;
-
     use super::*;
+    use crate::fake_ekctl::{Fake, fixture};
     use crate::model::CalendarKind;
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
     const WRITE_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
     const EVENT_ID: &str = "46EBD007-078C-44AD-80E9-5D55FDE5FCC8:1709076";
-
-    struct Fake {
-        _dir: TempDir,
-        program: PathBuf,
-        log: PathBuf,
-    }
-
-    impl Fake {
-        fn new(body: &str) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let log = dir.path().join("log");
-            let source = dir.path().join("script");
-            let program = dir.path().join("ekctl");
-            fs::write(
-                &source,
-                format!("#!/bin/sh\nLOG='{}'\n{body}\n", log.display()),
-            )
-            .unwrap();
-            let copied = std::process::Command::new("cp")
-                .arg(&source)
-                .arg(&program)
-                .status()
-                .unwrap();
-            assert!(copied.success());
-            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-            Self {
-                _dir: dir,
-                program,
-                log,
-            }
-        }
-
-        fn printing(fixture_name: &str) -> Self {
-            Self::new(&format!("cat '{}'", fixture(fixture_name).display()))
-        }
-
-        fn recording(fixture_name: &str) -> Self {
-            Self::new(&format!(
-                "for arg in \"$@\"; do printf '%s\\0' \"$arg\" >> \"$LOG\"; done\ncat '{}'",
-                fixture(fixture_name).display()
-            ))
-        }
-
-        fn runner(&self) -> Runner {
-            Runner::new(self.program.clone(), Duration::from_secs(10))
-        }
-
-        fn log(&self) -> String {
-            fs::read_to_string(&self.log).unwrap_or_default()
-        }
-
-        fn recorded_args(&self) -> Vec<String> {
-            let mut args = Vec::new();
-            for arg in self.log().split_terminator('\0') {
-                args.push(arg.to_owned());
-            }
-            args
-        }
-    }
-
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join(name)
-    }
 
     fn calendar_id(value: &str) -> CalendarId {
         CalendarId::parse(value.to_owned()).unwrap()
@@ -1172,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_the_child() {
         let fake = Fake::new("echo start >> \"$LOG\"\nsleep 1\necho end >> \"$LOG\"");
-        let runner = Runner::new(fake.program.clone(), Duration::from_millis(300));
+        let runner = fake.runner_with_timeout(Duration::from_millis(300));
         let err = runner.session().await.list_calendars().await.unwrap_err();
         let EkctlError::Timeout = err else {
             panic!("unexpected error: {err:?}");

@@ -357,14 +357,15 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 **Files:**
 - Create: `src/policy.rs`
 
-- [ ] `Policy` from config: `readable(id)`, `writable(id)`, `filter_calendars` (event calendars only, readable only, `writable` flag set), `require_readable(ids)`, `default_read_set()`
-- [ ] the write guard: given an event id, run `show` through the runner and allow only when the event's calendar is the write calendar. It returns the shown event so `PATCH` can merge the range, and it runs inside the same runner lock as the write that follows
-- [ ] tests:
+- [x] `Policy` from config: `readable(id)`, `writable(id)`, `filter_calendars` (event calendars only, readable only, `writable` flag set), `require_readable(ids)`, `default_read_set()`
+- [x] the write guard: given an event id, run `show` through the runner and allow only when the event's calendar is the write calendar. It returns the shown event so `PATCH` can merge the range, and it runs inside the same runner lock as the write that follows
+- [x] tests:
   - filtering on the `list calendars` fixture (reminder lists dropped, non-readable dropped, writable flag);
   - non-readable id refused;
   - empty request set means all readable;
   - write guard allows the write calendar, refuses a user calendar, and passes through not-found
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ the fake `ekctl` used by tests moved from `ekctl.rs` into `src/fake_ekctl.rs` (`#[cfg(test)]`) so `policy.rs` and the Task 4 HTTP tests share it. `Policy` also exposes `write_calendar()`, which gives `403 no write calendar configured` for `POST`
 
 ### Task 4: HTTP API and health
 
