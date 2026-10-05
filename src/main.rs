@@ -170,6 +170,12 @@ async fn daemon(
             app.announce_lists(ANNOUNCE_RETRY).await;
         })
     };
+    let mail_announcer = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.announce_mail(ANNOUNCE_RETRY).await;
+        })
+    };
     let result = server::serve(
         listener,
         app,
@@ -180,6 +186,7 @@ async fn daemon(
     )
     .await;
     announcer.abort();
+    mail_announcer.abort();
     result.map_err(|err| format!("server failed: {err}"))?;
     tracing::info!("stopped");
     Ok(())

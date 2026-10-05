@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -73,6 +74,50 @@ JOIN addresses a ON a.ROWID = r.address
 WHERE r.message IN rarray(:messages) AND r.type IN (0, 1)
 ORDER BY r.message, r.type, r.position";
 
+const PROBE_SQL: &str = "SELECT count(*) FROM sqlite_master";
+
+const COLUMN_SQL: &str = "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2";
+
+const NEWEST_SQL: &str = "
+SELECT max(date_received) FROM messages
+WHERE deleted IS NOT 1 AND mailbox IN rarray(:mailboxes)";
+
+const MAILBOX_COUNTS_SQL: &str = "
+SELECT mailbox, count(*), max(date_received) FROM messages
+WHERE deleted IS NOT 1
+GROUP BY mailbox";
+
+const REGISTERED_ACCOUNTS_SQL: &str = "
+SELECT a.ZIDENTIFIER, t.ZIDENTIFIER, a.ZACCOUNTDESCRIPTION
+FROM ZACCOUNT a
+LEFT JOIN ZACCOUNTTYPE t ON t.Z_PK = a.ZACCOUNTTYPE";
+
+const ACCOUNTS_DATABASE: &str = "Accounts/Accounts4.sqlite";
+
+const SCHEMA: [(&str, &[&str]); 6] = [
+    (
+        "messages",
+        &[
+            "sender",
+            "subject",
+            "summary",
+            "date_sent",
+            "date_received",
+            "mailbox",
+            "read",
+            "flagged",
+            "deleted",
+            "size",
+            "conversation_id",
+        ],
+    ),
+    ("subjects", &["subject"]),
+    ("addresses", &["address", "comment"]),
+    ("summaries", &["summary"]),
+    ("recipients", &["message", "address", "type", "position"]),
+    ("mailboxes", &["url", "total_count", "unread_count"]),
+];
+
 /// The kind of account a mailbox belongs to, from its URL scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +128,17 @@ pub enum AccountKind {
     Imap,
     /// `local://`, a mailbox kept only on the Mac.
     Local,
+}
+
+impl fmt::Display for AccountKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            AccountKind::Exchange => "exchange",
+            AccountKind::Imap => "imap",
+            AccountKind::Local => "local",
+        };
+        f.write_str(name)
+    }
 }
 
 /// A row of the `mailboxes` table, decoded: `<scheme>://<account uuid>/<url-encoded path>`.
@@ -165,7 +221,7 @@ pub enum StoreError {
     #[error("Envelope Index query failed: {0}")]
     Query(#[from] rusqlite::Error),
     /// A requested account name is not configured.
-    #[error("unknown mail account {0}")]
+    #[error("unknown mail account \"{0}\"")]
     UnknownAccount(AccountName),
     /// A requested mailbox is not a visible mailbox of the requested accounts.
     #[error("unknown mailbox {0:?}")]
@@ -364,6 +420,54 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
 }
 
+/// What `/healthz` reports about the mail store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailStatus {
+    /// How many accounts are configured, each with mailboxes.
+    pub accounts: usize,
+    /// Seconds since the newest visible message was received; `None` when there is none.
+    pub newest_message_age_s: Option<u64>,
+}
+
+/// Why the mail store cannot serve reads as configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailProblem {
+    /// The Envelope Index cannot be opened or read, which is how a missing Full Disk Access grant shows up.
+    NoAccess,
+    /// A table or column the bridge reads is missing.
+    SchemaChanged,
+    /// A configured account has no mailboxes.
+    AccountMissing,
+}
+
+/// An account as `~/Library/Accounts/Accounts4.sqlite` registers it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegisteredAccount {
+    /// The account type, such as `com.apple.account.IMAP`.
+    pub account_type: Option<String>,
+    /// The description, which for an IMAP account is often its email address.
+    pub description: Option<String>,
+}
+
+/// An account found in the `mailboxes` table, as the startup listing shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountListing {
+    /// The account uuid.
+    pub id: AccountId,
+    /// The account kind, from its mailbox URLs.
+    pub kind: AccountKind,
+    /// The account in `Accounts4.sqlite`, when it is readable and lists it.
+    pub registered: Option<RegisteredAccount>,
+    /// How many mailboxes it has, excluded ones included.
+    pub mailboxes: usize,
+    /// How many messages those mailboxes hold, deleted rows left out.
+    pub messages: i64,
+    /// When the newest of them was received.
+    pub newest: Option<LocalTime>,
+    /// The configured name; `None` when the account is invisible.
+    pub name: Option<AccountName>,
+}
+
 /// Read access to Mail's store under the `[mail]` config.
 #[derive(Debug, Clone)]
 pub struct MailStore {
@@ -375,6 +479,18 @@ pub struct MailReader<'a> {
     config: &'a MailConfig,
     root: MailRoot,
     conn: Connection,
+}
+
+struct MailboxRecord {
+    id: i64,
+    url: MailboxUrl,
+    total: i64,
+    unread: i64,
+}
+
+struct Tally {
+    listing: AccountListing,
+    newest: Option<i64>,
 }
 
 struct VisibleMailbox {
@@ -439,18 +555,32 @@ impl MailStore {
             conn,
         })
     }
+
+    /// Opens the store and checks the schema, the configured accounts and the newest message as of `now`.
+    pub fn status(&self, now: DateTime<Utc>) -> Result<MailStatus, MailProblem> {
+        let reader = match self.open() {
+            Ok(reader) => reader,
+            Err(err) => return Err(unreadable(&err)),
+        };
+        reader.status(now)
+    }
 }
 
-/// Opens an Envelope Index read-only, with the busy timeout, `query_only`, `ufold` and `rarray`.
-///
-/// Never `immutable`: Mail writes the WAL while the bridge reads.
-pub fn open_index(path: &Path) -> rusqlite::Result<Connection> {
+fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "query_only", true)?;
+    Ok(conn)
+}
+
+/// Opens an Envelope Index read-only, with the busy timeout, `query_only`, `ufold` and `rarray`.
+///
+/// Never `immutable`: Mail writes the WAL while the bridge reads.
+pub fn open_index(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = open_read_only(path)?;
     conn.create_scalar_function(
         "ufold",
         1,
@@ -651,24 +781,183 @@ impl MailReader<'_> {
         }))
     }
 
-    fn visible_mailboxes(&self) -> rusqlite::Result<Vec<VisibleMailbox>> {
+    /// Every account in the `mailboxes` table with its counts, the configured name and, when
+    /// `Accounts4.sqlite` is readable, its type and description.
+    pub fn listing(&self) -> Result<Vec<AccountListing>, StoreError> {
+        let records = self.mailbox_records()?;
+        let mut counts = HashMap::new();
+        let mut stmt = self.conn.prepare_cached(MAILBOX_COUNTS_SQL)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let mailbox: i64 = row.get(0)?;
+            let messages: i64 = row.get(1)?;
+            let newest: Option<i64> = row.get(2)?;
+            counts.insert(mailbox, (messages, newest));
+        }
+        let mut registered = self.registered_accounts();
+        let mut tallies: BTreeMap<AccountId, Tally> = BTreeMap::new();
+        for MailboxRecord {
+            id,
+            url:
+                MailboxUrl {
+                    kind,
+                    account,
+                    path: _,
+                },
+            total: _,
+            unread: _,
+        } in records
+        {
+            let (messages, newest) = counts.get(&id).copied().unwrap_or((0, None));
+            let tally = tallies.entry(account.clone()).or_insert_with(|| Tally {
+                listing: AccountListing {
+                    registered: registered.remove(&account),
+                    name: self
+                        .config
+                        .account(&account)
+                        .map(|found| found.name.clone()),
+                    id: account,
+                    kind,
+                    mailboxes: 0,
+                    messages: 0,
+                    newest: None,
+                },
+                newest: None,
+            });
+            tally.listing.mailboxes += 1;
+            tally.listing.messages += messages;
+            tally.newest = tally.newest.max(newest);
+        }
+        let mut listings = Vec::new();
+        for Tally {
+            mut listing,
+            newest,
+        } in tallies.into_values()
+        {
+            listing.newest = newest.map(local_time);
+            listings.push(listing);
+        }
+        Ok(listings)
+    }
+
+    fn status(&self, now: DateTime<Utc>) -> Result<MailStatus, MailProblem> {
+        if let Err(err) = self
+            .conn
+            .query_row(PROBE_SQL, [], |row| row.get::<_, i64>(0))
+        {
+            return Err(unreadable(&err));
+        }
+        match self.missing_column() {
+            Ok(None) => {}
+            Ok(Some((table, column))) => {
+                tracing::warn!(table, column, "the Envelope Index schema changed");
+                return Err(MailProblem::SchemaChanged);
+            }
+            Err(err) => return Err(unreadable(&err)),
+        }
+        let records = match self.mailbox_records() {
+            Ok(records) => records,
+            Err(err) => return Err(unreadable(&err)),
+        };
+        for MailAccount { id, name } in &self.config.accounts {
+            let mut found = false;
+            for record in &records {
+                if record.url.account == *id {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                tracing::warn!(account = %name, "a configured mail account has no mailboxes");
+                return Err(MailProblem::AccountMissing);
+            }
+        }
+        let newest = match self.newest() {
+            Ok(newest) => newest,
+            Err(err) => return Err(unreadable(&err)),
+        };
+        let newest_message_age_s =
+            newest.map(|newest| u64::try_from(now.timestamp() - newest).unwrap_or(0));
+        Ok(MailStatus {
+            accounts: self.config.accounts.len(),
+            newest_message_age_s,
+        })
+    }
+
+    fn missing_column(&self) -> rusqlite::Result<Option<(&'static str, &'static str)>> {
+        let mut stmt = self.conn.prepare_cached(COLUMN_SQL)?;
+        for (table, columns) in SCHEMA {
+            for column in columns {
+                let found: i64 = stmt.query_row([table, column], |row| row.get(0))?;
+                if found == 0 {
+                    return Ok(Some((table, column)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn newest(&self) -> rusqlite::Result<Option<i64>> {
+        let mut ids = Vec::new();
+        for mailbox in self.visible_mailboxes()? {
+            ids.push(Value::from(mailbox.id));
+        }
+        let mut stmt = self.conn.prepare_cached(NEWEST_SQL)?;
+        stmt.query_row(named_params! { ":mailboxes": Rc::new(ids) }, |row| {
+            row.get(0)
+        })
+    }
+
+    fn registered_accounts(&self) -> HashMap<AccountId, RegisteredAccount> {
+        let Some(library) = self.root.as_path().parent().and_then(Path::parent) else {
+            return HashMap::new();
+        };
+        match registered_accounts(&library.join(ACCOUNTS_DATABASE)) {
+            Ok(registered) => registered,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot read Accounts4.sqlite, account descriptions left out");
+                HashMap::new()
+            }
+        }
+    }
+
+    fn mailbox_records(&self) -> rusqlite::Result<Vec<MailboxRecord>> {
         let mut stmt = self.conn.prepare_cached(MAILBOXES_SQL)?;
         let mut rows = stmt.query([])?;
-        let mut visible = Vec::new();
+        let mut records = Vec::new();
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             let url: Option<String> = row.get(1)?;
             let total: Option<i64> = row.get(2)?;
             let unread: Option<i64> = row.get(3)?;
             let Some(url) = url else { continue };
-            let Ok(MailboxUrl {
-                kind,
-                account,
-                path,
-            }) = MailboxUrl::parse(&url)
-            else {
+            let Ok(url) = MailboxUrl::parse(&url) else {
                 continue;
             };
+            records.push(MailboxRecord {
+                id,
+                url,
+                total: total.unwrap_or(0),
+                unread: unread.unwrap_or(0),
+            });
+        }
+        Ok(records)
+    }
+
+    fn visible_mailboxes(&self) -> rusqlite::Result<Vec<VisibleMailbox>> {
+        let mut visible = Vec::new();
+        for MailboxRecord {
+            id,
+            url:
+                MailboxUrl {
+                    kind,
+                    account,
+                    path,
+                },
+            total,
+            unread,
+        } in self.mailbox_records()?
+        {
             let Some(account) = self.config.account(&account) else {
                 continue;
             };
@@ -682,8 +971,8 @@ impl MailReader<'_> {
                 kind,
                 path,
                 display,
-                total: total.unwrap_or(0),
-                unread: unread.unwrap_or(0),
+                total,
+                unread,
             });
         }
         Ok(visible)
@@ -801,6 +1090,33 @@ impl SummaryParts<'_> {
             has_body,
         }
     }
+}
+
+fn unreadable(err: &dyn fmt::Display) -> MailProblem {
+    tracing::warn!(error = %err, "cannot read the mail store");
+    MailProblem::NoAccess
+}
+
+fn registered_accounts(path: &Path) -> rusqlite::Result<HashMap<AccountId, RegisteredAccount>> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn.prepare(REGISTERED_ACCOUNTS_SQL)?;
+    let mut rows = stmt.query([])?;
+    let mut registered = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let id: Option<String> = row.get(0)?;
+        let Some(id) = id else { continue };
+        let Ok(id) = AccountId::parse(&id) else {
+            continue;
+        };
+        registered.insert(
+            id,
+            RegisteredAccount {
+                account_type: row.get(1)?,
+                description: row.get(2)?,
+            },
+        );
+    }
+    Ok(registered)
 }
 
 fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<SummaryRow>> {
@@ -1677,5 +1993,188 @@ mod tests {
             Err(err) => Err(err),
         };
         assert!(result.is_err());
+    }
+    #[test]
+    fn status_reports_accounts_and_the_newest_visible_message() {
+        let fixture = Fixture::standard();
+        let store = MailStore::new(fixture.config());
+        let now = DateTime::<Utc>::from_timestamp(fixture::T + 1_000, 0).unwrap();
+        assert_eq!(
+            store.status(now),
+            Ok(MailStatus {
+                accounts: 2,
+                newest_message_age_s: Some(700),
+            })
+        );
+        let past = DateTime::<Utc>::from_timestamp(fixture::T, 0).unwrap();
+        assert_eq!(
+            store.status(past).map(|status| status.newest_message_age_s),
+            Ok(Some(0))
+        );
+    }
+
+    #[test]
+    fn status_without_messages_has_no_age() {
+        let fixture = Fixture::empty();
+        for (id, url) in [
+            (1, format!("ews://{}/Inbox", fixture::MAIN)),
+            (2, format!("imap://{}/INBOX", fixture::GMAIL)),
+        ] {
+            fixture.mailbox(&MailboxRow {
+                id,
+                url,
+                total: 0,
+                unread: 0,
+            });
+        }
+        let store = MailStore::new(fixture.config());
+        assert_eq!(
+            store.status(Utc::now()),
+            Ok(MailStatus {
+                accounts: 2,
+                newest_message_age_s: None,
+            })
+        );
+    }
+
+    #[test]
+    fn status_reports_an_unreadable_store() {
+        let fixture = Fixture::standard();
+        let mut config = fixture.config();
+        config.root = Some(fixture.root.join("missing"));
+        assert_eq!(
+            MailStore::new(config).status(Utc::now()),
+            Err(MailProblem::NoAccess)
+        );
+        fs::write(
+            fixture.root.join(MAIL_INDEX_RELATIVE_PATH),
+            b"not a database at all, just text that is long enough to be read as a header",
+        )
+        .unwrap();
+        assert_eq!(
+            MailStore::new(fixture.config()).status(Utc::now()),
+            Err(MailProblem::NoAccess)
+        );
+    }
+
+    #[test]
+    fn status_reports_a_missing_table_or_column() {
+        for change in [
+            "ALTER TABLE messages DROP COLUMN flagged",
+            "DROP TABLE summaries",
+            "ALTER TABLE mailboxes RENAME COLUMN url TO address",
+        ] {
+            let fixture = Fixture::standard();
+            fixture.writer().execute_batch(change).unwrap();
+            assert_eq!(
+                MailStore::new(fixture.config()).status(Utc::now()),
+                Err(MailProblem::SchemaChanged),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_reports_a_configured_account_without_mailboxes() {
+        let fixture = Fixture::standard();
+        let mut config = fixture.config();
+        config.accounts.push(MailAccount {
+            id: AccountId::parse("11111111-2222-3333-4444-555555555555").unwrap(),
+            name: name("gone"),
+        });
+        assert_eq!(
+            MailStore::new(config).status(Utc::now()),
+            Err(MailProblem::AccountMissing)
+        );
+    }
+
+    fn listing(fixture: &Fixture) -> Vec<AccountListing> {
+        MailStore::new(fixture.config())
+            .open()
+            .unwrap()
+            .listing()
+            .unwrap()
+    }
+
+    #[test]
+    fn listing_counts_every_account_with_its_registration() {
+        let fixture = Fixture::standard();
+        fixture.register_accounts(&[
+            (fixture::MAIN, "com.apple.account.Exchange", "Work"),
+            (
+                &fixture::GMAIL.to_lowercase(),
+                "com.apple.account.IMAP",
+                "me@gmail.example",
+            ),
+        ]);
+        let listed = listing(&fixture);
+        let newest = |seconds| Some(local_time(fixture::T + seconds));
+        assert_eq!(
+            listed,
+            vec![
+                AccountListing {
+                    id: AccountId::parse(fixture::OTHER).unwrap(),
+                    kind: AccountKind::Imap,
+                    registered: None,
+                    mailboxes: 1,
+                    messages: 1,
+                    newest: newest(600),
+                    name: None,
+                },
+                AccountListing {
+                    id: AccountId::parse(fixture::MAIN).unwrap(),
+                    kind: AccountKind::Exchange,
+                    registered: Some(RegisteredAccount {
+                        account_type: Some("com.apple.account.Exchange".to_owned()),
+                        description: Some("Work".to_owned()),
+                    }),
+                    mailboxes: 2,
+                    messages: 5,
+                    newest: newest(400),
+                    name: Some(name("main")),
+                },
+                AccountListing {
+                    id: AccountId::parse(fixture::GMAIL).unwrap(),
+                    kind: AccountKind::Imap,
+                    registered: Some(RegisteredAccount {
+                        account_type: Some("com.apple.account.IMAP".to_owned()),
+                        description: Some("me@gmail.example".to_owned()),
+                    }),
+                    mailboxes: 3,
+                    messages: 3,
+                    newest: newest(700),
+                    name: Some(name("gmail")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_without_accounts_database_has_no_registration() {
+        let fixture = Fixture::standard();
+        let listed = listing(&fixture);
+        assert_eq!(listed.len(), 3);
+        for account in &listed {
+            assert_eq!(account.registered, None, "{}", account.id);
+        }
+        let fixture = Fixture::empty();
+        fixture.mailbox(&MailboxRow {
+            id: 1,
+            url: format!("local://{}/Archive", fixture::MAIN),
+            total: 0,
+            unread: 0,
+        });
+        let listed = listing(&fixture);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, AccountKind::Local);
+        assert_eq!(listed[0].messages, 0);
+        assert_eq!(listed[0].newest, None);
+    }
+
+    #[test]
+    fn account_kind_displays_its_scheme_name() {
+        assert_eq!(AccountKind::Exchange.to_string(), "exchange");
+        assert_eq!(AccountKind::Imap.to_string(), "imap");
+        assert_eq!(AccountKind::Local.to_string(), "local");
     }
 }

@@ -139,7 +139,7 @@ pub fn multipart_message() -> String {
 impl Fixture {
     pub fn empty() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("V10");
+        let root = dir.path().join("Library/Mail/V10");
         let index = root.join(MAIL_INDEX_RELATIVE_PATH);
         fs::create_dir_all(index.parent().unwrap()).unwrap();
         let conn = Connection::open(&index).unwrap();
@@ -255,6 +255,27 @@ impl Fixture {
             );
         }
         fixture
+    }
+
+    pub fn register_accounts(&self, accounts: &[(&str, &str, &str)]) {
+        let path = self.root.join("../../Accounts/Accounts4.sqlite");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ZACCOUNTTYPE (Z_PK INTEGER PRIMARY KEY, ZIDENTIFIER VARCHAR, ZACCOUNTTYPEDESCRIPTION VARCHAR);
+             CREATE TABLE ZACCOUNT (Z_PK INTEGER PRIMARY KEY, ZACCOUNTTYPE INTEGER, ZIDENTIFIER VARCHAR, ZACCOUNTDESCRIPTION VARCHAR, ZUSERNAME VARCHAR);",
+        )
+        .unwrap();
+        for (id, kind, description) in accounts {
+            conn.execute("INSERT INTO ZACCOUNTTYPE (ZIDENTIFIER) VALUES (?1)", [kind])
+                .unwrap();
+            let kind = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO ZACCOUNT (ZACCOUNTTYPE, ZIDENTIFIER, ZACCOUNTDESCRIPTION) VALUES (?1, ?2, ?3)",
+                params![kind, id, description],
+            )
+            .unwrap();
+        }
     }
 
     pub fn writer(&self) -> Connection {

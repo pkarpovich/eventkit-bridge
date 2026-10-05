@@ -2,8 +2,10 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeDelta, Timelike, W
 use serde::{Deserialize, Deserializer};
 use url::Url;
 
-use crate::config::{CalendarId, ListId, Place};
+use crate::config::{AccountName, CalendarId, ListId, Place};
 use crate::ekctl::{EventChanges, EventRange, FreeQuery, NewEvent, Weekdays, WorkingHours};
+use crate::mail::MessageId;
+use crate::mail::store::{Cursor, CursorError, DEFAULT_LIMIT, MAX_LIMIT, MessageQuery, ReadFilter};
 use crate::model::Event;
 use crate::remindctl::{Change, Completion, NewReminder, ReminderChanges, ShowFilter, Trigger};
 use crate::reminders_model::{Due, Priority, Proximity, RcReminder, Repeat};
@@ -13,6 +15,8 @@ const MAX_TITLE: usize = 500;
 const MAX_LOCATION: usize = 500;
 const MAX_NOTES: usize = 10_000;
 const MAX_URL: usize = 2_000;
+const MAX_MAILBOX: usize = 1_000;
+const MAX_QUERY: usize = 500;
 
 /// A request the bridge refuses before running `ekctl`, answered with `400`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -85,17 +89,23 @@ impl Params {
                 params.calendars.push(id);
                 continue;
             }
-            if !allowed.contains(&key.as_ref()) {
-                return Err(Invalid::new(format!("unknown query parameter `{key}`")));
-            }
-            for (seen, _) in &params.single {
-                if *seen == key {
-                    return Err(Invalid::new(format!("`{key}` is given more than once")));
-                }
-            }
-            params.single.push((key.into_owned(), value.into_owned()));
+            params.insert((key.into_owned(), value.into_owned()), allowed)?;
         }
         Ok(params)
+    }
+
+    fn insert(&mut self, pair: (String, String), allowed: &[&str]) -> Result<(), Invalid> {
+        let (key, value) = pair;
+        if !allowed.contains(&key.as_str()) {
+            return Err(Invalid::new(format!("unknown query parameter `{key}`")));
+        }
+        for (seen, _) in &self.single {
+            if *seen == key {
+                return Err(Invalid::new(format!("`{key}` is given more than once")));
+            }
+        }
+        self.single.push((key, value));
+        Ok(())
     }
 
     fn get(&self, key: &str) -> Option<&str> {
@@ -185,6 +195,11 @@ const LIMIT_BOUNDS: Bounds = Bounds {
     min: 1,
     max: 100,
 };
+const MAIL_LIMIT_BOUNDS: Bounds = Bounds {
+    default: DEFAULT_LIMIT,
+    min: 1,
+    max: MAX_LIMIT,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct RangeKeys {
@@ -199,6 +214,10 @@ const FROM_TO: RangeKeys = RangeKeys {
 const START_END: RangeKeys = RangeKeys {
     from: "start",
     to: "end",
+};
+const SINCE_UNTIL: RangeKeys = RangeKeys {
+    from: "since",
+    to: "until",
 };
 
 fn check_range(
@@ -568,6 +587,85 @@ pub fn reminders_query(raw: Option<&str>) -> Result<RemindersQuery, Invalid> {
         }
     }
     Ok(query)
+}
+
+/// Parses the query of `GET /v1/mail/messages`; `accounts` holds the requested names, empty for all.
+pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
+    let mut accounts = Vec::new();
+    let mut params = Params {
+        single: Vec::new(),
+        calendars: Vec::new(),
+    };
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
+        if key == "account" {
+            let Ok(name) = AccountName::parse(&value) else {
+                return Err(Invalid::new(format!("unknown mail account {value:?}")));
+            };
+            accounts.push(name);
+            continue;
+        }
+        params.insert(
+            (key.into_owned(), value.into_owned()),
+            &[
+                "mailbox", "since", "until", "q", "unread", "limit", "cursor",
+            ],
+        )?;
+    }
+    let mailbox = match params.get("mailbox") {
+        Some("") => return Err(Invalid::new("`mailbox` must not be empty")),
+        Some(mailbox) => {
+            check_text("mailbox", mailbox, MAX_MAILBOX)?;
+            Some(mailbox.to_owned())
+        }
+        None => None,
+    };
+    let since = params.timestamp("since")?;
+    let until = params.timestamp("until")?;
+    if let (Some(since), Some(until)) = (since, until) {
+        check_range(SINCE_UNTIL, since, until)?;
+    }
+    let q = match params.get("q") {
+        Some(q) => {
+            check_text("q", q, MAX_QUERY)?;
+            Some(q.to_owned())
+        }
+        None => None,
+    };
+    let read = match params.get("unread") {
+        None | Some("false") => ReadFilter::Any,
+        Some("true") => ReadFilter::Unread,
+        Some(_) => return Err(Invalid::new("`unread` must be true or false")),
+    };
+    let limit = params.number("limit", MAIL_LIMIT_BOUNDS)?;
+    let cursor = match params.get("cursor") {
+        Some(cursor) => match Cursor::decode(cursor) {
+            Ok(cursor) => Some(cursor),
+            Err(CursorError) => {
+                return Err(Invalid::new(
+                    "`cursor` must be the `next_cursor` of a previous page",
+                ));
+            }
+        },
+        None => None,
+    };
+    Ok(MessageQuery {
+        accounts,
+        mailbox,
+        since,
+        until,
+        q,
+        read,
+        limit,
+        cursor,
+    })
+}
+
+/// Parses the id of `GET /v1/mail/messages/{id}`.
+pub fn mail_message_id(value: &str) -> Result<MessageId, Invalid> {
+    let Some(id) = MessageId::parse(value) else {
+        return Err(Invalid::new("message id must be a positive integer"));
+    };
+    Ok(id)
 }
 
 /// The body of `POST /v1/reminders`.
@@ -1534,5 +1632,110 @@ mod tests {
         );
         assert_eq!(merged_repeat(&clear_both, &existing(true, true)), Ok(()));
         assert_eq!(merged_repeat(&rename, &existing(false, true)), Ok(()));
+    }
+    fn account(value: &str) -> AccountName {
+        AccountName::parse(value).unwrap()
+    }
+
+    #[test]
+    fn mail_messages_query_defaults() {
+        for raw in [None, Some("")] {
+            assert_eq!(mail_messages_query(raw), Ok(MessageQuery::default()));
+        }
+    }
+
+    #[test]
+    fn mail_messages_query_full() {
+        let cursor = Cursor::decode("MTc5MTIwMDEwMDo4MzA").unwrap();
+        let query = mail_messages_query(Some(
+            "account=main&account=gmail&mailbox=%5BGmail%5D%2FAll%20Mail&since=2026-10-01T00:00:00+02:00&until=2026-10-05T00:00:00Z&q=%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82&unread=true&limit=100&cursor=MTc5MTIwMDEwMDo4MzA",
+        ))
+        .unwrap();
+        assert_eq!(
+            query,
+            MessageQuery {
+                accounts: vec![account("main"), account("gmail")],
+                mailbox: Some("[Gmail]/All Mail".to_owned()),
+                since: Some(at("2026-10-01T00:00:00+02:00")),
+                until: Some(at("2026-10-05T00:00:00Z")),
+                q: Some("Привет".to_owned()),
+                read: ReadFilter::Unread,
+                limit: 100,
+                cursor: Some(cursor),
+            }
+        );
+        let query =
+            mail_messages_query(Some("unread=false&limit=1&since=2026-10-01T00:00:00Z")).unwrap();
+        assert_eq!(query.read, ReadFilter::Any);
+        assert_eq!(query.limit, 1);
+        assert_eq!(query.until, None);
+    }
+
+    #[test]
+    fn mail_messages_query_rejects_bad_values() {
+        let cases = [
+            ("account=Main", "unknown mail account \"Main\""),
+            ("account=", "unknown mail account \"\""),
+            ("mailbox=", "`mailbox` must not be empty"),
+            (
+                "mailbox=a%00b",
+                "`mailbox` must not contain control characters",
+            ),
+            ("since=yesterday", "`since` must be an RFC 3339 timestamp"),
+            ("until=2026-10-05", "`until` must be an RFC 3339 timestamp"),
+            (
+                "since=2026-10-05T00:00:00Z&until=2026-10-05T00:00:00Z",
+                "`until` must be after `since`",
+            ),
+            (
+                "since=2026-10-05T00:00:00Z&until=2026-10-04T00:00:00Z",
+                "`until` must be after `since`",
+            ),
+            ("unread=yes", "`unread` must be true or false"),
+            ("unread=", "`unread` must be true or false"),
+            ("limit=0", "`limit` must be an integer from 1 to 100"),
+            ("limit=101", "`limit` must be an integer from 1 to 100"),
+            ("limit=ten", "`limit` must be an integer from 1 to 100"),
+            (
+                "cursor=not-a-cursor",
+                "`cursor` must be the `next_cursor` of a previous page",
+            ),
+            (
+                "cursor=",
+                "`cursor` must be the `next_cursor` of a previous page",
+            ),
+            (
+                "from=2026-10-05T00:00:00Z",
+                "unknown query parameter `from`",
+            ),
+            ("q=a&q=b", "`q` is given more than once"),
+            (
+                "mailbox=Inbox&mailbox=Sent",
+                "`mailbox` is given more than once",
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(message(mail_messages_query(Some(raw))), expected, "{raw}");
+        }
+        let long = "x".repeat(MAX_QUERY + 1);
+        assert_eq!(
+            message(mail_messages_query(Some(&format!("q={long}")))),
+            "`q` must be at most 500 characters"
+        );
+    }
+
+    #[test]
+    fn mail_message_id_accepts_positive_integers_only() {
+        assert_eq!(
+            mail_message_id("383621"),
+            Ok(MessageId::new(383621).unwrap())
+        );
+        for value in ["0", "-1", "abc", "1.5", "", "01"] {
+            assert_eq!(
+                message(mail_message_id(value)),
+                "message id must be a positive integer",
+                "{value}"
+            );
+        }
     }
 }
