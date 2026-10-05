@@ -165,6 +165,12 @@ jobs:
                    eventkit-bridge install
                  again.
 
+              Mail is optional. To read the mail Apple Mail has downloaded, add EventKitBridge
+              in System Settings > Privacy & Security > Full Disk Access (there is no prompt).
+              This grants Full Disk Access to the whole bridge, not just mail. Then add [mail]
+              to the config, run eventkit-bridge install, name the accounts from the log under
+              [mail.accounts], and run eventkit-bridge install again.
+
               Upgrades need no action: the daemon restarts on the new version by itself.
               After upgrading from a version without reminders, approve the Reminders
               prompt once.

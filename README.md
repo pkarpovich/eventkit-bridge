@@ -1,13 +1,16 @@
 # eventkit-bridge
 
-`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger.
+`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger. Optionally, it also reads the mail Apple Mail has already downloaded, for every account configured in Mail, without ever writing to it.
 
 ```
 HTTP client (on the tailnet) --HTTP--> eventkit-bridge (LaunchAgent, EventKitBridge.app) --exec--> ekctl     --EventKit--> calendars
                                                                                           --exec--> remindctl --EventKit--> reminders
+                                                                                          --read-only-------------------> ~/Library/Mail
 ```
 
 The bridge does not call EventKit itself. It ships pinned copies of two native Swift command-line tools over EventKit inside its app bundle: [`ekctl`](https://github.com/schappim/ekctl) v1.8.0 for calendars and [`remindctl`](https://github.com/openclaw/remindctl) v0.3.8 for reminders. Each API request is turned into an `ekctl` or `remindctl` invocation, and the tool's JSON output is turned into the bridge's own JSON. Clients never see either tool and never pass it arguments.
+
+Mail is read straight from the files Mail keeps on disk: the Envelope Index, a SQLite database with one row per message, and the `.emlx` files that hold each message. The bridge never talks to Mail.app or to a mail server, and needs no account credentials.
 
 It requires macOS 14 Sonoma or later on Apple Silicon.
 
@@ -21,7 +24,9 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **Reminders follow the same rules.** Reads touch only the reminder lists you list, and writes only the write lists. Before every change or delete, the bridge looks up the reminder and refuses unless it is in a write list.
 - **Location triggers name a place from the config.** A client picks a place such as `shop` by name; street addresses and coordinates never cross the API in either direction.
 - **The bridge builds every `ekctl` and `remindctl` command itself.** There is no generic passthrough, so a client cannot inject options into either tool. Reminder and list ids must be full UUIDs, because `remindctl` reads a short number as a row index from its last listing.
-- **Contents are never logged.** Request logs carry the method, route, status and timing, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, or place addresses and coordinates.
+- **Mail is off unless you turn it on, and then read-only.** Without a `[mail]` table no mail code runs. With it, the Envelope Index is opened read-only, no message data is ever written (the only files the bridge can create under `~/Library/Mail` are SQLite's own `-shm` and `-wal` files next to the Envelope Index, when Mail is not running), and only the accounts you name in `[mail.accounts]` are visible. Mail routes accept `GET` only; sending, moving, flagging and deleting mail are not possible.
+- **Reading mail needs Full Disk Access, for the whole bridge.** macOS has no narrower permission for `~/Library/Mail`. Granting it to EventKitBridge lets the bridge process read every file your user can, not just mail. The bridge itself only opens the Envelope Index, the `.emlx` files under the mail folder and `~/Library/Accounts/Accounts4.sqlite`, and refuses any message path that leads outside the mail folder. Leave mail off if you do not want to grant it.
+- **Contents are never logged.** Request logs carry the method, route, status and timing, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies and attachment names.
 
 ## Install
 
@@ -85,6 +90,43 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 
 Upgrades need no action: the daemon restarts on the new version by itself. After upgrading from a version without reminders, the first reminders call shows the Reminders prompt once; approve it.
 
+### Turning on mail
+
+Mail is optional. Skip this section to keep it off.
+
+1. Open System Settings, Privacy & Security, Full Disk Access, click `+`, and add `EventKitBridge` from `/Applications`. There is no prompt for this permission; it has to be added by hand. It applies to the whole bridge process, not just mail (see Security model).
+
+2. Add an empty `[mail]` table to the config and reinstall:
+
+   ```toml
+   [mail]
+   ```
+
+   ```sh
+   eventkit-bridge install
+   ```
+
+3. Find your mail accounts in `~/Library/Logs/eventkit-bridge.log`. The daemon logs one line per account found in Mail's store:
+
+   ```
+   2026-10-05T09:00:01.512930Z  INFO eventkit_bridge::server: mail account id=1B9F0E52-6C3A-4D27-8E45-7A0B2C9D1E83 kind=exchange account_type="com.apple.account.Exchange" description="Work" mailboxes=24 messages=18342 newest="2026-10-05T10:58:12+02:00"
+   2026-10-05T09:00:01.512977Z  INFO eventkit_bridge::server: mail account id=6E2D8A17-4B90-4C3F-A1D5-9F8E7C6B5A42 kind=imap account_type="com.apple.account.IMAP" description="me@gmail.example" mailboxes=9 messages=40211 newest="2026-10-05T10:57:40+02:00"
+   ```
+
+   `kind` is `exchange`, `imap` or `local`. `account_type` and `description` come from `~/Library/Accounts/Accounts4.sqlite` and are left out when it cannot be read; the description of an IMAP account is often its email address. `newest` is when the newest message arrived, and `configured` names the account once it is in `[mail.accounts]`. Until Full Disk Access is granted, the log shows `cannot read the mail store yet, retrying`, and the daemon retries every 30 seconds.
+
+4. Name the accounts clients may read under `[mail.accounts]`, then run `eventkit-bridge install` again:
+
+   ```toml
+   [mail.accounts]
+   "1B9F0E52-6C3A-4D27-8E45-7A0B2C9D1E83" = "work"
+   "6E2D8A17-4B90-4C3F-A1D5-9F8E7C6B5A42" = "gmail"
+   ```
+
+   Accounts not listed stay invisible to clients.
+
+The Envelope Index is an undocumented Apple format. The bridge was built against Mail data version `V10` on macOS 27, and a macOS release may change it; `/healthz` reports `mail schema changed` when a table or column the bridge reads disappears.
+
 ### Config reference
 
 ```toml
@@ -100,6 +142,14 @@ write_lists = ["2A7C1E90-5B3D-4F68-8E21-9D4C6B0A1F37"]
 [places]
 shop = { address = "1 Example Street, Exampletown", radius = 150 }
 home = { address = "2 Example Road, Exampletown" }
+
+[mail]
+exclude_mailboxes = ["Trash", "Deleted Items", "Junk", "Junk Email", "Spam", "[Gmail]/Trash", "[Gmail]/Spam"]
+# root = "/path/to/Mail/V10"
+
+[mail.accounts]
+"1B9F0E52-6C3A-4D27-8E45-7A0B2C9D1E83" = "work"
+"6E2D8A17-4B90-4C3F-A1D5-9F8E7C6B5A42" = "gmail"
 ```
 
 | Key | Required | Meaning |
@@ -113,10 +163,14 @@ home = { address = "2 Example Road, Exampletown" }
 | `write_lists` | no | The reminder list ids writes may touch. They are always readable as well. Empty by default, which refuses every reminder write with `403`. |
 | `places` | no | Named places for location triggers. A name is 1 to 40 characters of lowercase letters, digits and `-`, starting with a letter or digit. `address` is a street address and must not be blank or contain a control character; `radius` is in meters, 50 to 2000, default 100. |
 | `remindctl` | no | The `remindctl` binary to run. Defaults to the `remindctl` next to the `eventkit-bridge` binary. Only useful for development. |
+| `mail` | no | The `[mail]` table. Its presence turns mail on; without it the mail routes answer `404` and the mail store is never opened. |
+| `mail.accounts` | no | Maps a Mail account uuid, a full UUID in either case, to the name clients see. A name follows the same rule as a place name. Two entries may not share a uuid or a name. Accounts not listed are invisible. Empty by default, which hides every account. |
+| `mail.exclude_mailboxes` | no | Mailbox paths never shown, compared case-insensitively, such as `[Gmail]/Spam`. Defaults to the list in the example above; `[]` excludes nothing. An entry must not be blank. |
+| `mail.root` | no | The Mail data directory to read. Defaults to the highest `~/Library/Mail/V<n>` that contains `MailData/Envelope Index`. Only useful for development. |
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
 
-`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged.
+`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes and the mail root; it never opens the mail store.
 
 #### Why places are named
 
@@ -440,6 +494,125 @@ Deletes a reminder in a write list and answers `204` with no body. The same look
 
 Reminder sections, tags, subtasks, smart lists, the Groceries list type and the Urgent toggle have no public EventKit API, so neither `remindctl` nor the bridge can read or set them. Alarms separate from the due time, URLs, custom repeat rules, moving a reminder between lists, and creating or renaming lists are not supported either.
 
+## Mail API
+
+The mail routes follow the same rules as the other routes: the `Host` check, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET` only; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
+
+Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request.
+
+### Types
+
+An account:
+
+```json
+{"name":"work","type":"exchange","mailboxes":[{"path":"Inbox","total":812,"unread":3}]}
+```
+
+`type` is `exchange`, `imap` or `local`. `total` and `unread` are Mail's own counts for the mailbox.
+
+A message summary:
+
+```json
+{
+  "id": 383621,
+  "account": "work",
+  "mailbox": "Inbox",
+  "date": "2026-10-05T15:35:13+02:00",
+  "from": {"name": "A Person", "address": "a@example.com"},
+  "to": [{"name": null, "address": "me@example.com"}],
+  "subject": "Quarterly report",
+  "summary": "The numbers for the third quarter",
+  "read": false,
+  "flagged": false,
+  "has_body": true
+}
+```
+
+A message is a summary plus:
+
+```json
+{
+  "cc": [{"name": "Carol", "address": "carol@example.com"}],
+  "body": "Plain text of the message",
+  "body_truncated": false,
+  "partial": false,
+  "attachments": [{"name": "report.pdf", "content_type": "application/pdf", "size": 120334}]
+}
+```
+
+- `id` is Mail's row id for the message.
+- `date` is when the message was received, RFC 3339 in the Mac's time zone.
+- `from`, `subject` and `summary` are `null` when Mail stored none, and a name is `null` when the address has no display name. Mail keeps a `summary` for only some messages.
+- `has_body` is false when Mail has no file for the message; `body` is then `null`.
+- `body` is the first `text/plain` part, or else the first `text/html` part converted to plain text. It is cut at 100 000 characters, with `body_truncated: true`.
+- `partial` is true when Mail holds only part of the message, such as the headers and the start of the body. `body` is then whatever could be recovered.
+- `attachments` lists names, content types and sizes in bytes. Attachment contents are never served.
+
+### `GET /v1/mail/accounts`
+
+Lists the configured accounts that have mailboxes, by name, with their mailboxes by path. Excluded mailboxes are left out.
+
+```sh
+curl http://100.64.0.1:8790/v1/mail/accounts
+```
+
+```json
+{"accounts":[{"name":"gmail","type":"imap","mailboxes":[{"path":"INBOX","total":402,"unread":5},{"path":"[Gmail]/All Mail","total":40211,"unread":12}]},{"name":"work","type":"exchange","mailboxes":[{"path":"Inbox","total":812,"unread":3}]}]}
+```
+
+### `GET /v1/mail/messages`
+
+Lists message summaries, newest first by the time they were received.
+
+| Parameter | Meaning |
+| --- | --- |
+| `account` | Optional and repeatable. A configured account name. Without it, every configured account is read. |
+| `mailbox` | Optional. A mailbox path within those accounts, such as `Inbox` or `[Gmail]/All Mail`, compared case-insensitively. |
+| `since`, `until` | Optional RFC 3339 timestamps. Messages received at or after `since` and before `until`. `until` must be after `since`. |
+| `q` | Optional, at most 500 characters. A case-insensitive substring of the subject, the sender's name or address, a recipient's address, or Mail's summary. Case folding covers every script, not only ASCII. |
+| `unread` | `true` lists unread messages only; `false`, the default, lists both. |
+| `limit` | The page size, 1 to 100, default 25. |
+| `cursor` | The `next_cursor` of the previous page. |
+
+```sh
+curl 'http://100.64.0.1:8790/v1/mail/messages?account=work&mailbox=Inbox&since=2026-10-01T00:00:00%2B02:00&q=report&limit=2'
+```
+
+```json
+{"messages":[{"id":383621,"account":"work","mailbox":"Inbox","date":"2026-10-05T15:35:13+02:00","from":{"name":"A Person","address":"a@example.com"},"to":[{"name":null,"address":"me@example.com"}],"subject":"Quarterly report","summary":"The numbers for the third quarter","read":false,"flagged":false,"has_body":true}],"next_cursor":null}
+```
+
+- `next_cursor` is `null` on the last page. Pass it back as `cursor` with the same filters to get the next page. A cursor that is not one the bridge returned is `400`; a cursor reused with different filters is not detected and simply continues from that position.
+- Deleted messages, messages in excluded mailboxes and messages in accounts not in `[mail.accounts]` never appear.
+- A message in several mailboxes, such as a Gmail message with labels, appears once per mailbox, `[Gmail]/All Mail` included.
+- `q` does not search message bodies. It matches Mail's stored summary, which is empty for many messages.
+- An account name that is not configured is `400 unknown mail account "<name>"`, and a mailbox that is not a visible mailbox of the chosen accounts is `400 unknown mailbox "<path>"`.
+- The bounds are `since` and `until`, not `from` and `to`; `from` is `400`.
+
+### `GET /v1/mail/messages/{id}`
+
+Returns one message with its body.
+
+```sh
+curl http://100.64.0.1:8790/v1/mail/messages/383621
+```
+
+An id that is not a positive integer is `400`. A message that is deleted, in an excluded mailbox, in an account not in `[mail.accounts]`, or does not exist is `404 message not found`; the four cases look the same.
+
+### Mail status codes
+
+| Status | Meaning |
+| --- | --- |
+| `400` | The request is invalid; the message names the parameter. |
+| `404` | Mail is off, the message is not visible, or the route does not exist. |
+| `405` | A method other than `GET`. |
+| `500` | A query against the Envelope Index failed, or a message file could not be read. The error names only the kind of failure, never the file path. |
+| `503` | The mail store could not be opened. This is how a missing Full Disk Access grant shows up. |
+
+### Not available
+
+Sending, moving, flagging, marking read and deleting mail; attachment contents; full-text search over message bodies; and de-duplicating a message that appears in several mailboxes.
+
 ## Health check
 
 ```sh
@@ -449,10 +622,14 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.3.0","calendars":2,"lists":1}
+{"status":"ok","version":"0.4.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95}
 ```
 
-`calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config. Otherwise it answers `503`:
+`calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config.
+
+When `[mail]` is present, the check also opens the mail store, checks that every table and column the bridge reads exists, and checks that every account in `[mail.accounts]` has mailboxes. `mail_accounts` is the number of configured accounts, and `newest_message_age_s` is how many seconds ago the newest visible message arrived, or `null` when there is none. A value that keeps growing means Mail stopped syncing. Without `[mail]`, both fields are left out.
+
+Otherwise it answers `503`:
 
 ```json
 {"status":"degraded","reason":"ekctl failed"}
@@ -466,23 +643,27 @@ When the bridge can read every configured calendar, it answers `200`:
 | `calendar missing` | A configured calendar id does not exist, or is not an event calendar. |
 | `reminders access missing` | Reminder lists are configured, but `remindctl status` reports no Reminders permission. |
 | `remindctl failed` | Reminder lists are configured and `remindctl` could not report its status or list the reminder lists. |
+| `mail no access` | `[mail]` is present and the mail store cannot be opened or read. This is how a missing Full Disk Access grant shows up. |
+| `mail schema changed` | A table or column the bridge reads is missing from the Envelope Index, most likely after a macOS update. |
+| `mail account missing` | An account in `[mail.accounts]` has no mailboxes in Mail's store. |
 
-`timeout` covers `remindctl` as well. The check runs `ekctl` (and `remindctl`) at most once every 10 seconds and reuses the result in between, so it is safe to poll.
+`timeout` covers `remindctl` as well. The check runs `ekctl` (and `remindctl`, and the mail check) at most once every 10 seconds and reuses the result in between, so it is safe to poll.
 
 ## Upgrades
 
-There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars and Reminders permissions belong to the app bundle and carry over.
+There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail request also logs how many rows it returned:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
 2026-10-05T09:13:02.104377Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/reminders/{id} status=200 duration_ms=164 remindctl="info=0, edit=0"
+2026-10-05T09:13:40.402118Z  INFO eventkit_bridge::server: request method=GET route=/v1/mail/messages status=200 duration_ms=18 rows=25
 ```
 
-Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, and place addresses and coordinates are never logged. The only calendar and reminder details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, and place names with their radii.
+Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies and attachment names are never logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. The description of an IMAP account is often its email address; it appears once, in the startup listing.
 
 The log is not rotated. To truncate it:
 
@@ -509,6 +690,9 @@ The log is not rotated. To truncate it:
 - **A reminder with a `place` fails with `502`.** `remindctl` could not geocode the place's address. Check that the Mac is online and that the address is a street address, not a business name.
 - **A reminder request fails with `502 remindctl: List not found`.** A list in `read_lists` or `write_lists` was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **`/healthz` says `calendar missing`.** A calendar in the config was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
+- **`/healthz` says `mail no access`, or mail requests fail with `503`.** The bridge has no Full Disk Access. Check System Settings, Privacy & Security, Full Disk Access, and make sure `EventKitBridge` is listed and switched on, then run `eventkit-bridge install` to restart the daemon.
+- **`/healthz` says `mail account missing`.** An account in `[mail.accounts]` was removed from Mail or re-added under a new uuid. Look up the current uuids in the startup listing in the log and update the config.
+- **`/healthz` says `mail schema changed`.** A macOS update changed the Envelope Index. Mail reads stay unreliable until the bridge is updated for the new format; remove `[mail]` to keep the rest of the bridge healthy meanwhile.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
 - **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars and Reminders permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.
 
