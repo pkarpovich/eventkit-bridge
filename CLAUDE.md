@@ -1,6 +1,6 @@
 # eventkit-bridge
 
-A Rust daemon inside `EventKitBridge.app` that serves an HTTP API over the Mac's calendars by running a bundled, pinned `ekctl` (v1.8.0). The bridge enforces one thing, the read/write calendar policy. See `README.md` for the API and `docs/plans/` for the design.
+A Rust daemon inside `EventKitBridge.app` that serves an HTTP API over the Mac's calendars by running a bundled, pinned `ekctl` (v1.8.0). The bridge enforces one thing, the read/write calendar policy. See `README.md` for the API and `docs/plans/completed/2026-10-05-eventkit-bridge.md` for the design.
 
 ## Gate
 
@@ -31,3 +31,8 @@ A Rust daemon inside `EventKitBridge.app` that serves an HTTP API over the Mac's
 ## Bundle id
 
 The bundle id `dev.pkarpovich.eventkit-bridge` (and the `ekctl` signing identifier `dev.pkarpovich.eventkit-bridge.ekctl`, the LaunchAgent label and `AssociatedBundleIdentifiers`) must never change. TCC keys the Calendars grant to it, so changing it silently revokes every user's permission and makes them approve the prompt again.
+
+## Release
+
+- `ekctl` is pinned in `scripts/fetch-ekctl.sh` (version, URL, sha256). `fixtures/*.json` is real output of that version with personal values replaced, and the tests treat it as `ekctl`'s output contract. A bump updates the script, re-captures the fixtures from the app bundle (never from a terminal), and updates the version here and in the README.
+- The Homebrew cask is written inline by `.github/workflows/release.yml`. Its `caveats` repeat the README "First run" steps, including `100.64.0.1:8790`; change both together.

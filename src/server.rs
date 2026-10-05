@@ -18,11 +18,11 @@ use tokio::sync::watch;
 use tokio::time::{self, Instant};
 
 use crate::config::Config;
-use crate::ekctl::{CallLog, EkctlError, EventRange, Runner};
+use crate::ekctl::{CallLog, EkctlError, Runner};
 use crate::health::{HEALTH_TTL, HealthCheck};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
 use crate::policy::{GuardError, Policy, PolicyError};
-use crate::request::{self, EventsRequest, Invalid};
+use crate::request::{self, Invalid};
 
 /// The largest request body the bridge accepts.
 pub const BODY_LIMIT: usize = 64 * 1024;
@@ -259,17 +259,10 @@ async fn list_calendars(State(app): Shared) -> Result<Response, ApiError> {
 }
 
 async fn list_events(State(app): Shared, RawQuery(query): RawQuery) -> Result<Response, ApiError> {
-    let EventsRequest {
-        calendars,
-        from,
-        to,
-    } = request::events_query(query.as_deref())?;
-    let calendars = app.policy.require_readable(calendars)?;
-    let range = EventRange {
-        calendars,
-        from,
-        to,
-    };
+    let mut range = request::events_query(query.as_deref())?;
+    range.calendars = app
+        .policy
+        .require_readable(mem::take(&mut range.calendars))?;
     let events = app.runner.session().await.list_events(&range).await?;
     let mut readable = Vec::new();
     for event in events {
@@ -1064,6 +1057,64 @@ mod tests {
         );
     }
 
+    fn slow_guard_fake() -> Fake {
+        Fake::new(&format!(
+            r#"case "$1 $2" in
+  'show event') echo show >> "$LOG"; sleep 0.3; cat <<'JSON'
+{show}
+JSON
+  ;;
+  'update event') echo update >> "$LOG"; cat '{add}' ;;
+  'delete event') echo delete >> "$LOG"; cat '{delete}' ;;
+  'list calendars') echo list >> "$LOG"; cat '{list}' ;;
+esac"#,
+            show = show_in(WRITE_ID),
+            add = fixture("add_event.json").display(),
+            delete = fixture("delete_event.json").display(),
+            list = fixture("list_calendars.json").display(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn writes_hold_one_session_across_guard_and_write() {
+        let cases = [
+            (
+                Method::DELETE,
+                None,
+                StatusCode::NO_CONTENT,
+                "show\ndelete\nlist\n",
+            ),
+            (
+                Method::PATCH,
+                Some(json!({"title": "Renamed"})),
+                StatusCode::OK,
+                "show\nupdate\nshow\nlist\n",
+            ),
+        ];
+        for (method, body, expected, log) in cases {
+            let fake = slow_guard_fake();
+            let router = app(&configured(), fake.runner());
+            let write = {
+                let router = router.clone();
+                let method = method.clone();
+                tokio::spawn(async move {
+                    match body {
+                        Some(body) => send_json(&router, method, EVENT_PATH, body).await,
+                        None => send(&router, method, EVENT_PATH, None).await,
+                    }
+                })
+            };
+            while fake.log().is_empty() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            let (status, _) = get(&router, "/v1/calendars").await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = write.await.unwrap();
+            assert_eq!(status, expected, "{method}");
+            assert_eq!(fake.log(), log, "{method}");
+        }
+    }
+
     #[tokio::test]
     async fn delete_of_a_user_event_is_refused() {
         let fake = user_event_fake();
@@ -1408,14 +1459,12 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        let mut rest = Vec::new();
-        stream.read_to_end(&mut rest).await.ok();
     }
 
     #[tokio::test]
     async fn serve_finishes_in_flight_requests() {
         let fake = Fake::new(&format!(
-            "sleep 0.3\ncat '{}'",
+            "echo start >> \"$LOG\"\nsleep 0.3\ncat '{}'",
             fixture("list_calendars.json").display()
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1435,7 +1484,9 @@ mod tests {
             .write_all(b"GET /v1/calendars HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
             .await
             .unwrap();
-        time::sleep(Duration::from_millis(100)).await;
+        while fake.log().is_empty() {
+            time::sleep(Duration::from_millis(10)).await;
+        }
         stop.send(()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();

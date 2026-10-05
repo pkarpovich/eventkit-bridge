@@ -193,7 +193,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, ConfigError> {
     let Ok(addr) = value.parse::<SocketAddr>() else {
         return Err(ConfigError::ListenNotLiteral(value.to_owned()));
     };
-    if addr.ip().is_unspecified() {
+    if addr.ip().to_canonical().is_unspecified() {
         return Err(ConfigError::ListenUnspecified(addr));
     }
     Ok(addr)
@@ -288,6 +288,25 @@ mod tests {
         let ConfigError::ListenUnspecified(_) = err else {
             panic!("unexpected error: {err:?}");
         };
+    }
+
+    #[test]
+    fn ipv4_mapped_unspecified_listen() {
+        for value in [
+            r#"listen = "[::ffff:0.0.0.0]:8790""#,
+            r#"listen = "[::ffff:0:0]:8790""#,
+        ] {
+            let err = Config::from_toml(value).unwrap_err();
+            let ConfigError::ListenUnspecified(_) = err else {
+                panic!("unexpected error: {err:?}");
+            };
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_listen() {
+        let config = Config::from_toml(r#"listen = "[::ffff:127.0.0.1]:8790""#).unwrap();
+        assert_eq!(config.listen, "[::ffff:127.0.0.1]:8790".parse().unwrap());
     }
 
     #[test]

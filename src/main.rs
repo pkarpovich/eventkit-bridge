@@ -240,7 +240,7 @@ fn describe_install(installed: &Installed) -> String {
         program.display()
     );
     match housing {
-        Housing::AppBundle(_) => {}
+        Housing::AppBundle => {}
         Housing::Loose => out.push_str(
             "warning: the program is not inside an .app bundle; the Calendars permission will not survive an upgrade\n",
         ),
@@ -255,7 +255,7 @@ fn describe(path: &Path, config: &Config) -> String {
         write_calendar,
         ekctl: _,
     } = config;
-    let ekctl = match env::current_exe() {
+    let ekctl = match executable::canonical() {
         Ok(executable) => config.ekctl_path(&executable).display().to_string(),
         Err(err) => format!("unknown ({err})"),
     };
@@ -338,7 +338,7 @@ mod tests {
             program: PathBuf::from(
                 "/Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge",
             ),
-            housing: Housing::AppBundle(PathBuf::from("/Applications/EventKitBridge.app")),
+            housing: Housing::AppBundle,
         };
         assert_eq!(
             describe_install(&installed),

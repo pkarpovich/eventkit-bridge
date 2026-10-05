@@ -12,7 +12,7 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 
 ## Security model
 
-- **The network is the access control.** The bridge has no authentication. It binds only to the literal IP address in its config and refuses to listen on every interface (`0.0.0.0` or `::`). Bind it to your tailscale IP, and only devices on your tailnet can reach it.
+- **The network is the access control.** The bridge has no authentication. It binds only to the literal IP address in its config and refuses to listen on every interface (`0.0.0.0`, `::` or `::ffff:0.0.0.0`). Bind it to your tailscale IP, and only devices on your tailnet can reach it.
 - **Reads touch only the calendars you list.** A request for any other calendar is refused with `403`, and events from other calendars are never returned.
 - **Writes touch only the one write calendar.** New events are always created in it. Before every update or delete, the bridge looks up the event and refuses the change unless the event is in the write calendar. A bug in a client cannot change an event you created yourself in another calendar.
 - **The bridge builds every `ekctl` command itself.** There is no generic passthrough, so a client cannot inject options into `ekctl`.
@@ -59,6 +59,8 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
    2026-10-05T09:00:01.204533Z  INFO eventkit_bridge::server: calendar id=8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10 title="Agent" source="iCloud" readable=false writable=false
    ```
 
+   Until the permission is granted, the log shows `cannot list calendars yet, retrying` instead. The daemon retries every 30 seconds, so the listing appears within half a minute of approving the prompt.
+
    Add `read_calendars` and `write_calendar` to the config, then run
 
    ```sh
@@ -80,7 +82,7 @@ write_calendar = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `listen` | yes | A literal `IP:port`. Hostnames and unspecified addresses (`0.0.0.0`, `::`) are rejected. |
+| `listen` | yes | A literal `IP:port`. Hostnames and unspecified addresses (`0.0.0.0`, `::`, `::ffff:0.0.0.0`) are rejected. |
 | `read_calendars` | no | The calendar ids reads may touch. Empty by default, which leaves the bridge unconfigured. |
 | `write_calendar` | no | The only calendar writes may touch. It is always readable as well. Without it, every write is refused with `403`. |
 | `ekctl` | no | The `ekctl` binary to run. Defaults to the `ekctl` next to the `eventkit-bridge` binary, which is the one inside the app bundle. Only useful for development. |
@@ -168,7 +170,7 @@ Lists the events between `from` and `to`, in the order EventKit returns them.
 | Parameter | Meaning |
 | --- | --- |
 | `from`, `to` | Required. `from` must be before `to`, and the range may span at most 62 days. |
-| `calendar` | Optional and repeatable. The calendars to read. Without it, every readable calendar is read. |
+| `calendar` | Optional and repeatable. The calendars to read, one id per parameter (`calendar=A&calendar=B`); a comma-separated list or an empty value is `400`. Without it, every readable calendar is read. |
 
 ```sh
 curl 'http://100.64.0.1:8790/v1/events?from=2026-10-05T00:00:00%2B02:00&to=2026-10-12T00:00:00%2B02:00&calendar=4F7D9489-A78F-4369-A951-213207DCFEE3'
@@ -368,6 +370,8 @@ mise run check
 ```
 
 runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. CI also runs `shellcheck scripts/*.sh`.
+
+Do not run the daemon or `ekctl` from a terminal against your real calendars: TCC would grant Calendars access to the terminal app, not to EventKitBridge. Test on the Mac with the bundled app started by the LaunchAgent.
 
 ## Credits
 

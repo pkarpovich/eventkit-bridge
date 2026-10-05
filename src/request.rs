@@ -3,7 +3,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::config::CalendarId;
-use crate::ekctl::{EventChanges, FreeQuery, NewEvent, Weekdays, WorkingHours};
+use crate::ekctl::{EventChanges, EventRange, FreeQuery, NewEvent, Weekdays, WorkingHours};
 use crate::model::Event;
 
 const MAX_SPAN_DAYS: i64 = 62;
@@ -21,17 +21,6 @@ impl Invalid {
     fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
-}
-
-/// The calendars and range of `GET /v1/events`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventsRequest {
-    /// The requested calendars; empty means every readable calendar.
-    pub calendars: Vec<CalendarId>,
-    /// The range start.
-    pub from: DateTime<FixedOffset>,
-    /// The range end.
-    pub to: DateTime<FixedOffset>,
 }
 
 /// The body of `POST /v1/events`.
@@ -192,8 +181,8 @@ fn check_span(from: DateTime<FixedOffset>, to: DateTime<FixedOffset>) -> Result<
     Ok(())
 }
 
-/// Parses the query of `GET /v1/events`.
-pub fn events_query(raw: Option<&str>) -> Result<EventsRequest, Invalid> {
+/// Parses the query of `GET /v1/events`; `calendars` holds the requested ids, empty for all.
+pub fn events_query(raw: Option<&str>) -> Result<EventRange, Invalid> {
     let params = Params::parse(raw, &["from", "to"])?;
     let from = params.required_timestamp("from")?;
     let to = params.required_timestamp("to")?;
@@ -203,7 +192,7 @@ pub fn events_query(raw: Option<&str>) -> Result<EventsRequest, Invalid> {
         single: _,
         calendars,
     } = params;
-    Ok(EventsRequest {
+    Ok(EventRange {
         calendars,
         from,
         to,
@@ -523,7 +512,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             request,
-            EventsRequest {
+            EventRange {
                 calendars: vec![calendar_id(READ_ID), calendar_id(WRITE_ID)],
                 from: at("2026-10-05T00:00:00+02:00"),
                 to: at("2026-10-12T00:00:00Z"),

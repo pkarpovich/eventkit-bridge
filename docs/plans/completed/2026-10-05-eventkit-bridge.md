@@ -309,6 +309,8 @@ If step 2 attributes the grant to anything other than the app, or no prompt appe
 
 The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not depend on its outcome. Only the bundle and entitlements in Task 6 would change if it fails.
 
+⚠️ Gate 0 has not been run yet. Its outcome is still to be recorded here before the first release, together with the Post-Completion checks.
+
 ## Implementation Steps
 
 ### Task 1: Crate scaffold, config and CLI

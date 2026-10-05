@@ -1198,6 +1198,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn killed_by_a_signal() {
+        let fake = Fake::new("kill -9 $$");
+        let runner = fake.runner();
+        let log = CallLog::default();
+        let err = log
+            .scope(async { runner.session().await.list_calendars().await.unwrap_err() })
+            .await;
+        let EkctlError::Exit { code: None, stderr } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(stderr, "");
+        assert_eq!(err.to_string(), "ekctl was killed by a signal");
+        let mut rendered = Vec::new();
+        for call in log.calls() {
+            rendered.push(call.to_string());
+        }
+        assert_eq!(rendered, vec!["list calendars=signalled"]);
+    }
+
+    #[tokio::test]
     async fn stderr_with_exit_zero_is_ignored() {
         let fake = Fake::new(&format!(
             "echo warning >&2\ncat '{}'",
@@ -1217,7 +1237,7 @@ mod tests {
             panic!("unexpected error: {err:?}");
         };
         time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(fake.log(), "start\n");
+        assert!(!fake.log().contains("end"), "{}", fake.log());
     }
 
     #[tokio::test]

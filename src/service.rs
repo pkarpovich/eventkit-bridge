@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::{self, Instant};
 
+use crate::server::SHUTDOWN_GRACE;
+
 /// The LaunchAgent label, which is also the app's bundle id.
 pub const LABEL: &str = "dev.pkarpovich.eventkit-bridge";
 
@@ -22,6 +24,7 @@ const LAUNCHCTL: &str = "/bin/launchctl";
 const LAUNCH_AGENTS_DIR: &str = "Library/LaunchAgents";
 const LOG_RELATIVE_PATH: &str = "Library/Logs/eventkit-bridge.log";
 const STDERR_TAIL: usize = 500;
+const EXIT_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Why installing or uninstalling the LaunchAgent failed.
 #[derive(Debug, thiserror::Error)]
@@ -216,8 +219,8 @@ fn home_dir(home: Option<OsString>) -> Result<PathBuf, ServiceError> {
 /// Where the binary sits relative to an app bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Housing {
-    /// The binary is `<app>/Contents/MacOS/<binary>`; carries the `.app` path.
-    AppBundle(PathBuf),
+    /// The binary is `<app>/Contents/MacOS/<binary>`.
+    AppBundle,
     /// The binary is not inside an app bundle, so the Calendars grant will not survive an upgrade.
     Loose,
 }
@@ -242,13 +245,14 @@ pub fn housing(binary: &Path) -> Housing {
     if app.extension() != Some("app".as_ref()) {
         return Housing::Loose;
     }
-    Housing::AppBundle(app.to_path_buf())
+    Housing::AppBundle
 }
 
 /// Renders the LaunchAgent plist that runs `binary` and sends its output to `log`.
 pub fn render_plist(binary: &str, log: &str) -> String {
     let binary = escape_xml(binary);
     let log = escape_xml(log);
+    let exit_timeout = (SHUTDOWN_GRACE + EXIT_TIMEOUT_MARGIN).as_secs();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -270,6 +274,8 @@ pub fn render_plist(binary: &str, log: &str) -> String {
 			<true/>
 		</dict>
 	</dict>
+	<key>ExitTimeOut</key>
+	<integer>{exit_timeout}</integer>
 	<key>AssociatedBundleIdentifiers</key>
 	<array>
 		<string>{BUNDLE_ID}</string>
@@ -643,6 +649,9 @@ mod tests {
         let path_state = dict(keep_alive.get("PathState").unwrap());
         assert_eq!(path_state.len(), 1);
         assert_eq!(path_state.get(binary).unwrap().as_boolean(), Some(true));
+        let exit_timeout = root.get("ExitTimeOut").unwrap().as_unsigned_integer();
+        assert_eq!(exit_timeout, Some(30));
+        assert!(Duration::from_secs(30) > SHUTDOWN_GRACE);
         let bundles = root
             .get("AssociatedBundleIdentifiers")
             .unwrap()
@@ -655,7 +664,7 @@ mod tests {
             root.get("StandardErrorPath").unwrap().as_string(),
             Some(log)
         );
-        assert_eq!(root.len(), 7);
+        assert_eq!(root.len(), 8);
     }
 
     #[test]
@@ -680,11 +689,11 @@ mod tests {
             housing(Path::new(
                 "/Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge"
             )),
-            Housing::AppBundle(PathBuf::from("/Applications/EventKitBridge.app"))
+            Housing::AppBundle
         );
         assert_eq!(
             housing(Path::new("/Users/me/dist/Other.app/Contents/MacOS/x")),
-            Housing::AppBundle(PathBuf::from("/Users/me/dist/Other.app"))
+            Housing::AppBundle
         );
     }
 
@@ -733,9 +742,7 @@ mod tests {
             Installed {
                 plist: home.agent.plist.clone(),
                 program: binary.clone(),
-                housing: Housing::AppBundle(
-                    home.dir.path().join("Applications/EventKitBridge.app")
-                ),
+                housing: Housing::AppBundle,
             }
         );
     }

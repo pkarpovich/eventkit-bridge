@@ -220,6 +220,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_write_calendar_is_missing() {
+        let config = config(&[READ_ID], Some(MISSING_ID));
+        let fake = Fake::printing("list_calendars.json");
+        assert_eq!(
+            check(&config, &fake).await,
+            Health::Degraded(DegradedReason::CalendarMissing)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ekctl_binary_is_ekctl_failed() {
+        let config = config(&[READ_ID], None);
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Runner::new(dir.path().join("ekctl"), Duration::from_secs(5));
+        let health = HealthCheck::new(&config, HEALTH_TTL)
+            .check(&runner, &Policy::new(&config))
+            .await;
+        assert_eq!(health, Health::Degraded(DegradedReason::EkctlFailed));
+    }
+
+    #[tokio::test]
     async fn reminder_list_counts_as_missing() {
         let config = config(&[READ_ID, "2F8BCC68-AD77-B8A4-9218-37BF6271D47D"], None);
         let fake = Fake::printing("list_calendars.json");
