@@ -54,7 +54,8 @@ WHERE m.deleted IS NOT 1
        OR instr(ufold(a.address), :q) > 0
        OR instr(ufold(su.summary), :q) > 0
        OR EXISTS (SELECT 1 FROM recipients r JOIN addresses ra ON ra.ROWID = r.address
-                  WHERE r.message = m.ROWID AND instr(ufold(ra.address), :q) > 0))
+                  WHERE r.message = m.ROWID AND r.type IN (0, 1)
+                    AND instr(ufold(ra.address), :q) > 0))
 ORDER BY coalesce(m.date_received, 0) DESC, m.ROWID DESC
 LIMIT :limit";
 
@@ -1573,6 +1574,32 @@ mod tests {
         assert_eq!(by("пятницу"), cyrillic);
         assert_eq!(by("nothing like this"), Vec::<i64>::new());
         assert_eq!(by(""), ALL_VISIBLE);
+    }
+
+    #[test]
+    fn messages_q_ignores_other_recipient_types() {
+        let fixture = Fixture::standard();
+        let conn = fixture.writer();
+        conn.execute(
+            "INSERT INTO addresses (address, comment) VALUES ('hidden@example.com', 'Hidden')",
+            [],
+        )
+        .unwrap();
+        let address = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO recipients (message, address, type, position) VALUES (?1, ?2, 2, 0)",
+            rusqlite::params![fixture::PLAIN, address],
+        )
+        .unwrap();
+        let found = list(
+            &fixture,
+            MessageQuery {
+                q: Some("hidden@".to_owned()),
+                ..MessageQuery::default()
+            },
+        )
+        .unwrap();
+        assert!(found.is_empty());
     }
 
     #[test]
