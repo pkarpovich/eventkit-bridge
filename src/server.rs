@@ -219,7 +219,13 @@ fn policy_status(err: &PolicyError) -> StatusCode {
         | PolicyError::EventNotReadable
         | PolicyError::NoWriteCalendar
         | PolicyError::CalendarNotWritable(_)
-        | PolicyError::NotInWriteCalendar => StatusCode::FORBIDDEN,
+        | PolicyError::NotInWriteCalendar
+        | PolicyError::ListNotReadable(_)
+        | PolicyError::NoReadableLists
+        | PolicyError::ReminderNotReadable
+        | PolicyError::NoWriteList
+        | PolicyError::ListNotWritable(_)
+        | PolicyError::NotInWriteList => StatusCode::FORBIDDEN,
     }
 }
 

@@ -224,11 +224,12 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 ### Task 3: Policy for lists
 
 **Files:**
-- Modify: `src/policy.rs`
+- Modify: `src/policy.rs`, `src/server.rs` (the new refusals map to `403`)
+- ⚠️ Also added `require_writable_list` (for `POST`) and `require_reminder_readable` (for `GET /v1/reminders/{id}`), so Task 4's routes take every list decision from `policy.rs`. The guard returns `ReminderGuardError` (`Denied` or `Remindctl`).
 
-- [ ] `readable_list`, `writable_list`, `filter_lists`, `require_readable_lists`, and `guard_reminder_write` (`info` first, refuse a non-writable list)
-- [ ] tests: filtering, refusals, guard allows and refuses, not-found passes through
-- [ ] gate passes
+- [x] `readable_list`, `writable_list`, `filter_lists`, `require_readable_lists`, and `guard_reminder_write` (`info` first, refuse a non-writable list)
+- [x] tests: filtering, refusals, guard allows and refuses, not-found passes through
+- [x] gate passes
 
 ### Task 4: Reminder routes and health
 
