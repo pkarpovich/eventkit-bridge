@@ -198,6 +198,7 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - default radius;
   - write list implied readable;
   - `--check-config` lists places by name without addresses
+- ⚠️ `[places]` is read as a plain TOML table and checked by hand, and a TOML parse error reports only its message with line and column, never the source line. A toml error prints the offending line, and a serde type error quotes the value, so either would put an address in `--check-config` output and the daemon log.
 - [x] gate passes
 
 ### Task 2: remindctl runner, argv and parsing

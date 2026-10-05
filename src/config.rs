@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -216,9 +215,9 @@ pub enum ConfigError {
     /// The config file could not be read.
     #[error("cannot read the config file: {0}")]
     Read(#[source] io::Error),
-    /// The config file is not valid TOML or has an unknown key or a wrong type.
+    /// The config file is not valid TOML or has an unknown key or a wrong type; the text names only the position, never the source line.
     #[error("invalid config: {0}")]
-    Parse(#[source] toml::de::Error),
+    Parse(String),
     /// `listen` is absent.
     #[error("`listen` is required")]
     MissingListen,
@@ -267,6 +266,39 @@ pub enum ConfigError {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// `places` is not a table.
+    #[error("`places` must be a table")]
+    PlacesNotTable,
+    /// A place is not a table.
+    #[error("`places.{place}` must be a table with an `address`")]
+    PlaceNotTable {
+        /// The place that is not a table.
+        place: PlaceName,
+    },
+    /// A place has a key other than `address` and `radius`.
+    #[error("`places.{place}` has an unknown key {key:?}, expected `address` or `radius`")]
+    UnknownPlaceKey {
+        /// The place with the unknown key.
+        place: PlaceName,
+        /// The key as written.
+        key: String,
+    },
+    /// A place's `address` or `radius` has the wrong type.
+    #[error("`places.{place}.{key}` must be {expected}")]
+    PlaceKeyType {
+        /// The place whose key has the wrong type.
+        place: PlaceName,
+        /// The key with the wrong type.
+        key: &'static str,
+        /// The type the key must have.
+        expected: &'static str,
+    },
+    /// A place has no `address`.
+    #[error("`places.{place}.address` is required")]
+    MissingAddress {
+        /// The place without an address.
+        place: PlaceName,
+    },
     /// A place's `address` is blank.
     #[error("`places.{place}.address` must not be empty")]
     EmptyAddress {
@@ -307,16 +339,8 @@ struct RawConfig {
     read_lists: Vec<String>,
     #[serde(default)]
     write_lists: Vec<String>,
-    #[serde(default)]
-    places: BTreeMap<String, RawPlace>,
+    places: Option<toml::Value>,
     remindctl: Option<PathBuf>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPlace {
-    address: String,
-    radius: Option<i64>,
 }
 
 impl Config {
@@ -343,7 +367,10 @@ impl Config {
             write_lists,
             places,
             remindctl,
-        } = toml::from_str(text).map_err(ConfigError::Parse)?;
+        } = match toml::from_str(text) {
+            Ok(raw) => raw,
+            Err(err) => return Err(parse_error(text, &err)),
+        };
 
         let Some(listen) = listen else {
             return Err(ConfigError::MissingListen);
@@ -390,6 +417,18 @@ impl Config {
             lists_write.push(parse_list_id("write_lists", id)?);
         }
 
+        let places = match places {
+            None => toml::Table::new(),
+            Some(toml::Value::Table(table)) => table,
+            Some(
+                toml::Value::String(_)
+                | toml::Value::Integer(_)
+                | toml::Value::Float(_)
+                | toml::Value::Boolean(_)
+                | toml::Value::Datetime(_)
+                | toml::Value::Array(_),
+            ) => return Err(ConfigError::PlacesNotTable),
+        };
         let mut configured = Vec::new();
         for (name, place) in places {
             configured.push(parse_place(name, place)?);
@@ -498,8 +537,25 @@ fn parse_list_id(key: &'static str, value: String) -> Result<ListId, ConfigError
     }
 }
 
-fn parse_place(name: String, place: RawPlace) -> Result<Place, ConfigError> {
-    let RawPlace { address, radius } = place;
+fn parse_error(text: &str, err: &toml::de::Error) -> ConfigError {
+    let message = err.message();
+    let Some(span) = err.span() else {
+        return ConfigError::Parse(message.to_owned());
+    };
+    let mut line = 1;
+    let mut column = 1;
+    for c in text.get(..span.start).unwrap_or(text).chars() {
+        if c == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    ConfigError::Parse(format!("line {line}, column {column}: {message}"))
+}
+
+fn parse_place(name: String, place: toml::Value) -> Result<Place, ConfigError> {
     let name = match PlaceName::parse(&name) {
         Ok(parsed) => parsed,
         Err(reason) => {
@@ -508,6 +564,39 @@ fn parse_place(name: String, place: RawPlace) -> Result<Place, ConfigError> {
                 reason,
             });
         }
+    };
+    let toml::Value::Table(place) = place else {
+        return Err(ConfigError::PlaceNotTable { place: name });
+    };
+    let mut address = None;
+    let mut radius = None;
+    for (key, value) in place {
+        match key.as_str() {
+            "address" => {
+                let toml::Value::String(value) = value else {
+                    return Err(ConfigError::PlaceKeyType {
+                        place: name,
+                        key: "address",
+                        expected: "a string",
+                    });
+                };
+                address = Some(value);
+            }
+            "radius" => {
+                let toml::Value::Integer(value) = value else {
+                    return Err(ConfigError::PlaceKeyType {
+                        place: name,
+                        key: "radius",
+                        expected: "an integer",
+                    });
+                };
+                radius = Some(value);
+            }
+            _ => return Err(ConfigError::UnknownPlaceKey { place: name, key }),
+        }
+    }
+    let Some(address) = address else {
+        return Err(ConfigError::MissingAddress { place: name });
     };
     if address.trim().is_empty() {
         return Err(ConfigError::EmptyAddress { place: name });
@@ -764,19 +853,88 @@ mod tests {
     #[test]
     fn missing_address() {
         let err = with_places("shop = { radius = 100 }").unwrap_err();
-        let ConfigError::Parse(_) = &err else {
+        let ConfigError::MissingAddress { place } = &err else {
             panic!("unexpected error: {err:?}");
         };
-        assert!(err.to_string().contains("address"), "{err}");
+        assert_eq!(place.as_str(), "shop");
+        assert!(err.to_string().contains("`places.shop.address`"), "{err}");
     }
 
     #[test]
     fn unknown_place_key() {
         let err = with_places(r#"shop = { address = "1 Main St", lat = 1 }"#).unwrap_err();
-        let ConfigError::Parse(_) = &err else {
+        let ConfigError::UnknownPlaceKey { place, key } = &err else {
             panic!("unexpected error: {err:?}");
         };
-        assert!(err.to_string().contains("lat"), "{err}");
+        assert_eq!(place.as_str(), "shop");
+        assert_eq!(key, "lat");
+        assert!(!err.to_string().contains("Main"), "{err}");
+    }
+
+    #[test]
+    fn radius_wrong_type() {
+        let err = with_places(r#"shop = { address = "1 Main St", radius = "150" }"#).unwrap_err();
+        let ConfigError::PlaceKeyType {
+            place,
+            key,
+            expected,
+        } = &err
+        else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(place.as_str(), "shop");
+        assert_eq!(*key, "radius");
+        assert_eq!(*expected, "an integer");
+        assert!(!err.to_string().contains("Main"), "{err}");
+    }
+
+    #[test]
+    fn address_wrong_type() {
+        let err = with_places("shop = { address = [\"1 Main St\"] }").unwrap_err();
+        let ConfigError::PlaceKeyType { place, key, .. } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(place.as_str(), "shop");
+        assert_eq!(*key, "address");
+        assert!(!err.to_string().contains("Main"), "{err}");
+    }
+
+    #[test]
+    fn place_not_table() {
+        let err = with_places(r#"shop = "1 Main St""#).unwrap_err();
+        let ConfigError::PlaceNotTable { place } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(place.as_str(), "shop");
+        assert!(!err.to_string().contains("Main"), "{err}");
+    }
+
+    #[test]
+    fn places_not_table() {
+        let err =
+            Config::from_toml("listen = \"127.0.0.1:8790\"\nplaces = \"1 Main St\"").unwrap_err();
+        let ConfigError::PlacesNotTable = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(!err.to_string().contains("Main"), "{err}");
+    }
+
+    #[test]
+    fn place_syntax_error_hides_address() {
+        for places in [
+            r#"shop = { address = "1 Main St", radius = 150"#,
+            r#"shop = { address = "1 Main St\q" }"#,
+            r#"shop = { address = 1 Main St }"#,
+            r#"shop = { address = "1 Main St", address = "2 Main St" }"#,
+        ] {
+            let err = with_places(places).unwrap_err();
+            let ConfigError::Parse(_) = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            let message = err.to_string();
+            assert!(message.contains("line 3, column "), "{message}");
+            assert!(!message.contains("Main"), "{message}");
+        }
     }
 
     #[test]
@@ -972,13 +1130,14 @@ mod tests {
     #[test]
     fn malformed_toml() {
         let err = Config::from_toml(r#"listen = "127.0.0.1:8790"#).unwrap_err();
-        let ConfigError::Parse(_) = err else {
+        let ConfigError::Parse(_) = &err else {
             panic!("unexpected error: {err:?}");
         };
+        assert!(err.to_string().contains("line 1, column "), "{err}");
     }
 
     #[test]
-    fn wrong_type_names_key() {
+    fn wrong_type_names_position() {
         let err = Config::from_toml(
             r#"
             listen = "127.0.0.1:8790"
@@ -989,7 +1148,7 @@ mod tests {
         let ConfigError::Parse(_) = &err else {
             panic!("unexpected error: {err:?}");
         };
-        assert!(err.to_string().contains("read_calendars"), "{err}");
+        assert!(err.to_string().contains("line 3, column 30"), "{err}");
     }
 
     #[test]
