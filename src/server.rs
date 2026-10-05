@@ -1555,6 +1555,7 @@ esac"#,
             .with_max_level(Level::TRACE)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         (captured, guard)
     }
 
@@ -1684,6 +1685,7 @@ esac"#,
 
     #[tokio::test]
     async fn startup_retry_does_not_hold_the_ekctl_lock() {
+        let (_captured, _guard) = capture();
         let fake = Fake::new(&format!(
             "if [ -s \"$LOG\" ]; then cat '{}'; else echo failed >> \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
