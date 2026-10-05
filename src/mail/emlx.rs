@@ -258,7 +258,11 @@ fn body_part(message: &mail_parser::Message<'_>) -> Option<MessagePartId> {
             continue;
         }
         match part.body {
-            PartType::Text(_) | PartType::Html(_) => return Some(*index),
+            PartType::Text(_) | PartType::Html(_) => {
+                if is_body_type(part) {
+                    return Some(*index);
+                }
+            }
             PartType::Binary(_)
             | PartType::InlineBinary(_)
             | PartType::Message(_)
@@ -266,6 +270,19 @@ fn body_part(message: &mail_parser::Message<'_>) -> Option<MessagePartId> {
         }
     }
     None
+}
+
+fn is_body_type(part: &MessagePart<'_>) -> bool {
+    let Some(content_type) = part.content_type() else {
+        return true;
+    };
+    if !content_type.c_type.eq_ignore_ascii_case("text") {
+        return false;
+    }
+    let Some(subtype) = &content_type.c_subtype else {
+        return true;
+    };
+    subtype.eq_ignore_ascii_case("plain") || subtype.eq_ignore_ascii_case("html")
 }
 
 fn part<'m>(
@@ -543,6 +560,25 @@ mod tests {
         assert_eq!(content.attachments.len(), 1);
         assert_eq!(content.attachments[0].name, None);
         assert_eq!(content.attachments[0].content_type, "text/csv");
+    }
+
+    #[test]
+    fn parse_lists_an_unnamed_calendar_part_instead_of_using_it_as_the_body() {
+        let message = "Subject: x\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/calendar; method=REQUEST\r\nContent-Disposition: attachment\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n--b--\r\n";
+        let content = parse(&fixture::emlx_bytes(message)).unwrap();
+        assert_eq!(content.body, "");
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(content.attachments[0].name, None);
+        assert_eq!(content.attachments[0].content_type, "text/calendar");
+    }
+
+    #[test]
+    fn parse_lists_a_lone_calendar_part_instead_of_using_it_as_the_body() {
+        let message = "Subject: x\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n";
+        let content = parse(&fixture::emlx_bytes(message)).unwrap();
+        assert_eq!(content.body, "");
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(content.attachments[0].content_type, "text/calendar");
     }
 
     #[test]
