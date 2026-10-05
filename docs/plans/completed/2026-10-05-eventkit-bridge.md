@@ -307,9 +307,15 @@ Steps:
 
 If step 2 attributes the grant to anything other than the app, or no prompt appears, stop. The fallback is a small Swift helper inside the bundle that calls EventKit itself. Record the outcome here with ⚠️ and revise the plan before the first release.
 
+**Gate 0 result (2026-10-05, macOS 27, `pavels-macbook-pro-2021`): passed.**
+
+- **Attribution.** The spike was a compiled arm64 binary `spike` that `posix_spawn`s `Contents/MacOS/ekctl list calendars`. It was signed inside out with the Developer ID, `--options runtime`, the calendars entitlement and `--timestamp`, and started by a LaunchAgent with `AssociatedBundleIdentifiers`. The Calendars prompt named the app; after approval, `ekctl` listed every calendar.
+- **Rebuild.** Recompiled and re-signed (new cdhash, same identifier and team), the app listed calendars again with no new prompt.
+- **Entitlement.** The same app signed without the calendars entitlement under a fresh bundle id was refused at once, with no prompt. The entitlement is load-bearing.
+- **Permission denied looks different from other errors.** `ekctl` exits **2**, not 0, and puts the error envelope on **stdout**: `{"status":"error","error":"Permission denied for both Calendar and Reminders. Please grant access in System Settings > Privacy & Security."}`. The runner therefore reads an error envelope from stdout on any exit code. A non-zero exit whose stdout carries the envelope reports that message, and `/healthz` maps it to `ekctl failed`.
+
 The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not depend on its outcome. Only the bundle and entitlements in Task 6 would change if it fails.
 
-⚠️ Gate 0 has not been run yet. Its outcome is still to be recorded here before the first release, together with the Post-Completion checks.
 
 ## Implementation Steps
 
