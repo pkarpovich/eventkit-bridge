@@ -76,6 +76,10 @@ impl Fake {
         calls
     }
 
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
+    }
+
     pub(crate) fn runner(&self) -> Runner {
         self.runner_with_timeout(Duration::from_secs(10))
     }

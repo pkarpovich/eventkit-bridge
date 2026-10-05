@@ -408,14 +408,18 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `src/service.rs`, `src/executable.rs`
 - Modify: `src/main.rs`
 
-- [ ] `service.rs`: `install` and `uninstall` per Solution Overview. Plist rendering is a pure function from `(binary, log path)` to the plist string, and launchctl calls go through a small trait so tests do not run launchctl
-- [ ] `executable.rs`: `(device, inode)` identity of the canonical executable; a future that resolves when the file is swapped or removed (2 s poll); wired into the daemon's shutdown signal
-- [ ] tests:
+- [x] `service.rs`: `install` and `uninstall` per Solution Overview. Plist rendering is a pure function from `(binary, log path)` to the plist string, and launchctl calls go through a small trait so tests do not run launchctl
+- [x] `executable.rs`: `(device, inode)` identity of the canonical executable; a future that resolves when the file is swapped or removed (2 s poll); wired into the daemon's shutdown signal
+- [x] tests:
   - rendered plist is valid XML containing the canonical path, `KeepAlive.PathState`, `AssociatedBundleIdentifiers` and log paths;
   - housing detection inside and outside `.app`;
   - swap detection on a temp file replaced by rename and on removal;
   - install sequence order (unload, wait, write, bootstrap) against a recording fake
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ `install` validates the config first and refuses with the reason when it is missing or invalid, so it never loads an agent that would only crash-loop under `KeepAlive`
+- ⚠️ the uid for `gui/<uid>` comes from `rustix::process::getuid()` (safe wrapper; `#![forbid(unsafe_code)]` rules out `libc`). `plist` is a dev-dependency used only to parse the rendered plist in tests
+- ⚠️ `launchctl` calls run `/bin/launchctl` with a 10 s deadline (`kill_on_drop`). `bootout`'s exit status is ignored; `launchctl print` decides whether the agent is gone, and a still-loaded agent after 5 s fails `install`/`uninstall` with `bootout`'s stderr. `uninstall` reports when nothing was installed
+- ⚠️ `executable::changed` treats a file that is gone as removed; other stat errors are logged and polling continues
 
 ### Task 6: Bundle, release and cask
 

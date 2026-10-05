@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -14,7 +13,11 @@ use tracing::Level;
 
 use eventkit_bridge::config::Config;
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
+use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
 use eventkit_bridge::server::{self, App, SHUTDOWN_GRACE};
+use eventkit_bridge::service::{
+    Agent, Housing, Installed, Service, SystemLaunchctl, Uninstalled, UnloadWait,
+};
 
 const ANNOUNCE_RETRY: Duration = Duration::from_secs(30);
 
@@ -92,8 +95,8 @@ fn main() -> ExitCode {
             Ok(())
         }
         Action::CheckConfig => check_config(),
-        Action::Install => Err("install is not implemented yet".to_owned()),
-        Action::Uninstall => Err("uninstall is not implemented yet".to_owned()),
+        Action::Install => install(),
+        Action::Uninstall => uninstall(),
         Action::Daemon => run_daemon(),
     };
     match result {
@@ -124,18 +127,27 @@ fn run_daemon() -> Result<(), String> {
         .with_ansi(false)
         .with_writer(std::io::stdout)
         .init();
-    let executable = env::current_exe()
-        .and_then(fs::canonicalize)
-        .map_err(|err| format!("cannot resolve the running executable: {err}"))?;
+    let executable = resolve_executable()?;
+    let identity = Identity::of(&executable)
+        .map_err(|err| format!("cannot stat {}: {err}", executable.display()))?;
     let runner = Runner::new(config.ekctl_path(&executable), DEFAULT_TIMEOUT);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("cannot start the runtime: {err}"))?;
-    runtime.block_on(daemon(config, runner))
+    let shutdown = shutdown(executable, identity);
+    runtime.block_on(daemon(config, runner, shutdown))
 }
 
-async fn daemon(config: Config, runner: Runner) -> Result<(), String> {
+fn resolve_executable() -> Result<PathBuf, String> {
+    executable::canonical().map_err(|err| format!("cannot resolve the running executable: {err}"))
+}
+
+async fn daemon(
+    config: Config,
+    runner: Runner,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|err| format!("cannot listen on {}: {err}", config.listen))?;
@@ -145,11 +157,21 @@ async fn daemon(config: Config, runner: Runner) -> Result<(), String> {
         let app = Arc::clone(&app);
         tokio::spawn(async move { app.announce_calendars(ANNOUNCE_RETRY).await })
     };
-    let result = server::serve(listener, app, shutdown_signal(), SHUTDOWN_GRACE).await;
+    let result = server::serve(listener, app, shutdown, SHUTDOWN_GRACE).await;
     announcer.abort();
     result.map_err(|err| format!("server failed: {err}"))?;
     tracing::info!("stopped");
     Ok(())
+}
+
+async fn shutdown(executable: PathBuf, identity: Identity) {
+    tokio::select! {
+        () = shutdown_signal() => {}
+        change = executable::changed(executable, identity, SWAP_POLL) => match change {
+            Change::Replaced => tracing::info!("executable replaced, shutting down"),
+            Change::Removed => tracing::info!("executable removed, shutting down"),
+        },
+    }
 }
 
 async fn shutdown_signal() {
@@ -168,6 +190,62 @@ async fn shutdown_signal() {
         _ = terminate.recv() => tracing::info!("SIGTERM received, shutting down"),
         _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down"),
     }
+}
+
+fn install() -> Result<(), String> {
+    load_config()?;
+    let binary = resolve_executable()?;
+    let service = service()?;
+    let installed = block_on(service.install(&binary))?.map_err(|err| err.to_string())?;
+    print!("{}", describe_install(&installed));
+    Ok(())
+}
+
+fn uninstall() -> Result<(), String> {
+    let service = service()?;
+    let uninstalled = block_on(service.uninstall())?.map_err(|err| err.to_string())?;
+    match uninstalled {
+        Uninstalled::Removed => println!("LaunchAgent removed; the config is kept"),
+        Uninstalled::NothingInstalled => println!("no LaunchAgent installed"),
+    }
+    Ok(())
+}
+
+fn service() -> Result<Service<SystemLaunchctl>, String> {
+    let agent = Agent::current().map_err(|err| err.to_string())?;
+    Ok(Service::new(
+        SystemLaunchctl::new(),
+        agent,
+        UnloadWait::default(),
+    ))
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("cannot start the runtime: {err}"))?;
+    Ok(runtime.block_on(future))
+}
+
+fn describe_install(installed: &Installed) -> String {
+    let Installed {
+        plist,
+        program,
+        housing,
+    } = installed;
+    let mut out = format!(
+        "LaunchAgent installed: {}\nprogram: {}\n",
+        plist.display(),
+        program.display()
+    );
+    match housing {
+        Housing::AppBundle(_) => {}
+        Housing::Loose => out.push_str(
+            "warning: the program is not inside an .app bundle; the Calendars permission will not survive an upgrade\n",
+        ),
+    }
+    out
 }
 
 fn describe(path: &Path, config: &Config) -> String {
@@ -249,6 +327,37 @@ mod tests {
     fn unknown_argument_is_rejected() {
         assert!(parse(&["--listen"]).is_err());
         assert!(parse(&["serve"]).is_err());
+    }
+
+    #[test]
+    fn describe_install_in_bundle() {
+        let installed = Installed {
+            plist: PathBuf::from(
+                "/Users/me/Library/LaunchAgents/dev.pkarpovich.eventkit-bridge.plist",
+            ),
+            program: PathBuf::from(
+                "/Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge",
+            ),
+            housing: Housing::AppBundle(PathBuf::from("/Applications/EventKitBridge.app")),
+        };
+        assert_eq!(
+            describe_install(&installed),
+            "LaunchAgent installed: /Users/me/Library/LaunchAgents/dev.pkarpovich.eventkit-bridge.plist\nprogram: /Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge\n"
+        );
+    }
+
+    #[test]
+    fn describe_install_loose_warns() {
+        let installed = Installed {
+            plist: PathBuf::from(
+                "/Users/me/Library/LaunchAgents/dev.pkarpovich.eventkit-bridge.plist",
+            ),
+            program: PathBuf::from("/Users/me/src/target/release/eventkit-bridge"),
+            housing: Housing::Loose,
+        };
+        let text = describe_install(&installed);
+        assert!(text.contains("program: /Users/me/src/target/release/eventkit-bridge\n"));
+        assert!(text.contains("warning: the program is not inside an .app bundle"));
     }
 
     #[test]
