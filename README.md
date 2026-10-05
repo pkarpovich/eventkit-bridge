@@ -13,6 +13,7 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 ## Security model
 
 - **The network is the access control.** The bridge has no authentication. It binds only to the literal IP address in its config and refuses to listen on every interface (`0.0.0.0`, `::` or `::ffff:0.0.0.0`). Bind it to your tailscale IP, and only devices on your tailnet can reach it.
+- **Requests must name the bridge.** The `Host` header must be the listen IP or a name listed in `hosts`; anything else is refused with `421`. This stops a web page open in a browser on the tailnet from reaching the bridge through DNS rebinding.
 - **Reads touch only the calendars you list.** A request for any other calendar is refused with `403`, and events from other calendars are never returned.
 - **Writes touch only the one write calendar.** New events are always created in it. Before every update or delete, the bridge looks up the event and refuses the change unless the event is in the write calendar. A bug in a client cannot change an event you created yourself in another calendar.
 - **The bridge builds every `ekctl` command itself.** There is no generic passthrough, so a client cannot inject options into `ekctl`.
@@ -75,6 +76,7 @@ Upgrades need no action: the daemon restarts on the new version by itself.
 
 ```toml
 listen = "100.64.0.1:8790"
+# hosts = ["mac.tail1234.ts.net"]
 read_calendars = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
 write_calendar = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"
 # ekctl = "/path/to/ekctl"
@@ -83,6 +85,7 @@ write_calendar = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `listen` | yes | A literal `IP:port`. Hostnames and unspecified addresses (`0.0.0.0`, `::`, `::ffff:0.0.0.0`) are rejected. |
+| `hosts` | no | Extra names clients may use in the `Host` header, such as the Mac's MagicDNS name. The listen IP is always accepted. Names are compared case-insensitively; the port is not checked. |
 | `read_calendars` | no | The calendar ids reads may touch. Empty by default, which leaves the bridge unconfigured. |
 | `write_calendar` | no | The only calendar writes may touch. It is always readable as well. Without it, every write is refused with `403`. |
 | `ekctl` | no | The `ekctl` binary to run. Defaults to the `ekctl` next to the `eventkit-bridge` binary, which is the one inside the app bundle. Only useful for development. |
@@ -203,7 +206,7 @@ Finds free slots across the readable calendars, or across the calendars given wi
 | `weekdays` | `weekdays` | `weekdays`, `weekends`, `all`, or a comma-separated list of day names (`monday` or `mon`, and so on) where an item may be a forward range such as `mon-fri`. Case-insensitive. |
 | `buffer` | `0` | Minutes kept free around busy events, 0 to 240. |
 | `limit` | `20` | Maximum number of slots, 1 to 100. |
-| `from`, `to` | now to 7 days ahead | RFC 3339. When both are given, `from` must be before `to` and the range may span at most 62 days. |
+| `from`, `to` | now to 7 days ahead | RFC 3339. Give both or neither; `from` must be before `to` and the range may span at most 62 days. |
 | `calendar` | every readable calendar | Repeatable, same rules as `/v1/events`. |
 
 ```sh
@@ -269,6 +272,7 @@ A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: 
 | `405` | The route does not accept the method. |
 | `413` | The request body is larger than 64 KiB. |
 | `415` | A `POST` or `PATCH` without `Content-Type: application/json`. |
+| `421` | The `Host` header is missing or names neither the listen IP nor an entry in `hosts`. |
 | `502` | `ekctl` failed: it could not start, exited with an error, reported an error, wrote more than 8 MiB, or wrote output the bridge does not understand. |
 | `504` | `ekctl` did not finish within 20 seconds. |
 

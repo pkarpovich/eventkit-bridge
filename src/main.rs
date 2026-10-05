@@ -251,6 +251,7 @@ fn describe_install(installed: &Installed) -> String {
 fn describe(path: &Path, config: &Config) -> String {
     let Config {
         listen,
+        hosts,
         read_calendars,
         write_calendar,
         ekctl: _,
@@ -260,6 +261,9 @@ fn describe(path: &Path, config: &Config) -> String {
         Err(err) => format!("unknown ({err})"),
     };
     let mut out = format!("config ok: {}\nlisten: {listen}\n", path.display());
+    for host in hosts {
+        out.push_str(&format!("host: {}\n", host.as_str()));
+    }
     if read_calendars.is_empty() {
         out.push_str("read_calendars: none (unconfigured)\n");
     }
@@ -374,6 +378,7 @@ mod tests {
         let config = Config::from_toml(
             r#"
             listen = "127.0.0.1:8790"
+            hosts = ["mac.example.ts.net"]
             read_calendars = ["READ"]
             write_calendar = "WRITE"
             ekctl = "/opt/ekctl"
@@ -381,6 +386,7 @@ mod tests {
         )
         .unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.contains("listen: 127.0.0.1:8790\nhost: mac.example.ts.net\n"));
         assert!(text.contains("readable: READ\nreadable: WRITE\n"));
         assert!(text.contains("write_calendar: WRITE\n"));
         assert!(text.contains("ekctl: /opt/ekctl\n"));

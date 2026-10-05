@@ -1,6 +1,7 @@
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::mem;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Path, RawQuery, Request, State};
 use axum::handler::Handler;
+use axum::http::uri::Authority;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -18,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{self, Instant};
 
-use crate::config::Config;
+use crate::config::{Config, HostName};
 use crate::ekctl::{CallLog, EkctlError, Runner};
 use crate::health::{HEALTH_TTL, HealthCheck};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
@@ -31,12 +33,61 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 /// How long in-flight requests may run after shutdown starts.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
 
+#[derive(Debug)]
+struct KnownHosts {
+    ip: IpAddr,
+    names: Vec<HostName>,
+}
+
+impl KnownHosts {
+    fn allows(&self, request: &Request) -> bool {
+        let mut named = false;
+        if let Some(authority) = request.uri().authority() {
+            if !self.allows_host(authority.host()) {
+                return false;
+            }
+            named = true;
+        }
+        for value in request.headers().get_all(header::HOST) {
+            let Ok(value) = value.to_str() else {
+                return false;
+            };
+            let Ok(authority) = value.parse::<Authority>() else {
+                return false;
+            };
+            if !self.allows_host(authority.host()) {
+                return false;
+            }
+            named = true;
+        }
+        named
+    }
+
+    fn allows_host(&self, host: &str) -> bool {
+        let literal = match host.strip_prefix('[') {
+            Some(inner) => inner.strip_suffix(']').unwrap_or(inner),
+            None => host,
+        };
+        if let Ok(ip) = literal.parse::<IpAddr>() {
+            return ip.to_canonical() == self.ip.to_canonical();
+        }
+        let host = host.strip_suffix('.').unwrap_or(host);
+        for name in &self.names {
+            if name.as_str().eq_ignore_ascii_case(host) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The state every route shares.
 #[derive(Debug)]
 pub struct App {
     runner: Runner,
     policy: Policy,
     health: HealthCheck,
+    hosts: KnownHosts,
 }
 
 impl App {
@@ -46,6 +97,10 @@ impl App {
             runner,
             policy: Policy::new(config),
             health: HealthCheck::new(config, HEALTH_TTL),
+            hosts: KnownHosts {
+                ip: config.listen.ip(),
+                names: config.hosts.clone(),
+            },
         }
     }
 
@@ -159,7 +214,7 @@ impl IntoResponse for ApiError {
 
 type Shared = State<Arc<App>>;
 
-/// The bridge's HTTP routes, with the body limit and request logging.
+/// The bridge's HTTP routes, with the body limit, the `Host` check and request logging.
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -184,6 +239,10 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            require_known_host,
+        ))
         .layer(middleware::from_fn(log_request))
         .with_state(app)
 }
@@ -300,6 +359,17 @@ async fn free(State(app): Shared, RawQuery(query): RawQuery) -> Result<Response,
     Ok(Json(slots).into_response())
 }
 
+async fn require_known_host(State(app): Shared, request: Request, next: Next) -> Response {
+    if !app.hosts.allows(&request) {
+        return ApiError::Status(
+            StatusCode::MISDIRECTED_REQUEST,
+            "unknown host: use the listen IP or a name from `hosts` in the config".to_owned(),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
 async fn require_json(request: Request, next: Next) -> Response {
     let unsupported = ApiError::Status(
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -399,6 +469,7 @@ mod tests {
     const EVENT_ID: &str = "46EBD007-078C-44AD-80E9-5D55FDE5FCC8:1709076";
     const EVENT_PATH: &str = "/v1/events/46EBD007-078C-44AD-80E9-5D55FDE5FCC8%3A1709076";
     const RANGE: &str = "from=2026-10-05T00:00:00Z&to=2026-10-12T00:00:00Z";
+    const HOST: &str = "127.0.0.1:8790";
 
     fn configured() -> Config {
         Config::from_toml(&format!(
@@ -456,6 +527,7 @@ mod tests {
         let request = Request::builder()
             .method(method)
             .uri(uri)
+            .header("host", HOST)
             .header("content-type", "application/json")
             .body(body)
             .unwrap();
@@ -799,6 +871,10 @@ mod tests {
                 "the range must not exceed 62 days",
             ),
             ("/v1/free?to=soon", "`to` must be an RFC 3339 timestamp"),
+            (
+                "/v1/free?to=2099-01-01T00:00:00Z",
+                "`from` and `to` must be given together",
+            ),
         ];
         for (uri, message) in cases {
             let (status, body) = get(&router, uri).await;
@@ -860,7 +936,10 @@ mod tests {
             (Method::PATCH, EVENT_PATH, None),
         ];
         for (method, uri, content_type) in cases {
-            let mut request = Request::builder().method(method.clone()).uri(uri);
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header("host", HOST);
             if let Some(content_type) = content_type {
                 request = request.header("content-type", content_type);
             }
@@ -880,6 +959,7 @@ mod tests {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/events")
+            .header("host", HOST)
             .header("content-type", "Application/JSON; charset=utf-8")
             .body(Body::from(body))
             .unwrap();
@@ -1337,6 +1417,108 @@ esac"#,
         assert_eq!(body, error("method not allowed"));
     }
 
+    async fn send_host(router: &Router, method: Method, hosts: &[&str]) -> StatusCode {
+        let mut request = Request::builder().method(method).uri("/v1/events");
+        for host in hosts {
+            request = request.header("host", *host);
+        }
+        let request = request
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_body()).unwrap()))
+            .unwrap();
+        router.clone().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn unknown_hosts_are_refused_before_ekctl() {
+        let fake = write_fake();
+        let config = Config::from_toml(&format!(
+            "listen = \"100.64.0.1:8790\"\nhosts = [\"mac.tail1234.ts.net\"]\nwrite_calendar = \"{WRITE_ID}\""
+        ))
+        .unwrap();
+        let router = app(&config, fake.runner());
+        let refused: [&[&str]; 7] = [
+            &["evil.example.com:8790"],
+            &["evil.example.com"],
+            &["100.64.0.2:8790"],
+            &["localhost:8790"],
+            &["100.64.0.1:8790", "evil.example.com:8790"],
+            &["not a host"],
+            &[],
+        ];
+        for hosts in refused {
+            for method in [Method::GET, Method::POST] {
+                let status = send_host(&router, method.clone(), hosts).await;
+                assert_eq!(
+                    status,
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "{method} {hosts:?}"
+                );
+            }
+        }
+        assert!(fake.calls().is_empty());
+        let request = Request::builder()
+            .uri("http://evil.example.com:8790/v1/calendars")
+            .header("host", "100.64.0.1:8790")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            error("unknown host: use the listen IP or a name from `hosts` in the config")
+        );
+        assert!(fake.calls().is_empty());
+        for host in [
+            "100.64.0.1:8790",
+            "100.64.0.1",
+            "mac.tail1234.ts.net:8790",
+            "MAC.Tail1234.ts.net.",
+        ] {
+            let status = send_host(&router, Method::POST, &[host]).await;
+            assert_eq!(status, StatusCode::CREATED, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_listen_host() {
+        let fake = Fake::printing("list_calendars.json");
+        let config = Config::from_toml(&format!(
+            "listen = \"[fd7a:115c:a1e0::1]:8790\"\nread_calendars = [\"{READ_ID}\"]"
+        ))
+        .unwrap();
+        let router = app(&config, fake.runner());
+        for (host, expected) in [
+            ("[fd7a:115c:a1e0::1]:8790", StatusCode::OK),
+            ("[FD7A:115C:A1E0:0::1]", StatusCode::OK),
+            ("[fd7a:115c:a1e0::2]:8790", StatusCode::MISDIRECTED_REQUEST),
+        ] {
+            let request = Request::builder()
+                .uri("/v1/calendars")
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            let status = router.clone().oneshot(request).await.unwrap().status();
+            assert_eq!(status, expected, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_host_is_logged_without_the_host() {
+        let (captured, _guard) = capture();
+        let fake = write_fake();
+        let router = app(&configured(), fake.runner());
+        send_host(&router, Method::POST, &["rebound.example.com:8790"]).await;
+        let log = captured.text();
+        assert!(
+            log.contains("method=POST route=/v1/events status=421"),
+            "{log}"
+        );
+        assert!(!log.contains("rebound"), "{log}");
+    }
+
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
 
@@ -1539,7 +1721,7 @@ esac"#,
         ));
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
-            .write_all(b"GET /v1/calendars HTTP/1.1\r\nhost: x\r\n\r\n")
+            .write_all(b"GET /v1/calendars HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
         time::sleep(Duration::from_millis(200)).await;
@@ -1573,7 +1755,9 @@ esac"#,
         ));
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
-            .write_all(b"GET /v1/calendars HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .write_all(
+                b"GET /v1/calendars HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n",
+            )
             .await
             .unwrap();
         while fake.log().is_empty() {

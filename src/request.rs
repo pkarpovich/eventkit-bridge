@@ -229,9 +229,15 @@ pub fn free_query(raw: Option<&str>) -> Result<FreeQuery, Invalid> {
     let limit = params.number("limit", 20, 1, 100)?;
     let from = params.timestamp("from")?;
     let to = params.timestamp("to")?;
-    if let (Some(from), Some(to)) = (from, to) {
-        check_range(from, to, "from", "to")?;
-        check_span(from, to)?;
+    match (from, to) {
+        (Some(from), Some(to)) => {
+            check_range(from, to, "from", "to")?;
+            check_span(from, to)?;
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Invalid::new("`from` and `to` must be given together"));
+        }
     }
     let Params {
         single: _,
@@ -275,7 +281,8 @@ fn parse_clock(value: &str) -> Option<NaiveTime> {
 }
 
 fn parse_weekdays(value: &str) -> Result<Weekdays, Invalid> {
-    match value {
+    let value = value.to_lowercase();
+    match value.as_str() {
         "weekdays" => return Ok(Weekdays::Weekdays),
         "weekends" => return Ok(Weekdays::Weekends),
         "all" => return Ok(Weekdays::All),
@@ -283,11 +290,11 @@ fn parse_weekdays(value: &str) -> Result<Weekdays, Invalid> {
     }
     let mut days = Vec::new();
     for item in value.split(',') {
-        let item = item.trim().to_lowercase();
+        let item = item.trim();
         let (first, last) = match item.split_once('-') {
             Some((first, last)) => (parse_day(first)?, parse_day(last)?),
             None => {
-                let day = parse_day(&item)?;
+                let day = parse_day(item)?;
                 (day, day)
             }
         };
@@ -714,6 +721,14 @@ mod tests {
             free_query(Some("weekdays=weekdays")).unwrap().weekdays,
             Weekdays::Weekdays
         );
+        assert_eq!(
+            free_query(Some("weekdays=Weekends")).unwrap().weekdays,
+            Weekdays::Weekends
+        );
+        assert_eq!(
+            free_query(Some("weekdays=ALL")).unwrap().weekdays,
+            Weekdays::All
+        );
     }
 
     #[test]
@@ -732,8 +747,13 @@ mod tests {
 
     #[test]
     fn free_query_range() {
-        assert!(free_query(Some("from=2026-10-05T00:00:00Z")).is_ok());
-        assert!(free_query(Some("to=2026-10-05T00:00:00Z")).is_ok());
+        for one_sided in ["from=2026-10-05T00:00:00Z", "to=2099-01-01T00:00:00Z"] {
+            assert_eq!(
+                message(free_query(Some(one_sided))),
+                "`from` and `to` must be given together",
+                "{one_sided}"
+            );
+        }
         assert_eq!(
             message(free_query(Some(
                 "from=2026-10-06T00:00:00Z&to=2026-10-05T00:00:00Z"

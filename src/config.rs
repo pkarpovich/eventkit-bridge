@@ -43,11 +43,37 @@ impl fmt::Display for CalendarId {
     }
 }
 
+/// A DNS name clients may use to reach the bridge, stored lowercase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostName(String);
+
+impl HostName {
+    /// Accepts a DNS name of letters, digits, `-` and `.`, compared case-insensitively.
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        if value.is_empty() {
+            return Err("empty");
+        }
+        for c in value.chars() {
+            if !c.is_ascii_alphanumeric() && c != '-' && c != '.' {
+                return Err("must contain only letters, digits, `-` and `.`");
+            }
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// Returns the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The validated bridge configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// The literal socket address the HTTP server binds to.
     pub listen: SocketAddr,
+    /// Extra names the `Host` header may carry besides the listen IP.
+    pub hosts: Vec<HostName>,
     /// The calendars reads may touch, as listed in the config file.
     pub read_calendars: Vec<CalendarId>,
     /// The only calendar writes may touch; `None` refuses every write.
@@ -87,6 +113,14 @@ pub enum ConfigError {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// A name in `hosts` is not a DNS name.
+    #[error("`hosts` contains an invalid name {value:?}: {reason}")]
+    InvalidHost {
+        /// The name as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// `ekctl` is set to an empty path.
     #[error("`ekctl` must not be empty")]
     EmptyEkctl,
@@ -96,6 +130,8 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: Option<String>,
+    #[serde(default)]
+    hosts: Vec<String>,
     #[serde(default)]
     read_calendars: Vec<String>,
     write_calendar: Option<String>,
@@ -118,6 +154,7 @@ impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let RawConfig {
             listen,
+            hosts,
             read_calendars,
             write_calendar,
             ekctl,
@@ -127,6 +164,20 @@ impl Config {
             return Err(ConfigError::MissingListen);
         };
         let listen = parse_listen(&listen)?;
+
+        let mut names = Vec::new();
+        for host in hosts {
+            let name = match HostName::parse(&host) {
+                Ok(name) => name,
+                Err(reason) => {
+                    return Err(ConfigError::InvalidHost {
+                        value: host,
+                        reason,
+                    });
+                }
+            };
+            names.push(name);
+        }
 
         let mut read = Vec::new();
         for id in read_calendars {
@@ -146,6 +197,7 @@ impl Config {
 
         Ok(Self {
             listen,
+            hosts: names,
             read_calendars: read,
             write_calendar: write,
             ekctl,
@@ -231,6 +283,7 @@ mod tests {
         let config = Config::from_toml(&format!(
             r#"
             listen = "100.108.208.81:8790"
+            hosts = ["Mac.tail1234.ts.net"]
             read_calendars = ["{READ_ID}"]
             write_calendar = "{WRITE_ID}"
             ekctl = "/opt/ekctl"
@@ -242,6 +295,7 @@ mod tests {
             config,
             Config {
                 listen: "100.108.208.81:8790".parse().unwrap(),
+                hosts: vec![HostName("mac.tail1234.ts.net".to_owned())],
                 read_calendars: vec![id(READ_ID)],
                 write_calendar: Some(id(WRITE_ID)),
                 ekctl: Some(PathBuf::from("/opt/ekctl")),
@@ -258,6 +312,7 @@ mod tests {
     #[test]
     fn minimal_config_is_first_run() {
         let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        assert!(config.hosts.is_empty());
         assert!(config.read_calendars.is_empty());
         assert_eq!(config.write_calendar, None);
         assert_eq!(config.ekctl, None);
@@ -410,6 +465,30 @@ mod tests {
             panic!("unexpected error: {err:?}");
         };
         assert_eq!(reason, "contains a control character");
+    }
+
+    #[test]
+    fn invalid_hosts() {
+        for (host, expected) in [
+            ("", "empty"),
+            ("mac:8790", "must contain only letters, digits, `-` and `.`"),
+            (
+                "evil.com/x",
+                "must contain only letters, digits, `-` and `.`",
+            ),
+            ("[::1]", "must contain only letters, digits, `-` and `.`"),
+        ] {
+            let err = Config::from_toml(&format!(
+                "listen = \"127.0.0.1:8790\"\nhosts = [\"{host}\"]"
+            ))
+            .unwrap_err();
+            let ConfigError::InvalidHost { value, reason } = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(value, host);
+            assert_eq!(*reason, expected, "{host}");
+            assert!(err.to_string().contains("`hosts`"), "{err}");
+        }
     }
 
     #[test]

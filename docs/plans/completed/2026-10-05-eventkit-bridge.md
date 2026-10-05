@@ -148,7 +148,7 @@ delete event -- <id>
 
 ### HTTP API
 
-`axum` on the configured address, with no authentication: reachability is the tailnet. Request bodies are capped at 64 KiB. Every error body is `{"error":"<message>"}`.
+`axum` on the configured address, with no authentication: reachability is the tailnet. Every request's `Host` must be the listen IP or a name from the optional `hosts` config key, otherwise `421`, which blocks DNS rebinding from a browser on the tailnet. Request bodies are capped at 64 KiB. Every error body is `{"error":"<message>"}`.
 
 **Shared types:**
 
@@ -182,7 +182,7 @@ Slot: {"start":"...","end":"...","duration_minutes":60,"weekday":"monday"}
   - `weekdays`: default `weekdays`. Otherwise `weekdays`, `weekends`, `all`, or a comma list of day names (`monday`/`mon` ...), where an item may be a range such as `mon-fri`;
   - `buffer`: default 0, range 0-240;
   - `limit`: default 20, range 1-100;
-  - `from`/`to`: RFC3339 when given, otherwise not passed, so `ekctl`'s defaults apply (now to +7 days). When both are given, the span is at most 62 days;
+  - `from`/`to`: RFC3339 when given, otherwise not passed, so `ekctl`'s defaults apply (now to +7 days). Both or neither must be given (a one-sided range is `400`), and the span is at most 62 days;
   - `calendar`: same rules as `/v1/events`.
 - **`POST /v1/events`**, body `{"title","start","end","location"?,"notes"?,"url"?}` -> `201 Event`, created in the write calendar.
   - `403 no write calendar configured` when `write_calendar` is absent.
