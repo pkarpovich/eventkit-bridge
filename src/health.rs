@@ -259,8 +259,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::config::MAIL_INDEX_RELATIVE_PATH;
     use crate::ekctl::Runner;
     use crate::fake_ekctl::{Fake, fixture};
+    use crate::mail::fixture::Fixture as MailFixture;
     use crate::subprocess::StoreLock;
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
@@ -556,6 +558,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mail_result_is_cached_with_the_rest() {
+        let config = config(&[READ_ID], None);
+        let fake = counting("0");
+        let runner = fake.runner();
+        let reminders = absent_remindctl(&runner);
+        let policy = Policy::new(&config);
+        let fixture = MailFixture::standard();
+        let store = Arc::new(MailStore::new(fixture.config()));
+        let probe = Probe {
+            calendars: &runner,
+            reminders: &reminders,
+            policy: &policy,
+            mail: Some(&store),
+        };
+        let health = HealthCheck::new(&config, Duration::from_millis(50));
+        let Health::Ok {
+            calendars: 1,
+            lists: None,
+            mail:
+                Some(MailStatus {
+                    accounts: 2,
+                    newest_message_age_s: Some(_),
+                }),
+        } = health.check(probe).await
+        else {
+            panic!("mail status missing");
+        };
+
+        std::fs::write(
+            fixture.root.join(MAIL_INDEX_RELATIVE_PATH),
+            b"not a database at all, just text that is long enough to be read as a header",
+        )
+        .unwrap();
+        let Health::Ok {
+            calendars: 1,
+            lists: None,
+            mail: Some(_),
+        } = health.check(probe).await
+        else {
+            panic!("cached result not reused");
+        };
+        assert_eq!(fake.log(), "call\n");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            health.check(probe).await,
+            Health::Degraded(DegradedReason::MailNoAccess)
+        );
+        assert_eq!(fake.log(), "call\ncall\n");
+    }
+
+    #[tokio::test]
+    async fn mail_is_not_checked_when_calendars_fail() {
+        let config = config(&[READ_ID], None);
+        let fake = Fake::new("exit 1");
+        let runner = fake.runner();
+        let reminders = absent_remindctl(&runner);
+        let fixture = MailFixture::standard();
+        let mut mail = fixture.config();
+        mail.root = Some(fixture.root.join("missing"));
+        let store = Arc::new(MailStore::new(mail));
+        let health = HealthCheck::new(&config, HEALTH_TTL)
+            .check(Probe {
+                calendars: &runner,
+                reminders: &reminders,
+                policy: &Policy::new(&config),
+                mail: Some(&store),
+            })
+            .await;
+        assert_eq!(health, Health::Degraded(DegradedReason::EkctlFailed));
+    }
+
+    #[test]
+    fn mail_problems_map_to_reasons() {
+        assert_eq!(
+            mail_reason(MailProblem::NoAccess),
+            DegradedReason::MailNoAccess
+        );
+        assert_eq!(
+            mail_reason(MailProblem::SchemaChanged),
+            DegradedReason::MailSchemaChanged
+        );
+        assert_eq!(
+            mail_reason(MailProblem::AccountMissing),
+            DegradedReason::MailAccountMissing
+        );
+        for (reason, text) in [
+            (DegradedReason::MailNoAccess, "mail no access"),
+            (DegradedReason::MailSchemaChanged, "mail schema changed"),
+            (DegradedReason::MailAccountMissing, "mail account missing"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(text));
+        }
+    }
+
+    #[tokio::test]
     async fn concurrent_checks_share_one_run() {
         let config = config(&[READ_ID], None);
         let fake = counting("0.3");
@@ -631,6 +729,30 @@ mod tests {
             })
             .await,
             json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "lists": 3})
+        );
+        assert_eq!(
+            body(Health::Ok {
+                calendars: 1,
+                lists: None,
+                mail: Some(MailStatus {
+                    accounts: 2,
+                    newest_message_age_s: Some(42),
+                }),
+            })
+            .await,
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 2, "newest_message_age_s": 42})
+        );
+        assert_eq!(
+            body(Health::Ok {
+                calendars: 1,
+                lists: None,
+                mail: Some(MailStatus {
+                    accounts: 1,
+                    newest_message_age_s: None,
+                }),
+            })
+            .await,
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 1, "newest_message_age_s": null})
         );
     }
 }
