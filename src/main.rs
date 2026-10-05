@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
 
-use eventkit_bridge::config::Config;
+use eventkit_bridge::config::{Config, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
 use eventkit_bridge::server::{self, App, SHUTDOWN_GRACE};
@@ -263,10 +263,17 @@ fn describe(path: &Path, config: &Config) -> String {
         read_calendars,
         write_calendars,
         ekctl: _,
+        read_lists,
+        write_lists,
+        places,
+        remindctl: _,
     } = config;
-    let ekctl = match executable::canonical() {
-        Ok(executable) => config.ekctl_path(&executable).display().to_string(),
-        Err(err) => format!("unknown ({err})"),
+    let (ekctl, remindctl) = match executable::canonical() {
+        Ok(executable) => (
+            config.ekctl_path(&executable).display().to_string(),
+            config.remindctl_path(&executable).display().to_string(),
+        ),
+        Err(err) => (format!("unknown ({err})"), format!("unknown ({err})")),
     };
     let mut out = format!("config ok: {}\nlisten: {listen}\n", path.display());
     for host in hosts {
@@ -285,6 +292,27 @@ fn describe(path: &Path, config: &Config) -> String {
         out.push_str(&format!("writable: {id}\n"));
     }
     out.push_str(&format!("ekctl: {ekctl}\n"));
+    if read_lists.is_empty() && write_lists.is_empty() {
+        out.push_str("read_lists: none (reminders off)\n");
+    }
+    for id in config.readable_lists() {
+        out.push_str(&format!("readable list: {id}\n"));
+    }
+    if write_lists.is_empty() {
+        out.push_str("write_lists: none (reminder writes refused)\n");
+    }
+    for id in write_lists {
+        out.push_str(&format!("writable list: {id}\n"));
+    }
+    for Place {
+        name,
+        address: _,
+        radius,
+    } in places
+    {
+        out.push_str(&format!("place: {name} (radius {radius} m)\n"));
+    }
+    out.push_str(&format!("remindctl: {remindctl}\n"));
     out
 }
 
@@ -381,6 +409,9 @@ mod tests {
         assert!(text.starts_with("config ok: /tmp/config.toml\nlisten: 127.0.0.1:8790\n"));
         assert!(text.contains("read_calendars: none (unconfigured)\n"));
         assert!(text.contains("write_calendars: none (writes refused)\n"));
+        assert!(text.contains("read_lists: none (reminders off)\n"));
+        assert!(text.contains("write_lists: none (reminder writes refused)\n"));
+        assert!(!text.contains("place:"));
     }
 
     #[test]
@@ -401,6 +432,34 @@ mod tests {
         assert!(text.contains("writable: WRITE\n"));
         assert!(text.contains("ekctl: /opt/ekctl\n"));
         assert!(!text.contains("unconfigured"));
+    }
+
+    #[test]
+    fn describe_reminders() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+            read_lists = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
+            write_lists = ["8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"]
+            remindctl = "/opt/remindctl"
+
+            [places]
+            shop = { address = "1 Market Street, Springfield", radius = 150 }
+            home = { address = "2 Elm Street, Springfield" }
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.contains(
+            "readable list: 4F7D9489-A78F-4369-A951-213207DCFEE3\nreadable list: 8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10\n"
+        ));
+        assert!(text.contains("writable list: 8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10\n"));
+        assert!(text.contains("place: home (radius 100 m)\nplace: shop (radius 150 m)\n"));
+        assert!(text.contains("remindctl: /opt/remindctl\n"));
+        assert!(!text.contains("Street"), "{text}");
+        assert!(!text.contains("Springfield"), "{text}");
+        assert!(!text.contains("reminders off"), "{text}");
+        assert!(!text.contains("reminder writes refused"), "{text}");
     }
 
     #[tokio::test]

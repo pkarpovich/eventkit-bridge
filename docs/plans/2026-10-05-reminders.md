@@ -187,9 +187,9 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
 **Files:**
 - Modify: `src/config.rs`, `src/main.rs` (`--check-config` output)
 
-- [ ] `read_lists`, `write_lists`, `[places]` and `remindctl` keys with the rules above; errors name the key
-- [ ] `readable_lists()` = read plus write lists without duplicates; `remindctl_path(executable)` like `ekctl_path`
-- [ ] tests:
+- [x] `read_lists`, `write_lists`, `[places]` and `remindctl` keys with the rules above; errors name the key
+- [x] `readable_lists()` = read plus write lists without duplicates; `remindctl_path(executable)` like `ekctl_path`
+- [x] tests:
   - valid config;
   - invalid list id;
   - invalid place name;
@@ -198,7 +198,7 @@ Reminder: {"id":"...","title":"Milk","notes":null,"completed":false,"completed_a
   - default radius;
   - write list implied readable;
   - `--check-config` lists places by name without addresses
-- [ ] gate passes
+- [x] gate passes
 
 ### Task 2: remindctl runner, argv and parsing
 

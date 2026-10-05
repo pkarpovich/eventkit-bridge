@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -10,6 +11,16 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_RELATIVE_PATH: &str = ".config/eventkit-bridge/config.toml";
 const EKCTL_FILE_NAME: &str = "ekctl";
+const REMINDCTL_FILE_NAME: &str = "remindctl";
+const PLACE_NAME_MAX_LEN: usize = 40;
+const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// The radius in meters a place gets when the config gives none.
+pub const DEFAULT_RADIUS: u32 = 100;
+/// The smallest radius in meters a place may have.
+pub const MIN_RADIUS: u32 = 50;
+/// The largest radius in meters a place may have.
+pub const MAX_RADIUS: u32 = 2000;
 
 /// An EventKit calendar identifier as `ekctl` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -41,6 +52,95 @@ impl fmt::Display for CalendarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// A reminder list identifier, always a full UUID so `remindctl` never reads it as a row index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListId(String);
+
+impl ListId {
+    /// Accepts a full UUID such as `4F7D9489-A78F-4369-A951-213207DCFEE3`.
+    pub fn parse(value: String) -> Result<Self, &'static str> {
+        if !is_full_uuid(&value) {
+            return Err("must be a full UUID");
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the identifier as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ListId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The name a client uses to pick a configured place for a location trigger.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlaceName(String);
+
+impl PlaceName {
+    /// Accepts 1 to 40 lowercase letters, digits and `-`, starting with a letter or digit.
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        let Some(first) = value.chars().next() else {
+            return Err("empty");
+        };
+        if value.len() > PLACE_NAME_MAX_LEN {
+            return Err("longer than 40 characters");
+        }
+        if first == '-' {
+            return Err("must start with a letter or digit");
+        }
+        for c in value.chars() {
+            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+                return Err("must contain only lowercase letters, digits and `-`");
+            }
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PlaceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A street address that `remindctl` geocodes; its `Debug` output hides the text so it never reaches a log.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Address(String);
+
+impl Address {
+    /// Returns the address as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Address(<redacted>)")
+    }
+}
+
+/// A place a new reminder's location trigger may name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    /// The name clients use.
+    pub name: PlaceName,
+    /// The street address passed to `remindctl add --location`.
+    pub address: Address,
+    /// The trigger radius in meters.
+    pub radius: u32,
 }
 
 /// A DNS name clients may use to reach the bridge, stored lowercase.
@@ -80,6 +180,14 @@ pub struct Config {
     pub write_calendars: Vec<CalendarId>,
     /// An explicit `ekctl` path; `None` means `ekctl` next to the running executable.
     pub ekctl: Option<PathBuf>,
+    /// The reminder lists reads may touch, as listed in the config file.
+    pub read_lists: Vec<ListId>,
+    /// The reminder lists writes may touch; empty refuses every reminder write.
+    pub write_lists: Vec<ListId>,
+    /// The places location triggers may name, sorted by name.
+    pub places: Vec<Place>,
+    /// An explicit `remindctl` path; `None` means `remindctl` next to the running executable.
+    pub remindctl: Option<PathBuf>,
 }
 
 /// Why a config file was rejected; every rule violation names its key.
@@ -124,6 +232,47 @@ pub enum ConfigError {
     /// `ekctl` is set to an empty path.
     #[error("`ekctl` must not be empty")]
     EmptyEkctl,
+    /// A list id in `read_lists` or `write_lists` is not a full UUID.
+    #[error("`{key}` contains an invalid list id {value:?}: {reason}")]
+    InvalidListId {
+        /// The config key holding the id.
+        key: &'static str,
+        /// The id as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A key in `[places]` is not a valid place name.
+    #[error("`places` contains an invalid name {value:?}: {reason}")]
+    InvalidPlaceName {
+        /// The name as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A place's `address` is blank.
+    #[error("`places.{place}.address` must not be empty")]
+    EmptyAddress {
+        /// The place whose address is blank.
+        place: PlaceName,
+    },
+    /// A place's `address` contains a control character.
+    #[error("`places.{place}.address` must not contain a control character")]
+    AddressControlCharacter {
+        /// The place whose address is unusable.
+        place: PlaceName,
+    },
+    /// A place's `radius` is outside 50-2000 meters.
+    #[error("`places.{place}.radius` must be between 50 and 2000 meters, got {radius}")]
+    RadiusOutOfRange {
+        /// The place whose radius is out of range.
+        place: PlaceName,
+        /// The radius as written.
+        radius: i64,
+    },
+    /// `remindctl` is set to an empty path.
+    #[error("`remindctl` must not be empty")]
+    EmptyRemindctl,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +286,20 @@ struct RawConfig {
     #[serde(default)]
     write_calendars: Vec<String>,
     ekctl: Option<PathBuf>,
+    #[serde(default)]
+    read_lists: Vec<String>,
+    #[serde(default)]
+    write_lists: Vec<String>,
+    #[serde(default)]
+    places: BTreeMap<String, RawPlace>,
+    remindctl: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPlace {
+    address: String,
+    radius: Option<i64>,
 }
 
 impl Config {
@@ -159,6 +322,10 @@ impl Config {
             read_calendars,
             write_calendars,
             ekctl,
+            read_lists,
+            write_lists,
+            places,
+            remindctl,
         } = toml::from_str(text).map_err(ConfigError::Parse)?;
 
         let Some(listen) = listen else {
@@ -196,12 +363,37 @@ impl Config {
             return Err(ConfigError::EmptyEkctl);
         }
 
+        let mut lists_read = Vec::new();
+        for id in read_lists {
+            lists_read.push(parse_list_id("read_lists", id)?);
+        }
+
+        let mut lists_write = Vec::new();
+        for id in write_lists {
+            lists_write.push(parse_list_id("write_lists", id)?);
+        }
+
+        let mut configured = Vec::new();
+        for (name, place) in places {
+            configured.push(parse_place(name, place)?);
+        }
+
+        if let Some(path) = &remindctl
+            && path.as_os_str().is_empty()
+        {
+            return Err(ConfigError::EmptyRemindctl);
+        }
+
         Ok(Self {
             listen,
             hosts: names,
             read_calendars: read,
             write_calendars: write,
             ekctl,
+            read_lists: lists_read,
+            write_lists: lists_write,
+            places: configured,
+            remindctl,
         })
     }
 
@@ -220,16 +412,39 @@ impl Config {
         readable
     }
 
+    /// Every reminder list reads may touch: `read_lists` plus `write_lists`, without duplicates.
+    pub fn readable_lists(&self) -> Vec<ListId> {
+        let mut readable = Vec::new();
+        for id in self.read_lists.iter().chain(self.write_lists.iter()) {
+            if !readable.contains(id) {
+                readable.push(id.clone());
+            }
+        }
+        readable
+    }
+
     /// The `ekctl` to run: the configured path, or `ekctl` beside `executable`.
     pub fn ekctl_path(&self, executable: &Path) -> PathBuf {
         if let Some(path) = &self.ekctl {
             return path.clone();
         }
-        let Some(dir) = executable.parent() else {
-            return PathBuf::from(EKCTL_FILE_NAME);
-        };
-        dir.join(EKCTL_FILE_NAME)
+        beside(executable, EKCTL_FILE_NAME)
     }
+
+    /// The `remindctl` to run: the configured path, or `remindctl` beside `executable`.
+    pub fn remindctl_path(&self, executable: &Path) -> PathBuf {
+        if let Some(path) = &self.remindctl {
+            return path.clone();
+        }
+        beside(executable, REMINDCTL_FILE_NAME)
+    }
+}
+
+fn beside(executable: &Path, file_name: &str) -> PathBuf {
+    let Some(dir) = executable.parent() else {
+        return PathBuf::from(file_name);
+    };
+    dir.join(file_name)
 }
 
 fn path_under_home(home: Option<OsString>) -> Result<PathBuf, ConfigError> {
@@ -259,6 +474,69 @@ fn parse_calendar_id(key: &'static str, value: String) -> Result<CalendarId, Con
     }
 }
 
+fn parse_list_id(key: &'static str, value: String) -> Result<ListId, ConfigError> {
+    match ListId::parse(value.clone()) {
+        Ok(id) => Ok(id),
+        Err(reason) => Err(ConfigError::InvalidListId { key, value, reason }),
+    }
+}
+
+fn parse_place(name: String, place: RawPlace) -> Result<Place, ConfigError> {
+    let RawPlace { address, radius } = place;
+    let name = match PlaceName::parse(&name) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            return Err(ConfigError::InvalidPlaceName {
+                value: name,
+                reason,
+            });
+        }
+    };
+    if address.trim().is_empty() {
+        return Err(ConfigError::EmptyAddress { place: name });
+    }
+    if has_control_character(&address) {
+        return Err(ConfigError::AddressControlCharacter { place: name });
+    }
+    let radius = match radius {
+        None => DEFAULT_RADIUS,
+        Some(radius) => match u32::try_from(radius) {
+            Ok(meters) if (MIN_RADIUS..=MAX_RADIUS).contains(&meters) => meters,
+            Ok(_) | Err(_) => {
+                return Err(ConfigError::RadiusOutOfRange {
+                    place: name,
+                    radius,
+                });
+            }
+        },
+    };
+    Ok(Place {
+        name,
+        address: Address(address),
+        radius,
+    })
+}
+
+/// Whether `value` is a full hyphenated UUID, the only id form `remindctl` never reads as a row index.
+pub fn is_full_uuid(value: &str) -> bool {
+    let mut groups = 0;
+    for group in value.split('-') {
+        let Some(expected) = UUID_GROUP_LENGTHS.get(groups) else {
+            return false;
+        };
+        if group.len() != *expected {
+            return false;
+        }
+        for c in group.chars() {
+            if !c.is_ascii_hexdigit() {
+                return false;
+            }
+        }
+        groups += 1;
+    }
+    groups == UUID_GROUP_LENGTHS.len()
+}
+
 pub(crate) fn has_control_character(value: &str) -> bool {
     for c in value.chars() {
         if c.is_control() {
@@ -274,6 +552,7 @@ mod tests {
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
     const WRITE_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
+    const OTHER_ID: &str = "11111111-2222-3333-4444-555555555555";
 
     fn id(value: &str) -> CalendarId {
         CalendarId(value.to_owned())
@@ -300,7 +579,297 @@ mod tests {
                 read_calendars: vec![id(READ_ID)],
                 write_calendars: vec![id(WRITE_ID)],
                 ekctl: Some(PathBuf::from("/opt/ekctl")),
+                read_lists: Vec::new(),
+                write_lists: Vec::new(),
+                places: Vec::new(),
+                remindctl: None,
             }
+        );
+    }
+
+    fn list(value: &str) -> ListId {
+        ListId(value.to_owned())
+    }
+
+    fn place(name: &str, address: &str, radius: u32) -> Place {
+        Place {
+            name: PlaceName(name.to_owned()),
+            address: Address(address.to_owned()),
+            radius,
+        }
+    }
+
+    fn with_places(places: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\n[places]\n{places}\n"
+        ))
+    }
+
+    #[test]
+    fn valid_reminders_config() {
+        let config = Config::from_toml(&format!(
+            r#"
+            listen = "127.0.0.1:8790"
+            read_lists = ["{READ_ID}"]
+            write_lists = ["{WRITE_ID}"]
+            remindctl = "/opt/remindctl"
+
+            [places]
+            shop = {{ address = "1 Market Street, Springfield", radius = 150 }}
+            home-2 = {{ address = "2 Elm Street, Springfield" }}
+            "#
+        ))
+        .unwrap();
+
+        assert_eq!(config.read_lists, vec![list(READ_ID)]);
+        assert_eq!(config.write_lists, vec![list(WRITE_ID)]);
+        assert_eq!(
+            config.places,
+            vec![
+                place("home-2", "2 Elm Street, Springfield", DEFAULT_RADIUS),
+                place("shop", "1 Market Street, Springfield", 150),
+            ]
+        );
+        assert_eq!(config.remindctl, Some(PathBuf::from("/opt/remindctl")));
+    }
+
+    #[test]
+    fn minimal_config_has_no_reminders() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        assert!(config.read_lists.is_empty());
+        assert!(config.write_lists.is_empty());
+        assert!(config.places.is_empty());
+        assert_eq!(config.remindctl, None);
+        assert!(config.readable_lists().is_empty());
+    }
+
+    #[test]
+    fn invalid_list_ids() {
+        for (key, value) in [
+            ("read_lists", "1"),
+            ("read_lists", "4F7D9489"),
+            ("write_lists", "4F7D9489-A78F-4369-A951-213207DCFEE"),
+            ("write_lists", "4F7D9489-A78F-4369-A951-213207DCFEE3-0"),
+            ("read_lists", "4F7D9489A78F-4369-A951-213207DCFEE3-"),
+            ("read_lists", "ZF7D9489-A78F-4369-A951-213207DCFEE3"),
+            ("write_lists", ""),
+        ] {
+            let err = Config::from_toml(&format!(
+                "listen = \"127.0.0.1:8790\"\n{key} = [\"{value}\"]"
+            ))
+            .unwrap_err();
+            let ConfigError::InvalidListId {
+                key: named,
+                value: written,
+                reason,
+            } = &err
+            else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(*named, key);
+            assert_eq!(written, value);
+            assert_eq!(*reason, "must be a full UUID");
+            assert!(err.to_string().contains(&format!("`{key}`")), "{err}");
+        }
+    }
+
+    #[test]
+    fn lowercase_list_id_is_a_uuid() {
+        let lower = READ_ID.to_ascii_lowercase();
+        let config = Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\nread_lists = [\"{lower}\"]"
+        ))
+        .unwrap();
+        assert_eq!(config.read_lists, vec![list(&lower)]);
+    }
+
+    #[test]
+    fn invalid_place_names() {
+        for (name, expected) in [
+            ("\"\"", "empty"),
+            (
+                "Shop",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            (
+                "my_shop",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            (
+                "\"my shop\"",
+                "must contain only lowercase letters, digits and `-`",
+            ),
+            ("-shop", "must start with a letter or digit"),
+            (
+                "a1234567890123456789012345678901234567890",
+                "longer than 40 characters",
+            ),
+        ] {
+            let err = with_places(&format!("{name} = {{ address = \"1 Main St\" }}")).unwrap_err();
+            let ConfigError::InvalidPlaceName { reason, .. } = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(*reason, expected, "{name}");
+            assert!(err.to_string().contains("`places`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn longest_place_name() {
+        let name = format!("9{}b", "a-".repeat(19));
+        assert_eq!(name.len(), 40);
+        let config = with_places(&format!("{name} = {{ address = \"1 Main St\" }}")).unwrap();
+        assert_eq!(config.places[0].name.as_str(), name);
+    }
+
+    #[test]
+    fn empty_address() {
+        for address in ["", "  "] {
+            let err = with_places(&format!("shop = {{ address = \"{address}\" }}")).unwrap_err();
+            let ConfigError::EmptyAddress { place } = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(place.as_str(), "shop");
+            assert_eq!(err.to_string(), "`places.shop.address` must not be empty");
+        }
+    }
+
+    #[test]
+    fn address_with_control_character() {
+        let err = with_places(r#"shop = { address = "1 Main St\u0007" }"#).unwrap_err();
+        let ConfigError::AddressControlCharacter { place } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(place.as_str(), "shop");
+        assert!(!err.to_string().contains("Main"), "{err}");
+    }
+
+    #[test]
+    fn missing_address() {
+        let err = with_places("shop = { radius = 100 }").unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(err.to_string().contains("address"), "{err}");
+    }
+
+    #[test]
+    fn unknown_place_key() {
+        let err = with_places(r#"shop = { address = "1 Main St", lat = 1 }"#).unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(err.to_string().contains("lat"), "{err}");
+    }
+
+    #[test]
+    fn radius_out_of_range() {
+        for radius in [-1, 0, 49, 2001, 5_000_000_000] {
+            let err = with_places(&format!(
+                "shop = {{ address = \"1 Main St\", radius = {radius} }}"
+            ))
+            .unwrap_err();
+            let ConfigError::RadiusOutOfRange { place, radius: got } = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(place.as_str(), "shop");
+            assert_eq!(*got, radius);
+            assert!(err.to_string().contains("`places.shop.radius`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn radius_bounds_are_inclusive() {
+        let config = with_places(
+            "near = { address = \"1 Main St\", radius = 50 }\nfar = { address = \"2 Main St\", radius = 2000 }",
+        )
+        .unwrap();
+        assert_eq!(
+            config.places,
+            vec![
+                place("far", "2 Main St", 2000),
+                place("near", "1 Main St", 50)
+            ]
+        );
+    }
+
+    #[test]
+    fn default_radius() {
+        let config = with_places(r#"home = { address = "2 Elm Street" }"#).unwrap();
+        assert_eq!(config.places, vec![place("home", "2 Elm Street", 100)]);
+    }
+
+    #[test]
+    fn address_is_redacted_in_debug() {
+        let config = with_places(r#"home = { address = "2 Elm Street" }"#).unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("Elm"), "{debug}");
+        assert!(debug.contains("home"), "{debug}");
+    }
+
+    #[test]
+    fn write_list_implied_readable() {
+        let config = Config::from_toml(&format!(
+            r#"
+            listen = "127.0.0.1:8790"
+            read_lists = ["{WRITE_ID}", "{READ_ID}", "{READ_ID}"]
+            write_lists = ["{WRITE_ID}", "{OTHER_ID}"]
+            "#
+        ))
+        .unwrap();
+        assert_eq!(
+            config.readable_lists(),
+            vec![list(WRITE_ID), list(READ_ID), list(OTHER_ID)]
+        );
+    }
+
+    #[test]
+    fn write_list_readable_without_read_lists() {
+        let config = Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\nwrite_lists = [\"{WRITE_ID}\"]"
+        ))
+        .unwrap();
+        assert!(config.read_lists.is_empty());
+        assert_eq!(config.readable_lists(), vec![list(WRITE_ID)]);
+    }
+
+    #[test]
+    fn empty_remindctl() {
+        let err = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+            remindctl = ""
+            "#,
+        )
+        .unwrap_err();
+        let ConfigError::EmptyRemindctl = err else {
+            panic!("unexpected error: {err:?}");
+        };
+    }
+
+    #[test]
+    fn remindctl_defaults_next_to_executable() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let executable =
+            Path::new("/Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge");
+        assert_eq!(
+            config.remindctl_path(executable),
+            PathBuf::from("/Applications/EventKitBridge.app/Contents/MacOS/remindctl")
+        );
+    }
+
+    #[test]
+    fn remindctl_override() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+            remindctl = "/usr/local/bin/remindctl"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.remindctl_path(Path::new("/somewhere/eventkit-bridge")),
+            PathBuf::from("/usr/local/bin/remindctl")
         );
     }
 
