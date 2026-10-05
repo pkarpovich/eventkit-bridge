@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use chrono::Utc;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -10,6 +12,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::ekctl::{self, EkctlError};
+use crate::mail::store::{MailProblem, MailStatus, MailStore};
 use crate::policy::Policy;
 use crate::remindctl::{self, RemindctlError};
 use crate::reminders_model::RcStatus;
@@ -38,6 +41,15 @@ pub enum DegradedReason {
     /// `remindctl` failed for another reason.
     #[serde(rename = "remindctl failed")]
     RemindctlFailed,
+    /// The Envelope Index cannot be opened or read, as without Full Disk Access.
+    #[serde(rename = "mail no access")]
+    MailNoAccess,
+    /// A table or column the bridge reads from the Envelope Index is missing.
+    #[serde(rename = "mail schema changed")]
+    MailSchemaChanged,
+    /// A configured mail account has no mailboxes.
+    #[serde(rename = "mail account missing")]
+    MailAccountMissing,
 }
 
 /// The result of a health check.
@@ -49,6 +61,8 @@ pub enum Health {
         calendars: usize,
         /// How many readable reminder lists exist, `None` when none are configured.
         lists: Option<usize>,
+        /// The mail store, `None` when `[mail]` is absent.
+        mail: Option<MailStatus>,
     },
     /// The bridge cannot serve reads as configured.
     Degraded(DegradedReason),
@@ -57,7 +71,11 @@ pub enum Health {
 impl IntoResponse for Health {
     fn into_response(self) -> Response {
         match self {
-            Health::Ok { calendars, lists } => {
+            Health::Ok {
+                calendars,
+                lists,
+                mail,
+            } => {
                 let mut body = json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -65,6 +83,14 @@ impl IntoResponse for Health {
                 });
                 if let Some(lists) = lists {
                     body["lists"] = json!(lists);
+                }
+                if let Some(MailStatus {
+                    accounts,
+                    newest_message_age_s,
+                }) = mail
+                {
+                    body["mail_accounts"] = json!(accounts);
+                    body["newest_message_age_s"] = json!(newest_message_age_s);
                 }
                 (StatusCode::OK, Json(body)).into_response()
             }
@@ -86,10 +112,13 @@ pub struct Probe<'a> {
     pub reminders: &'a remindctl::Runner,
     /// The policy naming the readable calendars and lists.
     pub policy: &'a Policy,
+    /// The mail store, `None` when `[mail]` is absent.
+    pub mail: Option<&'a Arc<MailStore>>,
 }
 
-/// Runs `ekctl list calendars`, and `remindctl status` and `list` when reminder lists are
-/// configured, at most once per TTL; concurrent callers wait for one check.
+/// Runs `ekctl list calendars`, `remindctl status` and `list` when reminder lists are
+/// configured, and the mail store check when `[mail]` is present, at most once per TTL;
+/// concurrent callers wait for one check.
 #[derive(Debug)]
 pub struct HealthCheck {
     configured: bool,
@@ -125,31 +154,60 @@ impl HealthCheck {
 }
 
 async fn run_probe(probe: Probe<'_>) -> Health {
+    match probe_all(probe).await {
+        Ok(health) => health,
+        Err(reason) => Health::Degraded(reason),
+    }
+}
+
+async fn probe_all(probe: Probe<'_>) -> Result<Health, DegradedReason> {
     let Probe {
         calendars,
         reminders,
         policy,
+        mail,
     } = probe;
     let listed = match calendars.session().await.list_calendars().await {
         Ok(listed) => listed,
-        Err(err) => return Health::Degraded(failure_reason(&err)),
+        Err(err) => return Err(failure_reason(&err)),
     };
     let existing = policy.filter_calendars(listed).len();
     if existing < policy.default_read_set().len() {
-        return Health::Degraded(DegradedReason::CalendarMissing);
+        return Err(DegradedReason::CalendarMissing);
     }
-    if !policy.any_readable_list() {
-        return Health::Ok {
-            calendars: existing,
-            lists: None,
-        };
+    let lists = match policy.any_readable_list() {
+        true => Some(probe_lists(reminders, policy).await?),
+        false => None,
+    };
+    let mail = match mail {
+        Some(store) => Some(probe_mail(store).await?),
+        None => None,
+    };
+    Ok(Health::Ok {
+        calendars: existing,
+        lists,
+        mail,
+    })
+}
+
+async fn probe_mail(store: &Arc<MailStore>) -> Result<MailStatus, DegradedReason> {
+    let store = Arc::clone(store);
+    let status = tokio::task::spawn_blocking(move || store.status(Utc::now())).await;
+    match status {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(problem)) => Err(mail_reason(problem)),
+        Err(err) => {
+            tracing::warn!(error = %err, "the mail check did not finish");
+            Err(DegradedReason::MailNoAccess)
+        }
     }
-    match probe_lists(reminders, policy).await {
-        Ok(lists) => Health::Ok {
-            calendars: existing,
-            lists: Some(lists),
-        },
-        Err(reason) => Health::Degraded(reason),
+}
+
+fn mail_reason(problem: MailProblem) -> DegradedReason {
+    match problem {
+        MailProblem::NoAccess => DegradedReason::MailNoAccess,
+        MailProblem::SchemaChanged => DegradedReason::MailSchemaChanged,
+        MailProblem::AccountMissing => DegradedReason::MailAccountMissing,
     }
 }
 
@@ -201,8 +259,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::config::MAIL_INDEX_RELATIVE_PATH;
     use crate::ekctl::Runner;
     use crate::fake_ekctl::{Fake, fixture};
+    use crate::mail::fixture::Fixture as MailFixture;
     use crate::subprocess::StoreLock;
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
@@ -263,6 +323,7 @@ mod tests {
                 calendars,
                 reminders: &reminders,
                 policy: &Policy::new(config),
+                mail: None,
             })
             .await
     }
@@ -279,6 +340,7 @@ mod tests {
                 calendars: &calendars,
                 reminders: &reminders,
                 policy: &Policy::new(config),
+                mail: None,
             })
             .await
     }
@@ -291,7 +353,8 @@ mod tests {
             check(&config, &fake).await,
             Health::Ok {
                 calendars: 2,
-                lists: None
+                lists: None,
+                mail: None
             }
         );
     }
@@ -381,7 +444,8 @@ mod tests {
             check_reminders(&config, &fake).await,
             Health::Ok {
                 calendars: 1,
-                lists: None
+                lists: None,
+                mail: None
             }
         );
         assert_eq!(fake.log(), "list\n");
@@ -395,7 +459,8 @@ mod tests {
             check_reminders(&config, &fake).await,
             Health::Ok {
                 calendars: 1,
-                lists: Some(2)
+                lists: Some(2),
+                mail: None
             }
         );
         assert_eq!(fake.log(), "list\nstatus\nlist\n");
@@ -424,6 +489,7 @@ mod tests {
                 calendars: &calendars,
                 reminders: &reminders,
                 policy: &Policy::new(&config),
+                mail: None,
             })
             .await;
         assert_eq!(health, Health::Degraded(DegradedReason::RemindctlFailed));
@@ -438,6 +504,7 @@ mod tests {
                 calendars: &calendars,
                 reminders: &reminders,
                 policy: &Policy::new(&config),
+                mail: None,
             })
             .await;
         assert_eq!(health, Health::Degraded(DegradedReason::Timeout));
@@ -456,12 +523,14 @@ mod tests {
                 calendars: &runner,
                 reminders: &reminders,
                 policy: &policy,
+                mail: None,
             };
             assert_eq!(
                 health.check(probe).await,
                 Health::Ok {
                     calendars: 1,
-                    lists: None
+                    lists: None,
+                    mail: None
                 }
             );
         }
@@ -479,12 +548,109 @@ mod tests {
             calendars: &runner,
             reminders: &reminders,
             policy: &policy,
+            mail: None,
         };
         let health = HealthCheck::new(&config, Duration::from_millis(50));
         health.check(probe).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         health.check(probe).await;
         assert_eq!(fake.log(), "call\ncall\n");
+    }
+
+    #[tokio::test]
+    async fn mail_result_is_cached_with_the_rest() {
+        let config = config(&[READ_ID], None);
+        let fake = counting("0");
+        let runner = fake.runner();
+        let reminders = absent_remindctl(&runner);
+        let policy = Policy::new(&config);
+        let fixture = MailFixture::standard();
+        let store = Arc::new(MailStore::new(fixture.config()));
+        let probe = Probe {
+            calendars: &runner,
+            reminders: &reminders,
+            policy: &policy,
+            mail: Some(&store),
+        };
+        let health = HealthCheck::new(&config, Duration::from_millis(50));
+        let Health::Ok {
+            calendars: 1,
+            lists: None,
+            mail:
+                Some(MailStatus {
+                    accounts: 2,
+                    newest_message_age_s: Some(_),
+                }),
+        } = health.check(probe).await
+        else {
+            panic!("mail status missing");
+        };
+
+        std::fs::write(
+            fixture.root.join(MAIL_INDEX_RELATIVE_PATH),
+            b"not a database at all, just text that is long enough to be read as a header",
+        )
+        .unwrap();
+        let Health::Ok {
+            calendars: 1,
+            lists: None,
+            mail: Some(_),
+        } = health.check(probe).await
+        else {
+            panic!("cached result not reused");
+        };
+        assert_eq!(fake.log(), "call\n");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            health.check(probe).await,
+            Health::Degraded(DegradedReason::MailNoAccess)
+        );
+        assert_eq!(fake.log(), "call\ncall\n");
+    }
+
+    #[tokio::test]
+    async fn mail_is_not_checked_when_calendars_fail() {
+        let config = config(&[READ_ID], None);
+        let fake = Fake::new("exit 1");
+        let runner = fake.runner();
+        let reminders = absent_remindctl(&runner);
+        let fixture = MailFixture::standard();
+        let mut mail = fixture.config();
+        mail.root = Some(fixture.root.join("missing"));
+        let store = Arc::new(MailStore::new(mail));
+        let health = HealthCheck::new(&config, HEALTH_TTL)
+            .check(Probe {
+                calendars: &runner,
+                reminders: &reminders,
+                policy: &Policy::new(&config),
+                mail: Some(&store),
+            })
+            .await;
+        assert_eq!(health, Health::Degraded(DegradedReason::EkctlFailed));
+    }
+
+    #[test]
+    fn mail_problems_map_to_reasons() {
+        assert_eq!(
+            mail_reason(MailProblem::NoAccess),
+            DegradedReason::MailNoAccess
+        );
+        assert_eq!(
+            mail_reason(MailProblem::SchemaChanged),
+            DegradedReason::MailSchemaChanged
+        );
+        assert_eq!(
+            mail_reason(MailProblem::AccountMissing),
+            DegradedReason::MailAccountMissing
+        );
+        for (reason, text) in [
+            (DegradedReason::MailNoAccess, "mail no access"),
+            (DegradedReason::MailSchemaChanged, "mail schema changed"),
+            (DegradedReason::MailAccountMissing, "mail account missing"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(text));
+        }
     }
 
     #[tokio::test]
@@ -507,6 +673,7 @@ mod tests {
                         calendars: &runner,
                         reminders: &reminders,
                         policy: &policy,
+                        mail: None,
                     })
                     .await
             }));
@@ -516,7 +683,8 @@ mod tests {
                 task.await.unwrap(),
                 Health::Ok {
                     calendars: 1,
-                    lists: None
+                    lists: None,
+                    mail: None
                 }
             );
         }
@@ -546,6 +714,7 @@ mod tests {
         let ok = Health::Ok {
             calendars: 1,
             lists: None,
+            mail: None,
         };
         assert_eq!(ok.into_response().status(), StatusCode::OK);
         assert_eq!(
@@ -555,10 +724,35 @@ mod tests {
         assert_eq!(
             body(Health::Ok {
                 calendars: 1,
-                lists: Some(3)
+                lists: Some(3),
+                mail: None
             })
             .await,
             json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "lists": 3})
+        );
+        assert_eq!(
+            body(Health::Ok {
+                calendars: 1,
+                lists: None,
+                mail: Some(MailStatus {
+                    accounts: 2,
+                    newest_message_age_s: Some(42),
+                }),
+            })
+            .await,
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 2, "newest_message_age_s": 42})
+        );
+        assert_eq!(
+            body(Health::Ok {
+                calendars: 1,
+                lists: None,
+                mail: Some(MailStatus {
+                    accounts: 1,
+                    newest_message_age_s: None,
+                }),
+            })
+            .await,
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 1, "newest_message_age_s": null})
         );
     }
 }

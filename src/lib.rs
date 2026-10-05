@@ -4,6 +4,7 @@ pub mod config;
 pub mod ekctl;
 pub mod executable;
 pub mod health;
+pub mod mail;
 pub mod model;
 pub mod policy;
 pub mod remindctl;

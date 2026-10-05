@@ -24,6 +24,8 @@ use tokio::time::{self, Instant};
 use crate::config::{Config, HostName, Place};
 use crate::ekctl::{self, EkctlError};
 use crate::health::{HEALTH_TTL, HealthCheck, Probe};
+use crate::mail::emlx::EmlxError;
+use crate::mail::store::{AccountListing, MailReader, MailStore, RegisteredAccount, StoreError};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
 use crate::policy::{GuardError, Policy, PolicyError, ReminderGuardError};
 use crate::remindctl::{self, RemindctlError};
@@ -102,7 +104,11 @@ pub struct App {
     places: Vec<Place>,
     health: HealthCheck,
     hosts: KnownHosts,
+    mail: Option<Arc<MailStore>>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct Rows(usize);
 
 impl App {
     /// The bridge for `config`, running `ekctl` and `remindctl` through `runners`.
@@ -121,6 +127,35 @@ impl App {
                 ip: config.listen.ip(),
                 names: config.hosts.clone(),
             },
+            mail: config
+                .mail
+                .clone()
+                .map(|mail| Arc::new(MailStore::new(mail))),
+        }
+    }
+
+    /// Logs every account in Mail's mailboxes table with its counts and configured name, once
+    /// the store is readable, retrying every `retry` until it is. Does nothing when `[mail]` is
+    /// absent. No message content is logged.
+    pub async fn announce_mail(&self, retry: Duration) {
+        let Some(store) = &self.mail else {
+            return;
+        };
+        loop {
+            let store = Arc::clone(store);
+            let listing = tokio::task::spawn_blocking(move || store.open()?.listing()).await;
+            let error = match listing {
+                Ok(Ok(accounts)) => {
+                    for account in accounts {
+                        log_mail_account(account);
+                    }
+                    return;
+                }
+                Ok(Err(err)) => err.to_string(),
+                Err(err) => err.to_string(),
+            };
+            tracing::warn!(error, "cannot read the mail store yet, retrying");
+            time::sleep(retry).await;
         }
     }
 
@@ -194,13 +229,47 @@ impl App {
     }
 }
 
+fn log_mail_account(account: AccountListing) {
+    let AccountListing {
+        id,
+        kind,
+        registered,
+        mailboxes,
+        messages,
+        newest,
+        name,
+    } = account;
+    let RegisteredAccount {
+        account_type,
+        description,
+    } = registered.unwrap_or_default();
+    tracing::info!(
+        id = %id,
+        kind = %kind,
+        account_type,
+        description,
+        mailboxes,
+        messages,
+        newest = newest.map(|newest| newest.to_string()),
+        configured = name.map(|name| name.to_string()),
+        "mail account"
+    );
+}
+
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
     Policy(PolicyError),
     Ekctl(EkctlError),
     Remindctl(RemindctlError),
+    Mail(StoreError),
     Status(StatusCode, String),
+}
+
+impl From<StoreError> for ApiError {
+    fn from(err: StoreError) -> Self {
+        ApiError::Mail(err)
+    }
 }
 
 impl From<Invalid> for ApiError {
@@ -293,9 +362,43 @@ impl IntoResponse for ApiError {
             }
             ApiError::Ekctl(err) => (ekctl_status(&err), err.to_string()),
             ApiError::Remindctl(err) => (remindctl_status(&err), err.to_string()),
+            ApiError::Mail(err) => mail_failure(err),
             ApiError::Status(status, message) => (status, message),
         };
         (status, Json(json!({"error": message}))).into_response()
+    }
+}
+
+fn mail_failure(err: StoreError) -> (StatusCode, String) {
+    match err {
+        StoreError::UnknownAccount(_) | StoreError::UnknownMailbox(_) => {
+            (StatusCode::BAD_REQUEST, err.to_string())
+        }
+        StoreError::Root(_)
+        | StoreError::RootAccess { path: _, source: _ }
+        | StoreError::Open(_) => {
+            tracing::warn!(error = %err, "cannot open the mail store");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cannot open the mail store".to_owned(),
+            )
+        }
+        StoreError::Query(_) => {
+            tracing::warn!(error = %err, "mail store query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+        StoreError::File(err) => {
+            let reason = match err {
+                EmlxError::Io { path: _, source } => source.kind().to_string(),
+                EmlxError::OutsideRoot(_) => "outside the mail root".to_owned(),
+                EmlxError::LengthLine => "no length line".to_owned(),
+            };
+            tracing::warn!(reason, "cannot read a message file");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot read the message file: {reason}"),
+            )
+        }
     }
 }
 
@@ -353,6 +456,9 @@ pub fn router(app: Arc<App>) -> Router {
                 .patch(update_reminder.layer(middleware::from_fn(require_json)))
                 .delete(delete_reminder),
         )
+        .route("/v1/mail/accounts", get(mail_accounts))
+        .route("/v1/mail/messages", get(mail_messages))
+        .route("/v1/mail/messages/{id}", get(mail_message))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -420,7 +526,8 @@ async fn log_request(request: Request, next: Next) -> Response {
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let ekctl = joined(ekctl_calls.calls());
     let remindctl = joined(remindctl_calls.calls());
-    tracing::info!(%method, %route, status, duration_ms, ekctl, remindctl, "request");
+    let rows = response.extensions().get::<Rows>().map(|Rows(rows)| *rows);
+    tracing::info!(%method, %route, status, duration_ms, ekctl, remindctl, rows, "request");
     response
 }
 
@@ -458,6 +565,7 @@ async fn healthz(State(app): Shared) -> Response {
             calendars: &app.runner,
             reminders: &app.reminders,
             policy: &app.policy,
+            mail: app.mail.as_ref(),
         })
         .await
         .into_response()
@@ -666,6 +774,76 @@ async fn delete_reminder(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+fn mail_store(app: &App) -> Result<Arc<MailStore>, ApiError> {
+    let Some(store) = &app.mail else {
+        return Err(ApiError::Status(
+            StatusCode::NOT_FOUND,
+            "mail is off: add [mail] to the config".to_owned(),
+        ));
+    };
+    Ok(Arc::clone(store))
+}
+
+async fn read_mail<T, F>(store: Arc<MailStore>, read: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&MailReader<'_>) -> Result<T, StoreError> + Send + 'static,
+{
+    let result = tokio::task::spawn_blocking(move || read(&store.open()?)).await;
+    match result {
+        Ok(result) => Ok(result?),
+        Err(err) => {
+            tracing::warn!(error = %err, "mail read did not finish");
+            Err(ApiError::Status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mail read failed".to_owned(),
+            ))
+        }
+    }
+}
+
+fn with_rows(rows: usize, response: impl IntoResponse) -> Response {
+    let mut response = response.into_response();
+    response.extensions_mut().insert(Rows(rows));
+    response
+}
+
+async fn mail_accounts(State(app): Shared) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let accounts = read_mail(store, |reader| reader.accounts()).await?;
+    Ok(with_rows(
+        accounts.len(),
+        Json(json!({ "accounts": accounts })),
+    ))
+}
+
+async fn mail_messages(
+    State(app): Shared,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let query = request::mail_messages_query(query.as_deref())?;
+    let page = read_mail(store, move |reader| reader.messages(&query)).await?;
+    Ok(with_rows(page.messages.len(), Json(page)))
+}
+
+async fn mail_message(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let Path(id) = id?;
+    let id = request::mail_message_id(&id)?;
+    let message = read_mail(store, move |reader| reader.message(id)).await?;
+    let Some(message) = message else {
+        return Err(ApiError::Status(
+            StatusCode::NOT_FOUND,
+            "message not found".to_owned(),
+        ));
+    };
+    Ok(with_rows(1, Json(message)))
+}
+
 async fn empty_event_id() -> ApiError {
     ApiError::BadRequest(InvalidEventId::Empty.to_string())
 }
@@ -702,6 +880,7 @@ mod tests {
     use super::*;
     use crate::ekctl::Runner;
     use crate::fake_ekctl::{Fake, fixture, fixture_text};
+    use crate::mail::fixture::{self as mail_fixture, Fixture as MailFixture};
 
     const READ_ID: &str = "4F7D9489-A78F-4369-A951-213207DCFEE3";
     const WRITE_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
@@ -1873,25 +2052,58 @@ esac"#,
         }
     }
 
+    struct Sinks(Vec<Captured>);
+
+    impl Write for Sinks {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            for sink in &mut self.0 {
+                sink.write_all(buf)?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     thread_local! {
         static SINK: RefCell<Option<Captured>> = const { RefCell::new(None) };
     }
 
+    static POOL_SINKS: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
+
     struct ThreadSink;
 
     impl<'a> MakeWriter<'a> for ThreadSink {
-        type Writer = Captured;
+        type Writer = Sinks;
 
         fn make_writer(&'a self) -> Self::Writer {
-            SINK.with_borrow(|sink| sink.clone().unwrap_or_default())
+            let sink = SINK.with_borrow(Clone::clone);
+            if let Some(sink) = sink {
+                return Sinks(vec![sink]);
+            }
+            let thread = std::thread::current();
+            let Some(name) = thread.name() else {
+                return Sinks(Vec::new());
+            };
+            if !name.starts_with("tokio-") {
+                return Sinks(Vec::new());
+            }
+            Sinks(POOL_SINKS.lock().unwrap().clone())
         }
     }
 
-    struct CaptureGuard;
+    struct CaptureGuard(Captured);
 
     impl Drop for CaptureGuard {
         fn drop(&mut self) {
             SINK.set(None);
+            let Self(Captured(captured)) = self;
+            POOL_SINKS
+                .lock()
+                .unwrap()
+                .retain(|Captured(sink)| !Arc::ptr_eq(sink, captured));
         }
     }
 
@@ -1908,7 +2120,8 @@ esac"#,
         tracing::callsite::rebuild_interest_cache();
         let captured = Captured::default();
         SINK.set(Some(captured.clone()));
-        (captured, CaptureGuard)
+        POOL_SINKS.lock().unwrap().push(captured.clone());
+        (captured.clone(), CaptureGuard(captured))
     }
 
     #[tokio::test]
@@ -3285,5 +3498,723 @@ esac"#,
         assert!(log.contains("name=shop radius=150"), "{log}");
         assert!(!log.contains("Example Street"), "{log}");
         assert!(!log.contains("Home Lane"), "{log}");
+    }
+    fn mail_config(fixture: &MailFixture) -> Config {
+        let mut config = configured();
+        config.mail = Some(fixture.config());
+        config
+    }
+
+    fn no_ekctl() -> Runner {
+        Runner::new(PathBuf::from("/nonexistent/ekctl"), Duration::from_secs(5))
+    }
+
+    fn mail_app(fixture: &MailFixture) -> Router {
+        app(&mail_config(fixture), no_ekctl())
+    }
+
+    fn mail_date(seconds: i64) -> String {
+        DateTime::from_timestamp(seconds, 0)
+            .unwrap()
+            .with_timezone(&Local)
+            .to_rfc3339_opts(SecondsFormat::Secs, false)
+    }
+
+    fn message_ids(body: &Value) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for message in body["messages"].as_array().unwrap() {
+            ids.push(message["id"].as_i64().unwrap());
+        }
+        ids
+    }
+
+    const ALL_MAIL: [i64; 6] = [
+        mail_fixture::MULTIPART_ALL_MAIL,
+        mail_fixture::MULTIPART,
+        mail_fixture::HTML,
+        mail_fixture::PLAIN,
+        mail_fixture::PARTIAL,
+        mail_fixture::MISSING,
+    ];
+
+    #[tokio::test]
+    async fn mail_accounts() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let (status, body) = get(&router, "/v1/mail/accounts").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"accounts": [
+                {"name": "gmail", "type": "imap", "mailboxes": [
+                    {"path": "INBOX", "total": 1, "unread": 1},
+                    {"path": "[Gmail]/All Mail", "total": 1, "unread": 1}
+                ]},
+                {"name": "main", "type": "exchange", "mailboxes": [
+                    {"path": "Inbox", "total": 4, "unread": 2}
+                ]}
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_messages_lists_every_visible_message_newest_first() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let (status, body) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(message_ids(&body), ALL_MAIL);
+        assert_eq!(body["next_cursor"], Value::Null);
+        assert_eq!(
+            body["messages"][3],
+            json!({
+                "id": mail_fixture::PLAIN,
+                "account": "main",
+                "mailbox": "Inbox",
+                "date": mail_date(mail_fixture::T + 100),
+                "from": {"name": "Alice Example", "address": "alice@example.com"},
+                "to": [{"name": "Bob", "address": "bob@example.com"}],
+                "subject": "Quarterly report",
+                "summary": "Numbers attached",
+                "read": true,
+                "flagged": false,
+                "has_body": true
+            })
+        );
+        assert_eq!(body["messages"][0]["mailbox"], "[Gmail]/All Mail");
+        assert_eq!(body["messages"][1]["mailbox"], "INBOX");
+        assert_eq!(body["messages"][5]["has_body"], false);
+    }
+
+    #[tokio::test]
+    async fn mail_messages_apply_filters() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let since = mail_date(mail_fixture::T + 100).replace('+', "%2B");
+        let until = mail_date(mail_fixture::T + 300).replace('+', "%2B");
+        let cases: [(String, Vec<i64>); 7] = [
+            (
+                "account=main".to_owned(),
+                vec![
+                    mail_fixture::HTML,
+                    mail_fixture::PLAIN,
+                    mail_fixture::PARTIAL,
+                    mail_fixture::MISSING,
+                ],
+            ),
+            (
+                "account=gmail&mailbox=inbox".to_owned(),
+                vec![mail_fixture::MULTIPART],
+            ),
+            (
+                "account=main&unread=true".to_owned(),
+                vec![mail_fixture::HTML, mail_fixture::MISSING],
+            ),
+            (
+                format!("since={since}&until={until}"),
+                vec![mail_fixture::HTML, mail_fixture::PLAIN],
+            ),
+            (
+                "q=%D0%BF%D0%A0%D0%98%D0%B2%D0%B5%D1%82".to_owned(),
+                vec![mail_fixture::MULTIPART_ALL_MAIL, mail_fixture::MULTIPART],
+            ),
+            (
+                "q=BOB%40example.com&account=main&account=gmail".to_owned(),
+                vec![mail_fixture::HTML, mail_fixture::PLAIN],
+            ),
+            (
+                "unread=true&q=deals&mailbox=Inbox".to_owned(),
+                vec![mail_fixture::HTML],
+            ),
+        ];
+        for (query, expected) in cases {
+            let (status, body) = get(&router, &format!("/v1/mail/messages?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(message_ids(&body), expected, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_messages_page_with_the_cursor() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let mut seen = Vec::new();
+        let mut uri = "/v1/mail/messages?limit=4".to_owned();
+        let mut pages = 0;
+        loop {
+            let (status, body) = get(&router, &uri).await;
+            assert_eq!(status, StatusCode::OK);
+            seen.extend(message_ids(&body));
+            pages += 1;
+            let Some(cursor) = body["next_cursor"].as_str() else {
+                break;
+            };
+            uri = format!("/v1/mail/messages?limit=4&cursor={cursor}");
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(seen, ALL_MAIL);
+    }
+
+    #[tokio::test]
+    async fn mail_messages_validation() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let cases = [
+            ("account=nobody", "unknown mail account \"nobody\""),
+            ("account=Main", "unknown mail account \"Main\""),
+            ("mailbox=Spam", "unknown mailbox \"Spam\""),
+            (
+                "mailbox=Deleted%20Items",
+                "unknown mailbox \"Deleted Items\"",
+            ),
+            (
+                "account=main&mailbox=INBOX%2F..%2F..%2Fetc",
+                "unknown mailbox \"INBOX/../../etc\"",
+            ),
+            (
+                "account=gmail&mailbox=Archive",
+                "unknown mailbox \"Archive\"",
+            ),
+            ("mailbox=", "`mailbox` must not be empty"),
+            ("since=yesterday", "`since` must be an RFC 3339 timestamp"),
+            ("until=2026-10-05", "`until` must be an RFC 3339 timestamp"),
+            (
+                "since=2026-10-05T00:00:00Z&until=2026-10-04T00:00:00Z",
+                "`until` must be after `since`",
+            ),
+            ("unread=1", "`unread` must be true or false"),
+            ("limit=0", "`limit` must be an integer from 1 to 100"),
+            ("limit=101", "`limit` must be an integer from 1 to 100"),
+            (
+                "cursor=%21%21",
+                "`cursor` must be the `next_cursor` of a previous page",
+            ),
+            (
+                "cursor=MTc5MTIwMDEwMA",
+                "`cursor` must be the `next_cursor` of a previous page",
+            ),
+            (
+                "from=2026-10-05T00:00:00Z",
+                "unknown query parameter `from`",
+            ),
+            ("q=a&q=b", "`q` is given more than once"),
+        ];
+        for (query, message) in cases {
+            let (status, body) = get(&router, &format!("/v1/mail/messages?{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(body, error(message), "{query}");
+        }
+        for id in ["abc", "0", "-1", "01", "1.5"] {
+            let (status, body) = get(&router, &format!("/v1/mail/messages/{id}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
+            assert_eq!(body, error("message id must be a positive integer"));
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_message() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PLAIN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], mail_fixture::PLAIN);
+        assert_eq!(body["subject"], "Quarterly report");
+        assert_eq!(
+            body["cc"],
+            json!([{"name": "Carol", "address": "carol@example.com"}])
+        );
+        assert_eq!(body["body"], "Plain version\r\n");
+        assert_eq!(body["body_truncated"], false);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["attachments"], json!([]));
+
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::MULTIPART),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["account"], "gmail");
+        assert_eq!(body["subject"], mail_fixture::CYRILLIC_SUBJECT);
+        assert_eq!(body["body"], mail_fixture::CYRILLIC_BODY);
+        assert_eq!(
+            body["attachments"],
+            json!([{
+                "name": "report.pdf",
+                "content_type": "application/pdf",
+                "size": mail_fixture::ATTACHMENT_BYTES.len()
+            }])
+        );
+
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::HTML),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["body"].as_str().unwrap().contains("Big sale"),
+            "{body}"
+        );
+        assert_eq!(body["flagged"], true);
+
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PARTIAL),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["partial"], true);
+        assert_eq!(body["has_body"], true);
+
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::MISSING),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["has_body"], false);
+        assert_eq!(body["body"], Value::Null);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["attachments"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn invisible_mail_messages_are_not_found() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        for id in [
+            mail_fixture::IN_DELETED_ITEMS,
+            mail_fixture::DELETED_ROW,
+            mail_fixture::UNCONFIGURED,
+            mail_fixture::IN_SPAM,
+            mail_fixture::IN_CRAFTED,
+            999_999,
+        ] {
+            let (status, body) = get(&router, &format!("/v1/mail/messages/{id}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(body, error("message not found"), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_off_is_not_found() {
+        let router = app(&configured(), no_ekctl());
+        for uri in [
+            "/v1/mail/accounts",
+            "/v1/mail/messages",
+            "/v1/mail/messages?limit=0",
+            "/v1/mail/messages/830",
+            "/v1/mail/messages/abc",
+        ] {
+            let (status, body) = get(&router, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                body,
+                error("mail is off: add [mail] to the config"),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_routes_are_get_only_and_check_the_host() {
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        for (method, uri) in [
+            (Method::POST, "/v1/mail/accounts"),
+            (Method::POST, "/v1/mail/messages"),
+            (Method::PATCH, "/v1/mail/messages/830"),
+            (Method::DELETE, "/v1/mail/messages/830"),
+        ] {
+            let (status, body) = send(&router, build_request(method, uri, Body::empty())).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+            assert_eq!(body, error("method not allowed"));
+        }
+        let request = Request::builder()
+            .uri("/v1/mail/messages/830")
+            .header("host", "rebound.example.com:8790")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send(&router, request).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mail_store_failures() {
+        let fixture = MailFixture::standard();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.root = Some(fixture.root.join("missing"));
+        }
+        let router = app(&config, no_ekctl());
+        let (status, body) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, error("cannot open the mail store"));
+
+        std::fs::write(
+            fixture.root.join(crate::config::MAIL_INDEX_RELATIVE_PATH),
+            b"not a database at all, just text that is long enough to be read as a header",
+        )
+        .unwrap();
+        let router = mail_app(&fixture);
+        for uri in [
+            "/v1/mail/accounts",
+            "/v1/mail/messages",
+            "/v1/mail/messages/830",
+        ] {
+            let (status, body) = get(&router, uri).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Envelope Index query failed"),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_message_file_is_a_server_error_without_its_path() {
+        let fixture = MailFixture::standard();
+        let inbox = fixture.root.join(mail_fixture::MAIN).join("Inbox.mbox");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(&inbox, outside.path().join("Inbox.mbox")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("Inbox.mbox"), &inbox).unwrap();
+        let router = mail_app(&fixture);
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PLAIN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            error("cannot read the message file: outside the mail root")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_file_without_a_length_line_is_a_server_error() {
+        let fixture = MailFixture::standard();
+        let path = fixture
+            .root
+            .join(mail_fixture::MAIN)
+            .join("Inbox.mbox")
+            .join(mail_fixture::STORE)
+            .join(crate::mail::emlx::partition(
+                crate::mail::MessageId::new(mail_fixture::PLAIN).unwrap(),
+            ))
+            .join(format!("{}.emlx", mail_fixture::PLAIN));
+        std::fs::write(&path, "abc\nSubject: x\r\n\r\ny").unwrap();
+        let router = mail_app(&fixture);
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PLAIN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, error("cannot read the message file: no length line"));
+    }
+
+    #[tokio::test]
+    async fn mail_without_configured_accounts_shows_nothing() {
+        let fixture = MailFixture::standard();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.accounts = Vec::new();
+        }
+        let router = app(&config, no_ekctl());
+        let (status, body) = get(&router, "/v1/mail/accounts").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"accounts": []}));
+        let (status, body) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(message_ids(&body), [0_i64; 0]);
+        let (status, _) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PLAIN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn healthz_with_mail() {
+        let fixture = MailFixture::standard();
+        let fake = Fake::printing("list_calendars.json");
+        let router = app(&mail_config(&fixture), fake.runner());
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["calendars"], 2);
+        assert_eq!(body["mail_accounts"], 2);
+        assert!(body["newest_message_age_s"].is_u64(), "{body}");
+
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("lists").is_none(), "{body}");
+
+        let fixture = MailFixture::empty();
+        for (id, url) in [
+            (1, format!("ews://{}/Inbox", mail_fixture::MAIN)),
+            (2, format!("imap://{}/INBOX", mail_fixture::GMAIL)),
+        ] {
+            fixture.mailbox(&mail_fixture::MailboxRow {
+                id,
+                url,
+                total: 0,
+                unread: 0,
+            });
+        }
+        let router = app(&mail_config(&fixture), fake.runner());
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mail_accounts"], 2);
+        assert_eq!(body["newest_message_age_s"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn healthz_without_mail_has_no_mail_fields() {
+        let fake = Fake::printing("list_calendars.json");
+        let router = app(&configured(), fake.runner());
+        let (status, body) = get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("mail_accounts").is_none(), "{body}");
+        assert!(body.get("newest_message_age_s").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_mail_degraded() {
+        let fake = Fake::printing("list_calendars.json");
+        let check = async |config: &Config| {
+            let router = app(config, fake.runner());
+            get(&router, "/healthz").await
+        };
+
+        let fixture = MailFixture::standard();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.root = Some(fixture.root.join("missing"));
+        }
+        let missing_root = check(&config).await;
+
+        let unreadable = MailFixture::standard();
+        std::fs::write(
+            unreadable
+                .root
+                .join(crate::config::MAIL_INDEX_RELATIVE_PATH),
+            b"not a database at all, just text that is long enough to be read as a header",
+        )
+        .unwrap();
+        let unreadable_index = check(&mail_config(&unreadable)).await;
+
+        let changed = MailFixture::standard();
+        changed
+            .writer()
+            .execute_batch("ALTER TABLE recipients DROP COLUMN position")
+            .unwrap();
+        let schema_changed = check(&mail_config(&changed)).await;
+
+        let fixture = MailFixture::standard();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.accounts.push(crate::config::MailAccount {
+                id: crate::config::AccountId::parse(OTHER_ID).unwrap(),
+                name: crate::config::AccountName::parse("gone").unwrap(),
+            });
+        }
+        let account_missing = check(&config).await;
+
+        for ((status, body), reason) in [
+            (missing_root, "mail no access"),
+            (unreadable_index, "mail no access"),
+            (schema_changed, "mail schema changed"),
+            (account_missing, "mail account missing"),
+        ] {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reason}");
+            assert_eq!(body, json!({"status": "degraded", "reason": reason}));
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_request_log_carries_rows_but_no_content() {
+        let (captured, _guard) = capture();
+        let fixture = MailFixture::standard();
+        let router = mail_app(&fixture);
+        let (status, _) = get(&router, "/v1/mail/accounts").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(
+            &router,
+            "/v1/mail/messages?q=quarterly%20report&mailbox=Inbox&account=main",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, "/v1/mail/messages?mailbox=Secret%20folder").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for id in [
+            mail_fixture::PLAIN,
+            mail_fixture::HTML,
+            mail_fixture::MULTIPART,
+            mail_fixture::PARTIAL,
+            mail_fixture::MISSING,
+            mail_fixture::IN_SPAM,
+        ] {
+            get(&router, &format!("/v1/mail/messages/{id}")).await;
+        }
+        let inbox = fixture.root.join(mail_fixture::MAIN).join("Inbox.mbox");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(&inbox, outside.path().join("Inbox.mbox")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("Inbox.mbox"), &inbox).unwrap();
+        let (status, _) = get(&router, "/v1/mail/messages?account=main").await;
+        assert_eq!(status, StatusCode::OK);
+        let log = captured.text();
+        assert!(log.contains("message file refused"), "{log}");
+        for secret in [
+            "Alice",
+            "alice@example.com",
+            "Bob",
+            "bob@example.com",
+            "Carol",
+            "carol@example.com",
+            "Quarterly",
+            "quarterly",
+            "Numbers attached",
+            "Plain version",
+            "Newsletter",
+            "news@shop.example",
+            "Weekly deals",
+            "Big sale",
+            "Иван",
+            "ivan@example.ru",
+            "me@gmail.example",
+            mail_fixture::CYRILLIC_SUBJECT,
+            mail_fixture::CYRILLIC_BODY,
+            "report.pdf",
+            "Long thread",
+            "half downloaded",
+            "Subject",
+            "sender@example.com",
+            "Secret",
+        ] {
+            assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
+        assert!(
+            log.contains("method=GET route=/v1/mail/accounts status=200"),
+            "{log}"
+        );
+        assert!(log.contains("rows=2"), "{log}");
+        assert!(log.contains("rows=6"), "{log}");
+        assert!(
+            log.contains("method=GET route=/v1/mail/messages status=400"),
+            "{log}"
+        );
+        assert!(
+            log.contains("method=GET route=/v1/mail/messages/{id} status=200"),
+            "{log}"
+        );
+        assert!(
+            log.contains("method=GET route=/v1/mail/messages/{id} status=404"),
+            "{log}"
+        );
+        for line in log.lines() {
+            if !line.contains("route=/v1/mail/") {
+                continue;
+            }
+            if line.contains("route=/v1/mail/messages/{id} status=200") {
+                assert!(line.ends_with(" rows=1"), "{line}");
+            }
+            if line.contains("status=400") || line.contains("status=404") {
+                assert!(!line.contains("rows="), "{line}");
+            }
+        }
+        assert!(!log.contains("ekctl="), "{log}");
+    }
+
+    #[tokio::test]
+    async fn startup_listing_logs_mail_accounts_without_content() {
+        let (captured, _guard) = capture();
+        let fixture = MailFixture::standard();
+        fixture.register_accounts(&[
+            (mail_fixture::MAIN, "com.apple.account.Exchange", "Work"),
+            (
+                mail_fixture::GMAIL,
+                "com.apple.account.IMAP",
+                "me@gmail.example",
+            ),
+        ]);
+        let app = App::new(&mail_config(&fixture), runners(no_ekctl()));
+        app.announce_mail(Duration::from_millis(10)).await;
+        let log = captured.text();
+        assert!(
+            log.contains(&format!(
+                "id={} kind=exchange account_type=\"com.apple.account.Exchange\" description=\"Work\" mailboxes=2 messages=5 newest=\"{}\" configured=\"main\"",
+                mail_fixture::MAIN,
+                mail_date(mail_fixture::T + 400)
+            )),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "id={} kind=imap account_type=\"com.apple.account.IMAP\" description=\"me@gmail.example\" mailboxes=3 messages=3",
+                mail_fixture::GMAIL
+            )),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "mail account id={} kind=imap mailboxes=1 messages=1 newest=\"{}\"\n",
+                mail_fixture::OTHER,
+                mail_date(mail_fixture::T + 600)
+            )),
+            "{log}"
+        );
+        for secret in [
+            "Alice",
+            "alice@example.com",
+            "Quarterly",
+            "Weekly deals",
+            mail_fixture::CYRILLIC_SUBJECT,
+            "ivan@example.ru",
+            "sender@example.com",
+            "Inbox",
+            "Spam",
+        ] {
+            assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_listing_retries_while_the_mail_store_is_unreadable() {
+        let (captured, _guard) = capture();
+        let fixture = MailFixture::standard();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.root = Some(fixture.root.join("missing"));
+        }
+        let app = App::new(&config, runners(no_ekctl()));
+        let finished = time::timeout(
+            Duration::from_millis(200),
+            app.announce_mail(Duration::from_millis(10)),
+        )
+        .await;
+        assert!(finished.is_err());
+        let log = captured.text();
+        assert!(
+            log.matches("cannot read the mail store yet, retrying")
+                .count()
+                >= 2,
+            "{log}"
+        );
+
+        let app = App::new(&configured(), runners(no_ekctl()));
+        app.announce_mail(Duration::from_millis(10)).await;
+        assert!(!captured.text().contains("mail account"));
     }
 }
