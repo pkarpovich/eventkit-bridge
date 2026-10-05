@@ -144,7 +144,7 @@ shop = { address = "1 Example Street, Exampletown", radius = 150 }
 home = { address = "2 Example Road, Exampletown" }
 
 [mail]
-exclude_mailboxes = ["Trash", "Deleted Items", "Junk", "Junk Email", "Spam", "[Gmail]/Trash", "[Gmail]/Spam"]
+exclude_mailboxes = ["Trash", "Deleted Items", "Deleted Messages", "Junk", "Junk Email", "Spam", "[Gmail]/Trash", "[Gmail]/Spam"]
 # root = "/path/to/Mail/V10"
 
 [mail.accounts]
@@ -186,7 +186,7 @@ A location trigger names a place from the config rather than taking an address f
 | `eventkit-bridge --check-config` | Validates the config and exits `0` or `1`. |
 | `eventkit-bridge --version` | Prints the version. |
 
-`install` points the LaunchAgent at the real binary inside `EventKitBridge.app`, not at the Homebrew symlink, because the Calendars and Reminders permissions belong to the app bundle. It warns when the binary is not inside an `.app` bundle, since the permission would then not survive an upgrade.
+`install` points the LaunchAgent at the real binary inside `EventKitBridge.app`, not at the Homebrew symlink, because the Calendars, Reminders and Full Disk Access permissions belong to the app bundle. It warns when the binary is not inside an `.app` bundle, since the permissions would then not survive an upgrade.
 
 To remove the bridge completely, run `eventkit-bridge uninstall`, then `brew uninstall --cask --zap eventkit-bridge`, which also deletes the config, the LaunchAgent plist and the log.
 
@@ -694,7 +694,7 @@ The log is not rotated. To truncate it:
 - **`/healthz` says `mail account missing`.** An account in `[mail.accounts]` was removed from Mail or re-added under a new uuid. Look up the current uuids in the startup listing in the log and update the config.
 - **`/healthz` says `mail schema changed`.** A macOS update changed the Envelope Index. Mail reads stay unreliable until the bridge is updated for the new format; remove `[mail]` to keep the rest of the bridge healthy meanwhile.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
-- **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars and Reminders permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.
+- **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars, Reminders and Full Disk Access permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.
 
 ## Releasing
 
@@ -726,7 +726,7 @@ For a local signed build, run `scripts/build-signed.sh <team-id>`. It builds the
 
 ## Development
 
-The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl` or `launchctl` for real.
+The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl` or `launchctl` for real, and no test reads a real `~/Library/Mail`: mail tests build a fixture store from `fixtures/mail_schema.sql`.
 
 ```sh
 mise run check
@@ -734,7 +734,7 @@ mise run check
 
 runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. CI also runs `shellcheck scripts/*.sh`.
 
-Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars or reminders: TCC would grant access to the terminal app, not to EventKitBridge. Test on the Mac with the bundled app started by the LaunchAgent.
+Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars, reminders or mail: TCC would grant access to the terminal app, not to EventKitBridge, and reading mail would need Full Disk Access for the terminal. Test on the Mac with the bundled app started by the LaunchAgent.
 
 ## Credits
 

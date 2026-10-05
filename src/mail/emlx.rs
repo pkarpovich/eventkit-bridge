@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use mail_parser::{MessageParser, MessagePart, MessagePartId, MimeHeaders, PartType};
 use serde::Serialize;
 
-use crate::config::{AccountId, is_full_uuid};
+use crate::config::{AccountId, is_decimal, is_full_uuid};
 use crate::mail::{MailboxPath, MessageId};
 
 /// The most body characters returned before the body is cut.
@@ -290,13 +290,8 @@ fn message_bytes(bytes: &[u8]) -> Result<&[u8], EmlxError> {
         return Err(EmlxError::LengthLine);
     };
     let line = line.trim();
-    if line.is_empty() {
+    if !is_decimal(line) {
         return Err(EmlxError::LengthLine);
-    }
-    for c in line.chars() {
-        if !c.is_ascii_digit() {
-            return Err(EmlxError::LengthLine);
-        }
     }
     let Ok(length) = line.parse::<usize>() else {
         return Err(EmlxError::LengthLine);
@@ -385,6 +380,27 @@ mod tests {
         let found = find(&root, &mailbox, id(12_345)).unwrap().unwrap();
         assert_eq!(found.completeness, Completeness::Full);
         assert!(found.path.ends_with("Data/2/1/Messages/12345.emlx"));
+    }
+
+    #[test]
+    fn find_prefers_a_full_file_in_any_store_and_skips_directories() {
+        let fixture = fixture::Fixture::empty();
+        let root = MailRoot::new(&fixture.root).unwrap();
+        let mailbox = fixture.root.join(fixture::MAIN).join("Inbox.mbox");
+        let first = mailbox
+            .join("0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D")
+            .join(partition(id(6)));
+        let second = mailbox.join(fixture::STORE).join(partition(id(6)));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("6.partial.emlx"), "1\na").unwrap();
+        fs::write(second.join("6.emlx"), "1\na").unwrap();
+        let found = find(&root, &mailbox, id(6)).unwrap().unwrap();
+        assert_eq!(found.completeness, Completeness::Full);
+        assert!(found.path.starts_with(second.canonicalize().unwrap()));
+
+        fs::create_dir_all(first.join("7.emlx")).unwrap();
+        assert_eq!(find(&root, &mailbox, id(7)).unwrap(), None);
     }
 
     #[test]

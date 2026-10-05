@@ -270,7 +270,7 @@ fn describe_install(installed: &Installed) -> String {
     match housing {
         Housing::AppBundle => {}
         Housing::Loose => out.push_str(
-            "warning: the program is not inside an .app bundle; the Calendars permission will not survive an upgrade\n",
+            "warning: the program is not inside an .app bundle; the Calendars, Reminders and Full Disk Access permissions will not survive an upgrade\n",
         ),
     }
     out
@@ -531,7 +531,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("mail excluded mailbox: Trash\nmail excluded mailbox: Deleted Items\n"),
+            text.contains("mail excluded mailbox: Trash\nmail excluded mailbox: Deleted Items\nmail excluded mailbox: Deleted Messages\n"),
             "{text}"
         );
         assert!(

@@ -9,6 +9,8 @@ use std::fmt;
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
 
+use crate::config::is_decimal;
+
 /// A message's `ROWID` in the Envelope Index, which is also its `.emlx` file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -25,13 +27,8 @@ impl MessageId {
 
     /// Parses a positive decimal `ROWID` written without sign or leading zero.
     pub fn parse(value: &str) -> Option<Self> {
-        if value.is_empty() || value.starts_with('0') {
+        if value.starts_with('0') || !is_decimal(value) {
             return None;
-        }
-        for c in value.chars() {
-            if !c.is_ascii_digit() {
-                return None;
-            }
         }
         let Ok(value) = value.parse::<i64>() else {
             return None;

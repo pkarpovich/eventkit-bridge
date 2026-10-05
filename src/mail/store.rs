@@ -15,6 +15,7 @@ use serde::{Serialize, Serializer};
 
 use crate::config::{
     AccountId, AccountName, MAIL_INDEX_RELATIVE_PATH, MailAccount, MailConfig, MailRootError,
+    is_decimal,
 };
 use crate::mail::emlx::{self, Attachment, Completeness, EmlxError, EmlxFile, MailRoot};
 use crate::mail::{MailboxPath, MailboxPathError, MessageId};
@@ -45,8 +46,8 @@ WHERE m.deleted IS NOT 1
   AND (:until IS NULL OR m.date_received < :until)
   AND (:unread = 0 OR coalesce(m.read, 0) = 0)
   AND (:cursor_date IS NULL
-       OR m.date_received < :cursor_date
-       OR (m.date_received = :cursor_date AND m.ROWID < :cursor_id))
+       OR coalesce(m.date_received, 0) < :cursor_date
+       OR (coalesce(m.date_received, 0) = :cursor_date AND m.ROWID < :cursor_id))
   AND (:q IS NULL
        OR instr(ufold(s.subject), :q) > 0
        OR instr(ufold(a.comment), :q) > 0
@@ -54,7 +55,7 @@ WHERE m.deleted IS NOT 1
        OR instr(ufold(su.summary), :q) > 0
        OR EXISTS (SELECT 1 FROM recipients r JOIN addresses ra ON ra.ROWID = r.address
                   WHERE r.message = m.ROWID AND instr(ufold(ra.address), :q) > 0))
-ORDER BY m.date_received DESC, m.ROWID DESC
+ORDER BY coalesce(m.date_received, 0) DESC, m.ROWID DESC
 LIMIT :limit";
 
 const MESSAGE_SQL: &str = "
@@ -255,13 +256,8 @@ impl Cursor {
         let Some((date_received, id)) = text.split_once(':') else {
             return Err(CursorError);
         };
-        if date_received.is_empty() {
+        if !is_decimal(date_received.strip_prefix('-').unwrap_or(date_received)) {
             return Err(CursorError);
-        }
-        for c in date_received.chars() {
-            if !c.is_ascii_digit() {
-                return Err(CursorError);
-            }
         }
         let Ok(date_received) = date_received.parse::<i64>() else {
             return Err(CursorError);
@@ -319,6 +315,7 @@ pub struct MessageQuery {
     pub cursor: Option<Cursor>,
 }
 
+#[cfg(test)]
 impl Default for MessageQuery {
     fn default() -> Self {
         Self {
@@ -531,11 +528,6 @@ impl MailStore {
     /// A store reading under `config`; nothing is opened until [`MailStore::open`].
     pub fn new(config: MailConfig) -> Self {
         Self { config }
-    }
-
-    /// The `[mail]` config.
-    pub fn config(&self) -> &MailConfig {
-        &self.config
     }
 
     /// Locates the root and opens the Envelope Index read-only.
@@ -931,8 +923,12 @@ impl MailReader<'_> {
             let total: Option<i64> = row.get(2)?;
             let unread: Option<i64> = row.get(3)?;
             let Some(url) = url else { continue };
-            let Ok(url) = MailboxUrl::parse(&url) else {
-                continue;
+            let url = match MailboxUrl::parse(&url) {
+                Ok(url) => url,
+                Err(err) => {
+                    tracing::debug!(mailbox = id, error = %err, "mailbox URL skipped");
+                    continue;
+                }
             };
             records.push(MailboxRecord {
                 id,
@@ -1696,6 +1692,45 @@ mod tests {
     }
 
     #[test]
+    fn messages_page_through_rows_without_a_date() {
+        let fixture = Fixture::empty();
+        fixture.mailbox(&MailboxRow {
+            id: fixture::MAIN_INBOX,
+            url: format!("ews://{}/Inbox", fixture::MAIN),
+            total: 4,
+            unread: 0,
+        });
+        for id in 1..=4 {
+            fixture.insert(&Row::new(id, fixture::MAIN_INBOX, fixture::T + id));
+        }
+        fixture
+            .writer()
+            .execute(
+                "UPDATE messages SET date_received = NULL WHERE ROWID IN (2, 3)",
+                [],
+            )
+            .unwrap();
+
+        let store = MailStore::new(fixture.config());
+        let reader = store.open().unwrap();
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = reader
+                .messages(&MessageQuery {
+                    limit: 1,
+                    cursor,
+                    ..MessageQuery::default()
+                })
+                .unwrap();
+            seen.extend(ids(&page));
+            let Some(next) = page.next_cursor else { break };
+            cursor = Some(Cursor::decode(&next.encode()).unwrap());
+        }
+        assert_eq!(seen, [4, 1, 3, 2]);
+    }
+
+    #[test]
     fn messages_clamp_the_limit() {
         let fixture = Fixture::standard();
         let one = list(
@@ -1734,6 +1769,12 @@ mod tests {
             serde_json::to_value(cursor).unwrap(),
             serde_json::Value::String(encoded)
         );
+
+        let cursor = Cursor {
+            date_received: -1,
+            id: 7,
+        };
+        assert_eq!(Cursor::decode(&cursor.encode()), Ok(cursor));
     }
 
     #[test]
@@ -1744,7 +1785,9 @@ mod tests {
             "1791200000:",
             ":5",
             "x:5",
-            "-1:5",
+            "-:5",
+            "--1:5",
+            "+1:5",
             "1:0",
             "1:-5",
             "1:5:6",
@@ -1988,11 +2031,34 @@ mod tests {
         )
         .unwrap();
         let store = MailStore::new(fixture.config());
-        let result = match store.open() {
-            Ok(reader) => reader.accounts().map(|_| ()),
-            Err(err) => Err(err),
+        let reader = store.open().unwrap();
+        let result = reader.accounts();
+        let Err(StoreError::Query(_)) = result else {
+            panic!("{result:?}");
         };
-        assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_configured_account_shows_nothing() {
+        let fixture = Fixture::standard();
+        let mut config = fixture.config();
+        config.accounts = Vec::new();
+        let store = MailStore::new(config);
+        let reader = store.open().unwrap();
+        assert_eq!(reader.accounts().unwrap(), []);
+        let page = reader.messages(&MessageQuery::default()).unwrap();
+        assert_eq!(ids(&page), [0_i64; 0]);
+        assert_eq!(page.next_cursor, None);
+        for id in ALL_VISIBLE {
+            assert_eq!(reader.message(message_id(id)).unwrap(), None, "{id}");
+        }
+        assert_eq!(
+            store.status(Utc::now()),
+            Ok(MailStatus {
+                accounts: 0,
+                newest_message_age_s: None,
+            })
+        );
     }
     #[test]
     fn status_reports_accounts_and_the_newest_visible_message() {

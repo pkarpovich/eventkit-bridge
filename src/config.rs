@@ -20,9 +20,10 @@ const MAIL_RELATIVE_PATH: &str = "Library/Mail";
 pub const MAIL_INDEX_RELATIVE_PATH: &str = "MailData/Envelope Index";
 
 /// The mailboxes left out when `[mail]` has no `exclude_mailboxes`.
-pub const DEFAULT_EXCLUDED_MAILBOXES: [&str; 7] = [
+pub const DEFAULT_EXCLUDED_MAILBOXES: [&str; 8] = [
     "Trash",
     "Deleted Items",
+    "Deleted Messages",
     "Junk",
     "Junk Email",
     "Spam",
@@ -913,7 +914,7 @@ fn parse_mail(mail: RawMail) -> Result<MailConfig, ConfigError> {
     })
 }
 
-fn is_decimal(value: &str) -> bool {
+pub(crate) fn is_decimal(value: &str) -> bool {
     if value.is_empty() {
         return false;
     }

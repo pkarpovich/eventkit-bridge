@@ -378,7 +378,10 @@ fn mail_failure(err: StoreError) -> (StatusCode, String) {
         | StoreError::RootAccess { path: _, source: _ }
         | StoreError::Open(_) => {
             tracing::warn!(error = %err, "cannot open the mail store");
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cannot open the mail store".to_owned(),
+            )
         }
         StoreError::Query(_) => {
             tracing::warn!(error = %err, "mail store query failed");
@@ -2049,25 +2052,58 @@ esac"#,
         }
     }
 
+    struct Sinks(Vec<Captured>);
+
+    impl Write for Sinks {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            for sink in &mut self.0 {
+                sink.write_all(buf)?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     thread_local! {
         static SINK: RefCell<Option<Captured>> = const { RefCell::new(None) };
     }
 
+    static POOL_SINKS: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
+
     struct ThreadSink;
 
     impl<'a> MakeWriter<'a> for ThreadSink {
-        type Writer = Captured;
+        type Writer = Sinks;
 
         fn make_writer(&'a self) -> Self::Writer {
-            SINK.with_borrow(|sink| sink.clone().unwrap_or_default())
+            let sink = SINK.with_borrow(Clone::clone);
+            if let Some(sink) = sink {
+                return Sinks(vec![sink]);
+            }
+            let thread = std::thread::current();
+            let Some(name) = thread.name() else {
+                return Sinks(Vec::new());
+            };
+            if !name.starts_with("tokio-") {
+                return Sinks(Vec::new());
+            }
+            Sinks(POOL_SINKS.lock().unwrap().clone())
         }
     }
 
-    struct CaptureGuard;
+    struct CaptureGuard(Captured);
 
     impl Drop for CaptureGuard {
         fn drop(&mut self) {
             SINK.set(None);
+            let Self(Captured(captured)) = self;
+            POOL_SINKS
+                .lock()
+                .unwrap()
+                .retain(|Captured(sink)| !Arc::ptr_eq(sink, captured));
         }
     }
 
@@ -2084,7 +2120,8 @@ esac"#,
         tracing::callsite::rebuild_interest_cache();
         let captured = Captured::default();
         SINK.set(Some(captured.clone()));
-        (captured, CaptureGuard)
+        POOL_SINKS.lock().unwrap().push(captured.clone());
+        (captured.clone(), CaptureGuard(captured))
     }
 
     #[tokio::test]
@@ -3817,13 +3854,7 @@ esac"#,
         let router = app(&config, no_ekctl());
         let (status, body) = get(&router, "/v1/mail/messages").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("cannot open the mail root"),
-            "{body}"
-        );
+        assert_eq!(body, error("cannot open the mail store"));
 
         std::fs::write(
             fixture.root.join(crate::config::MAIL_INDEX_RELATIVE_PATH),
@@ -3866,6 +3897,51 @@ esac"#,
             body,
             error("cannot read the message file: outside the mail root")
         );
+    }
+
+    #[tokio::test]
+    async fn message_file_without_a_length_line_is_a_server_error() {
+        let fixture = MailFixture::standard();
+        let path = fixture
+            .root
+            .join(mail_fixture::MAIN)
+            .join("Inbox.mbox")
+            .join(mail_fixture::STORE)
+            .join(crate::mail::emlx::partition(
+                crate::mail::MessageId::new(mail_fixture::PLAIN).unwrap(),
+            ))
+            .join(format!("{}.emlx", mail_fixture::PLAIN));
+        std::fs::write(&path, "abc\nSubject: x\r\n\r\ny").unwrap();
+        let router = mail_app(&fixture);
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PLAIN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, error("cannot read the message file: no length line"));
+    }
+
+    #[tokio::test]
+    async fn mail_without_configured_accounts_shows_nothing() {
+        let fixture = MailFixture::standard();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.accounts = Vec::new();
+        }
+        let router = app(&config, no_ekctl());
+        let (status, body) = get(&router, "/v1/mail/accounts").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"accounts": []}));
+        let (status, body) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(message_ids(&body), [0_i64; 0]);
+        let (status, _) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::PLAIN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3992,7 +4068,14 @@ esac"#,
         ] {
             get(&router, &format!("/v1/mail/messages/{id}")).await;
         }
+        let inbox = fixture.root.join(mail_fixture::MAIN).join("Inbox.mbox");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(&inbox, outside.path().join("Inbox.mbox")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("Inbox.mbox"), &inbox).unwrap();
+        let (status, _) = get(&router, "/v1/mail/messages?account=main").await;
+        assert_eq!(status, StatusCode::OK);
         let log = captured.text();
+        assert!(log.contains("message file refused"), "{log}");
         for secret in [
             "Alice",
             "alice@example.com",
@@ -4036,11 +4119,21 @@ esac"#,
             log.contains("method=GET route=/v1/mail/messages/{id} status=200"),
             "{log}"
         );
-        assert!(log.contains("rows=1"), "{log}");
         assert!(
             log.contains("method=GET route=/v1/mail/messages/{id} status=404"),
             "{log}"
         );
+        for line in log.lines() {
+            if !line.contains("route=/v1/mail/") {
+                continue;
+            }
+            if line.contains("route=/v1/mail/messages/{id} status=200") {
+                assert!(line.ends_with(" rows=1"), "{line}");
+            }
+            if line.contains("status=400") || line.contains("status=404") {
+                assert!(!line.contains("rows="), "{line}");
+            }
+        }
         assert!(!log.contains("ekctl="), "{log}");
     }
 
