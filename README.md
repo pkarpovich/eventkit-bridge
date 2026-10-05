@@ -257,7 +257,7 @@ A write is `400` when:
 - any string contains a control character other than newline and tab;
 - the body is not valid JSON or has an unknown field.
 
-A body larger than 64 KiB is `413`.
+A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events with a cross-site form or `fetch` request.
 
 ### Status codes
 
@@ -268,6 +268,7 @@ A body larger than 64 KiB is `413`.
 | `404` | The event or the route does not exist. |
 | `405` | The route does not accept the method. |
 | `413` | The request body is larger than 64 KiB. |
+| `415` | A `POST` or `PATCH` without `Content-Type: application/json`. |
 | `502` | `ekctl` failed: it could not start, exited with an error, reported an error, wrote more than 8 MiB, or wrote output the bridge does not understand. |
 | `504` | `ekctl` did not finish within 20 seconds. |
 

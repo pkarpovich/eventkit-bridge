@@ -7,7 +7,8 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Path, RawQuery, Request, State};
-use axum::http::StatusCode;
+use axum::handler::Handler;
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -52,7 +53,8 @@ impl App {
     /// retrying every `retry` until it does.
     pub async fn announce_calendars(&self, retry: Duration) {
         loop {
-            match self.runner.session().await.list_calendars().await {
+            let calendars = self.runner.session().await.list_calendars().await;
+            match calendars {
                 Ok(calendars) => {
                     for calendar in calendars {
                         match calendar.kind {
@@ -162,7 +164,10 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/calendars", get(list_calendars))
-        .route("/v1/events", get(list_events).post(create_event))
+        .route(
+            "/v1/events",
+            get(list_events).post(create_event.layer(middleware::from_fn(require_json))),
+        )
         .route(
             "/v1/events/",
             get(empty_event_id)
@@ -171,7 +176,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/v1/events/{id}",
-            get(show_event).patch(update_event).delete(delete_event),
+            get(show_event)
+                .patch(update_event.layer(middleware::from_fn(require_json)))
+                .delete(delete_event),
         )
         .route("/v1/free", get(free))
         .fallback(not_found)
@@ -291,6 +298,26 @@ async fn free(State(app): Shared, RawQuery(query): RawQuery) -> Result<Response,
         .require_readable(mem::take(&mut query.calendars))?;
     let slots = app.runner.session().await.free(&query).await?;
     Ok(Json(slots).into_response())
+}
+
+async fn require_json(request: Request, next: Next) -> Response {
+    let unsupported = ApiError::Status(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "content type must be application/json".to_owned(),
+    );
+    let Some(content_type) = request.headers().get(header::CONTENT_TYPE) else {
+        return unsupported.into_response();
+    };
+    let Ok(content_type) = content_type.to_str() else {
+        return unsupported.into_response();
+    };
+    let Some(essence) = content_type.split(';').next() else {
+        return unsupported.into_response();
+    };
+    if !essence.trim().eq_ignore_ascii_case("application/json") {
+        return unsupported.into_response();
+    }
+    next.run(request).await
 }
 
 async fn create_event(
@@ -815,6 +842,49 @@ mod tests {
                 "show event -- NEW123:EVENT456".to_owned(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn writes_require_a_json_content_type() {
+        let fake = write_fake();
+        let router = app(&configured(), fake.runner());
+        let body = serde_json::to_vec(&create_body()).unwrap();
+        let cases = [
+            (Method::POST, "/v1/events", Some("text/plain")),
+            (Method::POST, "/v1/events", None),
+            (
+                Method::PATCH,
+                EVENT_PATH,
+                Some("application/x-www-form-urlencoded"),
+            ),
+            (Method::PATCH, EVENT_PATH, None),
+        ];
+        for (method, uri, content_type) in cases {
+            let mut request = Request::builder().method(method.clone()).uri(uri);
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let request = request.body(Body::from(body.clone())).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let message: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{method} {content_type:?}"
+            );
+            assert_eq!(message, error("content type must be application/json"));
+        }
+        assert!(fake.calls().is_empty());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/events")
+            .header("content-type", "Application/JSON; charset=utf-8")
+            .body(Body::from(body))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -1428,6 +1498,28 @@ esac"#,
             "{log}"
         );
         assert!(!log.contains("Reminders"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn startup_retry_does_not_hold_the_ekctl_lock() {
+        let fake = Fake::new(&format!(
+            "if [ -s \"$LOG\" ]; then cat '{}'; else echo failed >> \"$LOG\"; exit 1; fi",
+            fixture("list_calendars.json").display()
+        ));
+        let app = Arc::new(App::new(&configured(), fake.runner()));
+        let announcer = tokio::spawn({
+            let app = Arc::clone(&app);
+            async move { app.announce_calendars(Duration::from_secs(30)).await }
+        });
+        while fake.log().is_empty() {
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        let router = router(Arc::clone(&app));
+        let (status, _) = time::timeout(Duration::from_secs(5), get(&router, "/v1/calendars"))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        announcer.abort();
     }
 
     #[tokio::test]
