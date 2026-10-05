@@ -202,12 +202,24 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             ApiError::Policy(err) => {
                 tracing::warn!(reason = %err, "policy refusal");
-                (StatusCode::FORBIDDEN, err.to_string())
+                (policy_status(&err), err.to_string())
             }
             ApiError::Ekctl(err) => (ekctl_status(&err), err.to_string()),
             ApiError::Status(status, message) => (status, message),
         };
         (status, Json(json!({"error": message}))).into_response()
+    }
+}
+
+fn policy_status(err: &PolicyError) -> StatusCode {
+    match err {
+        PolicyError::RecurringEvent => StatusCode::CONFLICT,
+        PolicyError::CalendarNotReadable(_)
+        | PolicyError::NoReadableCalendars
+        | PolicyError::EventNotReadable
+        | PolicyError::NoWriteCalendar
+        | PolicyError::CalendarNotWritable(_)
+        | PolicyError::NotInWriteCalendar => StatusCode::FORBIDDEN,
     }
 }
 
@@ -403,10 +415,10 @@ async fn create_event(
     State(app): Shared,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let event = request::create_body(&body?)?;
-    let calendar = app.policy.write_calendar()?;
+    let request::CreateRequest { calendar, event } = request::create_body(&body?)?;
+    app.policy.require_writable(&calendar)?;
     let session = app.runner.session().await;
-    let id = session.add_event(calendar, &event).await?;
+    let id = session.add_event(&calendar, &event).await?;
     let created = session.show_event(&id).await?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
@@ -483,7 +495,7 @@ mod tests {
 
     fn configured() -> Config {
         Config::from_toml(&format!(
-            "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\nwrite_calendar = \"{WRITE_ID}\""
+            "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\nwrite_calendars = [\"{WRITE_ID}\"]"
         ))
         .unwrap()
     }
@@ -504,7 +516,12 @@ mod tests {
     }
 
     fn show_in(calendar: &str) -> String {
-        fixture_text("show_event.json").replace(READ_ID, calendar)
+        fixture_text("show_event.json")
+            .replace(READ_ID, calendar)
+            .replace(
+                r#""hasRecurrenceRules":true"#,
+                r#""hasRecurrenceRules":false"#,
+            )
     }
 
     fn write_fake() -> Fake {
@@ -558,6 +575,7 @@ mod tests {
 
     fn create_body() -> Value {
         json!({
+            "calendar": WRITE_ID,
             "title": "Lunch",
             "start": "2026-02-10T12:30:00Z",
             "end": "2026-02-10T13:30:00Z"
@@ -894,6 +912,7 @@ mod tests {
                 Method::POST,
                 "/v1/events",
                 &json!({
+                    "calendar": WRITE_ID,
                     "title": "-Lunch",
                     "start": "2026-02-10T12:30:00Z",
                     "end": "2026-02-10T14:30:00+01:00",
@@ -976,7 +995,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body, error("no write calendar configured"));
+        assert_eq!(body, error("no write calendars configured"));
         assert!(fake.calls().is_empty());
     }
 
@@ -1178,7 +1197,48 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body, error("event is not in the write calendar"));
+        assert_eq!(body, error("event is not in a writable calendar"));
+        assert_no_writes(&fake);
+    }
+
+    #[tokio::test]
+    async fn create_in_a_calendar_that_is_not_writable() {
+        let fake = write_fake();
+        let router = app(&configured(), fake.runner());
+        let mut body = create_body();
+        body["calendar"] = json!(READ_ID);
+        let (status, body) = send(&router, json_request(Method::POST, "/v1/events", &body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, error(&format!("calendar not writable: {READ_ID}")));
+        assert_no_writes(&fake);
+    }
+
+    #[tokio::test]
+    async fn recurring_events_are_not_changed() {
+        let recurring = fixture_text("show_event.json").replace(READ_ID, WRITE_ID);
+        let fake = Fake::scripted(&[
+            ("show event", &recurring),
+            ("update event", &fixture_text("add_event.json")),
+            ("delete event", &fixture_text("delete_event.json")),
+        ]);
+        let router = app(&configured(), fake.runner());
+        let refused = error(
+            "recurring events cannot be changed: ekctl would change the first occurrence of the series",
+        );
+        let (status, body) = send(
+            &router,
+            json_request(Method::PATCH, EVENT_PATH, &json!({"title": "Moved"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, refused);
+        let (status, body) = send(
+            &router,
+            build_request(Method::DELETE, EVENT_PATH, Body::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, refused);
         assert_no_writes(&fake);
     }
 
@@ -1192,7 +1252,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body, error("no write calendar configured"));
+        assert_eq!(body, error("no write calendars configured"));
         assert!(fake.calls().is_empty());
     }
 
@@ -1303,7 +1363,7 @@ esac"#,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body, error("event is not in the write calendar"));
+        assert_eq!(body, error("event is not in a writable calendar"));
         assert_no_writes(&fake);
         assert_eq!(fake.calls(), vec![format!("show event -- {EVENT_ID}")]);
     }
@@ -1477,7 +1537,7 @@ esac"#,
     async fn unknown_hosts_are_refused_before_ekctl() {
         let fake = write_fake();
         let config = Config::from_toml(&format!(
-            "listen = \"100.64.0.1:8790\"\nhosts = [\"mac.tail1234.ts.net\"]\nwrite_calendar = \"{WRITE_ID}\""
+            "listen = \"100.64.0.1:8790\"\nhosts = [\"mac.tail1234.ts.net\"]\nwrite_calendars = [\"{WRITE_ID}\"]"
         ))
         .unwrap();
         let router = app(&config, fake.runner());
@@ -1632,6 +1692,7 @@ esac"#,
                 Method::POST,
                 "/v1/events",
                 &json!({
+                    "calendar": WRITE_ID,
                     "title": "Secret title",
                     "start": "2026-02-10T12:30:00Z",
                     "end": "2026-02-10T13:30:00Z",
@@ -1705,7 +1766,7 @@ esac"#,
         .await;
         let log = captured.text();
         assert!(
-            log.contains(r#"reason=event is not in the write calendar"#),
+            log.contains(r#"reason=event is not in a writable calendar"#),
             "{log}"
         );
         assert!(log.contains(r#"ekctl="show event=0""#), "{log}");

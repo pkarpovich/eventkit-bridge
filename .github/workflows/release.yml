@@ -155,7 +155,7 @@ jobs:
                    eventkit-bridge install
               4. Approve the Calendars prompt for EventKitBridge.
               5. Find your calendar ids in ~/Library/Logs/eventkit-bridge.log, add
-                 read_calendars and write_calendar to the config, then run
+                 read_calendars and write_calendars to the config, then run
                    eventkit-bridge install
                  again.
 

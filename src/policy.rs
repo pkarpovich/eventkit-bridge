@@ -14,12 +14,20 @@ pub enum PolicyError {
     /// A requested event lives in a calendar outside the readable set.
     #[error("event is not in a readable calendar")]
     EventNotReadable,
-    /// A write was requested but the config names no write calendar.
-    #[error("no write calendar configured")]
+    /// A write was requested but the config names no write calendars.
+    #[error("no write calendars configured")]
     NoWriteCalendar,
-    /// A write targets an event outside the write calendar.
-    #[error("event is not in the write calendar")]
+    /// A new event names a calendar outside the writable set.
+    #[error("calendar not writable: {0}")]
+    CalendarNotWritable(CalendarId),
+    /// A write targets an event outside the writable calendars.
+    #[error("event is not in a writable calendar")]
     NotInWriteCalendar,
+    /// A write targets a recurring event; `ekctl` would change the series' first occurrence.
+    #[error(
+        "recurring events cannot be changed: ekctl would change the first occurrence of the series"
+    )]
+    RecurringEvent,
 }
 
 /// Why the write guard did not allow a write.
@@ -37,15 +45,15 @@ pub enum GuardError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     readable: Vec<CalendarId>,
-    write: Option<CalendarId>,
+    write: Vec<CalendarId>,
 }
 
 impl Policy {
-    /// The policy the config describes; the write calendar is always readable.
+    /// The policy the config describes; every write calendar is also readable.
     pub fn new(config: &Config) -> Self {
         Self {
             readable: config.readable_calendars(),
-            write: config.write_calendar.clone(),
+            write: config.write_calendars.clone(),
         }
     }
 
@@ -54,17 +62,20 @@ impl Policy {
         self.readable.contains(id)
     }
 
-    /// Whether writes may touch the calendar `id`: true for the write calendar alone.
+    /// Whether writes may touch the calendar `id`.
     pub fn writable(&self, id: &CalendarId) -> bool {
-        self.write.as_ref() == Some(id)
+        self.write.contains(id)
     }
 
-    /// The write calendar, or [`PolicyError::NoWriteCalendar`] when none is configured.
-    pub fn write_calendar(&self) -> Result<&CalendarId, PolicyError> {
-        let Some(write) = &self.write else {
+    /// Refuses a new event in `id` unless `id` is one of the write calendars.
+    pub fn require_writable(&self, id: &CalendarId) -> Result<(), PolicyError> {
+        if self.write.is_empty() {
             return Err(PolicyError::NoWriteCalendar);
-        };
-        Ok(write)
+        }
+        if !self.writable(id) {
+            return Err(PolicyError::CalendarNotWritable(id.clone()));
+        }
+        Ok(())
     }
 
     /// Every readable calendar, the set a read uses when the client names none.
@@ -72,7 +83,7 @@ impl Policy {
         self.readable.clone()
     }
 
-    /// Keeps the readable event calendars of `calendars`, marking the write calendar writable.
+    /// Keeps the readable event calendars of `calendars`, marking the write calendars writable.
     pub fn filter_calendars(&self, calendars: Vec<EkCalendar>) -> Vec<Calendar> {
         let mut filtered = Vec::new();
         for calendar in calendars {
@@ -124,20 +135,26 @@ impl Policy {
         Ok(())
     }
 
-    /// Shows the event `id` through `session` and returns it when it lives in the write
-    /// calendar. The caller makes the write through the same session, so nothing runs between
-    /// the check and the write.
+    /// Shows the event `id` through `session` and returns it when it lives in a write calendar
+    /// and is not recurring. The caller makes the write through the same session, so nothing
+    /// runs between the check and the write.
     pub async fn guard_write(
         &self,
         session: &Session<'_>,
         id: &EventId,
     ) -> Result<Event, GuardError> {
-        let write = self.write_calendar()?;
+        if self.write.is_empty() {
+            return Err(PolicyError::NoWriteCalendar.into());
+        }
         let event = session.show_event(id).await?;
-        if &event.calendar.id != write {
+        if !self.writable(&event.calendar.id) {
             return Err(PolicyError::NotInWriteCalendar.into());
         }
-        Ok(event)
+        match event.recurring {
+            Some(false) => Ok(event),
+            Some(true) => Err(PolicyError::RecurringEvent.into()),
+            None => Err(PolicyError::RecurringEvent.into()),
+        }
     }
 }
 
@@ -170,7 +187,7 @@ mod tests {
 
     fn read_and_write() -> Policy {
         policy(&format!(
-            "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\", \"{REMINDERS_ID}\"]\nwrite_calendar = \"{WRITE_ID}\""
+            "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\", \"{REMINDERS_ID}\"]\nwrite_calendars = [\"{WRITE_ID}\"]"
         ))
     }
 
@@ -188,7 +205,10 @@ mod tests {
 
     fn show_event_in(calendar: &str) -> String {
         let json = fs::read_to_string(fixture("show_event.json")).unwrap();
-        json.replace(READ_ID, calendar)
+        json.replace(READ_ID, calendar).replace(
+            r#""hasRecurrenceRules":true"#,
+            r#""hasRecurrenceRules":false"#,
+        )
     }
 
     #[test]
@@ -200,7 +220,11 @@ mod tests {
         assert!(policy.writable(&calendar_id(WRITE_ID)));
         assert!(!policy.writable(&calendar_id(READ_ID)));
         assert!(!policy.writable(&calendar_id(OTHER_ID)));
-        assert_eq!(policy.write_calendar(), Ok(&calendar_id(WRITE_ID)));
+        assert_eq!(policy.require_writable(&calendar_id(WRITE_ID)), Ok(()));
+        assert_eq!(
+            policy.require_writable(&calendar_id(READ_ID)),
+            Err(PolicyError::CalendarNotWritable(calendar_id(READ_ID)))
+        );
     }
 
     #[test]
@@ -208,10 +232,13 @@ mod tests {
         let policy = read_only();
         assert!(!policy.writable(&calendar_id(READ_ID)));
         assert!(!policy.readable(&calendar_id(WRITE_ID)));
-        assert_eq!(policy.write_calendar(), Err(PolicyError::NoWriteCalendar));
+        assert_eq!(
+            policy.require_writable(&calendar_id(READ_ID)),
+            Err(PolicyError::NoWriteCalendar)
+        );
         assert_eq!(
             PolicyError::NoWriteCalendar.to_string(),
-            "no write calendar configured"
+            "no write calendars configured"
         );
     }
 
@@ -225,6 +252,21 @@ mod tests {
                 {"id": WRITE_ID, "title": "Agent", "source": "iCloud", "color": "#34C759", "writable": true}
             ])
         );
+    }
+
+    #[test]
+    fn several_write_calendars_are_all_writable() {
+        let policy = policy(&format!(
+            "listen = \"127.0.0.1:8790\"\nwrite_calendars = [\"{READ_ID}\", \"{WRITE_ID}\"]"
+        ));
+        assert!(policy.writable(&calendar_id(READ_ID)));
+        assert!(policy.writable(&calendar_id(WRITE_ID)));
+        assert!(!policy.writable(&calendar_id(OTHER_ID)));
+        let calendars = policy.filter_calendars(listed_calendars());
+        assert_eq!(calendars.len(), 2);
+        for calendar in calendars {
+            assert!(calendar.writable, "{}", calendar.id);
+        }
     }
 
     #[test]
@@ -334,7 +376,7 @@ mod tests {
         let GuardError::Denied(PolicyError::NotInWriteCalendar) = err else {
             panic!("unexpected error: {err:?}");
         };
-        assert_eq!(err.to_string(), "event is not in the write calendar");
+        assert_eq!(err.to_string(), "event is not in a writable calendar");
     }
 
     #[tokio::test]

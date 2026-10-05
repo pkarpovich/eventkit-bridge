@@ -76,8 +76,8 @@ pub struct Config {
     pub hosts: Vec<HostName>,
     /// The calendars reads may touch, as listed in the config file.
     pub read_calendars: Vec<CalendarId>,
-    /// The only calendar writes may touch; `None` refuses every write.
-    pub write_calendar: Option<CalendarId>,
+    /// The calendars writes may touch; empty refuses every write.
+    pub write_calendars: Vec<CalendarId>,
     /// An explicit `ekctl` path; `None` means `ekctl` next to the running executable.
     pub ekctl: Option<PathBuf>,
 }
@@ -103,7 +103,7 @@ pub enum ConfigError {
     /// `listen` names an address that would bind every interface.
     #[error("`listen` must not be an unspecified address, got {0}")]
     ListenUnspecified(SocketAddr),
-    /// A calendar id in `read_calendars` or `write_calendar` is unusable.
+    /// A calendar id in `read_calendars` or `write_calendars` is unusable.
     #[error("`{key}` contains an invalid calendar id {value:?}: {reason}")]
     InvalidCalendarId {
         /// The config key holding the id.
@@ -134,7 +134,8 @@ struct RawConfig {
     hosts: Vec<String>,
     #[serde(default)]
     read_calendars: Vec<String>,
-    write_calendar: Option<String>,
+    #[serde(default)]
+    write_calendars: Vec<String>,
     ekctl: Option<PathBuf>,
 }
 
@@ -156,7 +157,7 @@ impl Config {
             listen,
             hosts,
             read_calendars,
-            write_calendar,
+            write_calendars,
             ekctl,
         } = toml::from_str(text).map_err(ConfigError::Parse)?;
 
@@ -184,10 +185,10 @@ impl Config {
             read.push(parse_calendar_id("read_calendars", id)?);
         }
 
-        let write = match write_calendar {
-            Some(id) => Some(parse_calendar_id("write_calendar", id)?),
-            None => None,
-        };
+        let mut write = Vec::new();
+        for id in write_calendars {
+            write.push(parse_calendar_id("write_calendars", id)?);
+        }
 
         if let Some(path) = &ekctl
             && path.as_os_str().is_empty()
@@ -199,18 +200,18 @@ impl Config {
             listen,
             hosts: names,
             read_calendars: read,
-            write_calendar: write,
+            write_calendars: write,
             ekctl,
         })
     }
 
-    /// Every calendar reads may touch: `read_calendars` plus the write calendar, without duplicates.
+    /// Every calendar reads may touch: `read_calendars` plus `write_calendars`, without duplicates.
     pub fn readable_calendars(&self) -> Vec<CalendarId> {
         let mut readable = Vec::new();
         for id in self
             .read_calendars
             .iter()
-            .chain(self.write_calendar.as_ref())
+            .chain(self.write_calendars.iter())
         {
             if !readable.contains(id) {
                 readable.push(id.clone());
@@ -285,7 +286,7 @@ mod tests {
             listen = "100.108.208.81:8790"
             hosts = ["Mac.tail1234.ts.net"]
             read_calendars = ["{READ_ID}"]
-            write_calendar = "{WRITE_ID}"
+            write_calendars = ["{WRITE_ID}"]
             ekctl = "/opt/ekctl"
             "#
         ))
@@ -297,7 +298,7 @@ mod tests {
                 listen: "100.108.208.81:8790".parse().unwrap(),
                 hosts: vec![HostName("mac.tail1234.ts.net".to_owned())],
                 read_calendars: vec![id(READ_ID)],
-                write_calendar: Some(id(WRITE_ID)),
+                write_calendars: vec![id(WRITE_ID)],
                 ekctl: Some(PathBuf::from("/opt/ekctl")),
             }
         );
@@ -314,7 +315,7 @@ mod tests {
         let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
         assert!(config.hosts.is_empty());
         assert!(config.read_calendars.is_empty());
-        assert_eq!(config.write_calendar, None);
+        assert!(config.write_calendars.is_empty());
         assert_eq!(config.ekctl, None);
         assert!(config.readable_calendars().is_empty());
     }
@@ -410,14 +411,14 @@ mod tests {
         let err = Config::from_toml(
             r#"
             listen = "127.0.0.1:8790"
-            write_calendars = ["x"]
+            write_calendar = "x"
             "#,
         )
         .unwrap_err();
         let ConfigError::Parse(_) = &err else {
             panic!("unexpected error: {err:?}");
         };
-        assert!(err.to_string().contains("write_calendars"), "{err}");
+        assert!(err.to_string().contains("write_calendar"), "{err}");
     }
 
     #[test]
@@ -440,16 +441,16 @@ mod tests {
         let err = Config::from_toml(&format!(
             r#"
             listen = "127.0.0.1:8790"
-            write_calendar = "{READ_ID},{WRITE_ID}"
+            write_calendars = ["{READ_ID},{WRITE_ID}"]
             "#
         ))
         .unwrap_err();
         let ConfigError::InvalidCalendarId { key, reason, .. } = &err else {
             panic!("unexpected error: {err:?}");
         };
-        assert_eq!(*key, "write_calendar");
+        assert_eq!(*key, "write_calendars");
         assert_eq!(*reason, "contains a comma");
-        assert!(err.to_string().contains("`write_calendar`"));
+        assert!(err.to_string().contains("`write_calendars`"));
     }
 
     #[test]
@@ -511,7 +512,7 @@ mod tests {
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = ["{READ_ID}"]
-            write_calendar = "{WRITE_ID}"
+            write_calendars = ["{WRITE_ID}"]
             "#
         ))
         .unwrap();
@@ -523,7 +524,7 @@ mod tests {
         let config = Config::from_toml(&format!(
             r#"
             listen = "127.0.0.1:8790"
-            write_calendar = "{WRITE_ID}"
+            write_calendars = ["{WRITE_ID}"]
             "#
         ))
         .unwrap();
@@ -537,7 +538,7 @@ mod tests {
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = ["{WRITE_ID}", "{READ_ID}", "{READ_ID}"]
-            write_calendar = "{WRITE_ID}"
+            write_calendars = ["{WRITE_ID}"]
             "#
         ))
         .unwrap();
@@ -545,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_write_calendar() {
+    fn absent_write_calendars() {
         let config = Config::from_toml(&format!(
             r#"
             listen = "127.0.0.1:8790"
@@ -553,7 +554,7 @@ mod tests {
             "#
         ))
         .unwrap();
-        assert_eq!(config.write_calendar, None);
+        assert!(config.write_calendars.is_empty());
         assert_eq!(config.readable_calendars(), vec![id(READ_ID)]);
     }
 

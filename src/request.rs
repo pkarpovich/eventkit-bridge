@@ -27,6 +27,8 @@ impl Invalid {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateBody {
+    /// The calendar to create the event in; must be a write calendar.
+    pub calendar: String,
     /// The title.
     pub title: String,
     /// The start, RFC 3339.
@@ -435,9 +437,10 @@ fn parse_optional_timestamp(
 }
 
 /// Parses and validates a `POST /v1/events` body.
-pub fn create_body(body: &[u8]) -> Result<NewEvent, Invalid> {
+pub fn create_body(body: &[u8]) -> Result<CreateRequest, Invalid> {
     let body: CreateBody = parse_json(body)?;
     let CreateBody {
+        calendar,
         title,
         start,
         end,
@@ -449,14 +452,29 @@ pub fn create_body(body: &[u8]) -> Result<NewEvent, Invalid> {
     let start = parse_timestamp("start", &start)?;
     let end = parse_timestamp("end", &end)?;
     check_range(START_END, start, end)?;
-    Ok(NewEvent {
-        title,
-        start,
-        end,
-        location: parse_optional_text("location", location, MAX_LOCATION)?,
-        notes: parse_optional_text("notes", notes, MAX_NOTES)?,
-        url: parse_url(url)?,
+    let Ok(calendar) = CalendarId::parse(calendar) else {
+        return Err(Invalid::new("`calendar` must be a calendar id".to_owned()));
+    };
+    Ok(CreateRequest {
+        calendar,
+        event: NewEvent {
+            title,
+            start,
+            end,
+            location: parse_optional_text("location", location, MAX_LOCATION)?,
+            notes: parse_optional_text("notes", notes, MAX_NOTES)?,
+            url: parse_url(url)?,
+        },
     })
+}
+
+/// A validated `POST /v1/events` body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRequest {
+    /// The calendar to create the event in.
+    pub calendar: CalendarId,
+    /// The event to create.
+    pub event: NewEvent,
 }
 
 /// Parses and validates a `PATCH /v1/events/{id}` body, which must change at least one field.
@@ -536,6 +554,7 @@ mod tests {
 
     fn valid_create() -> serde_json::Value {
         json!({
+            "calendar": "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
             "title": "Lunch",
             "start": "2026-10-05T12:00:00+02:00",
             "end": "2026-10-05T13:00:00+02:00"
@@ -820,19 +839,24 @@ mod tests {
 
     #[test]
     fn create_minimal_and_full() {
-        let event = create_body(&body(valid_create())).unwrap();
+        let request = create_body(&body(valid_create())).unwrap();
         assert_eq!(
-            event,
-            NewEvent {
-                title: "Lunch".to_owned(),
-                start: at("2026-10-05T12:00:00+02:00"),
-                end: at("2026-10-05T13:00:00+02:00"),
-                location: None,
-                notes: None,
-                url: None,
+            request,
+            CreateRequest {
+                calendar: CalendarId::parse("8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10".to_owned())
+                    .unwrap(),
+                event: NewEvent {
+                    title: "Lunch".to_owned(),
+                    start: at("2026-10-05T12:00:00+02:00"),
+                    end: at("2026-10-05T13:00:00+02:00"),
+                    location: None,
+                    notes: None,
+                    url: None,
+                },
             }
         );
-        let event = create_body(&body(json!({
+        let CreateRequest { calendar: _, event } = create_body(&body(json!({
+            "calendar": "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10",
             "title": "-Lunch",
             "start": "2026-10-05T12:00:00+02:00",
             "end": "2026-10-05T13:00:00+02:00",
@@ -844,6 +868,17 @@ mod tests {
         assert_eq!(event.location.as_deref(), Some("Cafe"));
         assert_eq!(event.notes.as_deref(), Some("line\n\tindented"));
         assert_eq!(event.url.unwrap().as_str(), "https://example.com/menu");
+    }
+
+    #[test]
+    fn create_calendar_rules() {
+        assert_eq!(
+            message(create_body(&with(valid_create(), "calendar", json!(" ")))),
+            "`calendar` must be a calendar id"
+        );
+        let mut missing = valid_create();
+        missing.as_object_mut().unwrap().remove("calendar");
+        assert!(create_body(&body(missing)).is_err());
     }
 
     #[test]
@@ -960,7 +995,7 @@ mod tests {
         assert!(message(create_body(b"not json")).starts_with("invalid JSON body: "));
         assert!(
             message(create_body(&body(
-                json!({"title": "x", "start": "2026-10-05T12:00:00Z"})
+                json!({"calendar": "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10", "title": "x", "start": "2026-10-05T12:00:00Z"})
             )))
             .contains("missing field `end`")
         );

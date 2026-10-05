@@ -15,7 +15,8 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **The network is the access control.** The bridge has no authentication. It binds only to the literal IP address in its config and refuses to listen on every interface (`0.0.0.0`, `::` or `::ffff:0.0.0.0`). Bind it to your tailscale IP, and only devices on your tailnet can reach it.
 - **Requests must name the bridge.** The `Host` header must be the listen IP or a name listed in `hosts`; anything else is refused with `421`. This stops a web page open in a browser on the tailnet from reaching the bridge through DNS rebinding.
 - **Reads touch only the calendars you list.** A request for any other calendar is refused with `403`, and events from other calendars are never returned.
-- **Writes touch only the one write calendar.** New events are always created in it. Before every update or delete, the bridge looks up the event and refuses the change unless the event is in the write calendar. A bug in a client cannot change an event you created yourself in another calendar.
+- **Writes touch only the write calendars.** A new event must name one of them. Before every update or delete, the bridge looks up the event and refuses the change unless the event is in a write calendar. A bug in a client cannot change an event in any other calendar.
+- **Recurring events are not changed.** `ekctl` looks an event up by id, and for a recurring event that is the first occurrence of the series, so an update or delete would silently hit the wrong occurrence. The bridge refuses both with `409` until `ekctl` can address a single occurrence.
 - **The bridge builds every `ekctl` command itself.** There is no generic passthrough, so a client cannot inject options into `ekctl`.
 - **Event contents are never logged.** Request logs carry the method, route, status and timing, but never titles, notes, locations, URLs or attendees.
 
@@ -62,7 +63,7 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 
    Until the permission is granted, the log shows `cannot list calendars yet, retrying` instead. The daemon retries every 30 seconds, so the listing appears within half a minute of approving the prompt.
 
-   Add `read_calendars` and `write_calendar` to the config, then run
+   Add `read_calendars` and `write_calendars` to the config, then run
 
    ```sh
    eventkit-bridge install
@@ -78,7 +79,7 @@ Upgrades need no action: the daemon restarts on the new version by itself.
 listen = "100.64.0.1:8790"
 # hosts = ["mac.tail1234.ts.net"]
 read_calendars = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
-write_calendar = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"
+write_calendars = ["8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"]
 # ekctl = "/path/to/ekctl"
 ```
 
@@ -87,7 +88,7 @@ write_calendar = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10"
 | `listen` | yes | A literal `IP:port`. Hostnames and unspecified addresses (`0.0.0.0`, `::`, `::ffff:0.0.0.0`) are rejected. |
 | `hosts` | no | Extra names clients may use in the `Host` header, such as the Mac's MagicDNS name. The listen IP is always accepted. Names are compared case-insensitively; the port is not checked. |
 | `read_calendars` | no | The calendar ids reads may touch. Empty by default, which leaves the bridge unconfigured. |
-| `write_calendar` | no | The only calendar writes may touch. It is always readable as well. Without it, every write is refused with `403`. |
+| `write_calendars` | no | The calendar ids writes may touch. They are always readable as well. Empty by default, which refuses every write with `403`. |
 | `ekctl` | no | The `ekctl` binary to run. Defaults to the `ekctl` next to the `eventkit-bridge` binary, which is the one inside the app bundle. Only useful for development. |
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
@@ -156,7 +157,7 @@ A free slot:
 
 ### `GET /v1/calendars`
 
-Lists the readable event calendars. `writable` is true for the write calendar alone. Reminder lists and calendars outside the config are left out.
+Lists the readable event calendars. `writable` is true for the write calendars. Reminder lists and calendars outside the config are left out.
 
 ```sh
 curl http://100.64.0.1:8790/v1/calendars
@@ -219,15 +220,15 @@ curl 'http://100.64.0.1:8790/v1/free?duration=60&weekdays=mon-wed,fri&buffer=15'
 
 ### `POST /v1/events`
 
-Creates an event in the write calendar and answers `201` with the complete event.
+Creates an event in the write calendar named by `calendar` and answers `201` with the complete event.
 
 ```sh
 curl -X POST http://100.64.0.1:8790/v1/events \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Lunch","start":"2026-10-06T12:30:00+02:00","end":"2026-10-06T13:30:00+02:00","location":"Cafe","notes":"Booked","url":"https://example.com/booking"}'
+  -d '{"calendar":"8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10","title":"Lunch","start":"2026-10-06T12:30:00+02:00","end":"2026-10-06T13:30:00+02:00","location":"Cafe","notes":"Booked","url":"https://example.com/booking"}'
 ```
 
-`title`, `start` and `end` are required; `location`, `notes` and `url` are optional. Only timed events can be created: no all-day events, recurrence, attendees or alarms. Without a `write_calendar` in the config, the answer is `403 no write calendar configured`.
+`calendar`, `title`, `start` and `end` are required; `location`, `notes` and `url` are optional. Only timed events can be created: no all-day events, recurrence, attendees or alarms. A `calendar` outside `write_calendars` is `403 calendar not writable: <id>`, and with no `write_calendars` at all the answer is `403 no write calendars configured`.
 
 ### `PATCH /v1/events/{id}`
 
@@ -239,11 +240,11 @@ curl -X PATCH 'http://100.64.0.1:8790/v1/events/NEW123%3AEVENT456' \
   -d '{"start":"2026-10-06T13:00:00+02:00"}'
 ```
 
-The bridge first looks the event up. It answers `403 event is not in the write calendar` unless the event is in the write calendar, and `404` when it does not exist. The new or existing start must still be before the new or existing end. A body that changes nothing is `400`.
+The bridge first looks the event up. It answers `403 event is not in a writable calendar` unless the event is in a write calendar, `409` when the event is recurring, and `404` when it does not exist. The new or existing start must still be before the new or existing end. A body that changes nothing is `400`.
 
 ### `DELETE /v1/events/{id}`
 
-Deletes an event in the write calendar and answers `204` with no body. The same lookup and `403`/`404` rules as `PATCH` apply.
+Deletes an event in a write calendar and answers `204` with no body. The same lookup and `403`/`404`/`409` rules as `PATCH` apply.
 
 ```sh
 curl -X DELETE 'http://100.64.0.1:8790/v1/events/NEW123%3AEVENT456'
@@ -269,6 +270,7 @@ A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: 
 | `400` | The request is invalid; the message names the parameter or field. |
 | `403` | The security policy refused the request. |
 | `404` | The event or the route does not exist. |
+| `409` | `PATCH` or `DELETE` on a recurring event. |
 | `405` | The route does not accept the method. |
 | `413` | The request body is larger than 64 KiB. |
 | `415` | A `POST` or `PATCH` without `Content-Type: application/json`. |
