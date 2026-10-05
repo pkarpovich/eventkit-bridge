@@ -1,14 +1,12 @@
 #![forbid(unsafe_code)]
 
-mod config;
-
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use argh::FromArgs;
 
-use crate::config::Config;
+use eventkit_bridge::config::Config;
 
 /// Exposes the Mac's calendars over HTTP through ekctl.
 #[derive(FromArgs, Debug, PartialEq, Eq)]

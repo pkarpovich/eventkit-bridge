@@ -1,0 +1,1 @@
+{"status":"success","message":"Event created successfully","event":{"id":"NEW123:EVENT456","title":"Lunch","calendar":{"id":"8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10","title":"Agent"},"startDate":"2026-02-10T12:30:00Z","endDate":"2026-02-10T13:30:00Z","location":null,"notes":null,"allDay":false}}

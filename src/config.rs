@@ -6,16 +6,31 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONFIG_RELATIVE_PATH: &str = ".config/eventkit-bridge/config.toml";
 const EKCTL_FILE_NAME: &str = "ekctl";
 
 /// An EventKit calendar identifier as `ekctl` reports it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
 pub struct CalendarId(String);
 
 impl CalendarId {
+    /// Accepts an id that can be passed to `ekctl`: not blank, no comma, no control character.
+    pub fn parse(value: String) -> Result<Self, &'static str> {
+        if value.trim().is_empty() {
+            return Err("empty");
+        }
+        if value.contains(',') {
+            return Err("contains a comma");
+        }
+        if has_control_character(&value) {
+            return Err("contains a control character");
+        }
+        Ok(Self(value))
+    }
+
     /// Returns the identifier as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -185,22 +200,13 @@ fn parse_listen(value: &str) -> Result<SocketAddr, ConfigError> {
 }
 
 fn parse_calendar_id(key: &'static str, value: String) -> Result<CalendarId, ConfigError> {
-    let reason = if value.trim().is_empty() {
-        Some("empty")
-    } else if value.contains(',') {
-        Some("contains a comma")
-    } else if has_control_character(&value) {
-        Some("contains a control character")
-    } else {
-        None
-    };
-    match reason {
-        Some(reason) => Err(ConfigError::InvalidCalendarId { key, value, reason }),
-        None => Ok(CalendarId(value)),
+    match CalendarId::parse(value.clone()) {
+        Ok(id) => Ok(id),
+        Err(reason) => Err(ConfigError::InvalidCalendarId { key, value, reason }),
     }
 }
 
-fn has_control_character(value: &str) -> bool {
+pub(crate) fn has_control_character(value: &str) -> bool {
     for c in value.chars() {
         if c.is_control() {
             return true;

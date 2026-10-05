@@ -333,10 +333,10 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
 - Create: `src/ekctl.rs`, `src/model.rs`
 - Create: `fixtures/list_calendars.json`, `fixtures/list_events.json`, `fixtures/show_event.json`, `fixtures/free.json`, `fixtures/add_event.json`, `fixtures/delete_event.json`, `fixtures/error.json` (content under Technical Details)
 
-- [ ] `model.rs`: serde types for the `ekctl` shapes (tolerant of unknown fields, a missing `url` and `null` values) and the bridge's own `Calendar`, `Event`, `Attendee`, `Slot`; conversions from one to the other
-- [ ] `ekctl.rs`: the `Runner` (path, timeout, mutex), with the exec, timeout, stdout cap, stderr tail and the result mapping from Solution Overview, returning a typed error the HTTP layer maps to a status
-- [ ] typed argv builders for every command in Solution Overview; nothing outside this module builds argv
-- [ ] tests with the fake `ekctl`:
+- [x] `model.rs`: serde types for the `ekctl` shapes (tolerant of unknown fields, a missing `url` and `null` values) and the bridge's own `Calendar`, `Event`, `Attendee`, `Slot`; conversions from one to the other
+- [x] `ekctl.rs`: the `Runner` (path, timeout, mutex), with the exec, timeout, stdout cap, stderr tail and the result mapping from Solution Overview, returning a typed error the HTTP layer maps to a status
+- [x] typed argv builders for every command in Solution Overview; nothing outside this module builds argv
+- [x] tests with the fake `ekctl`:
   - each fixture parses and converts;
   - error envelope with exit 0;
   - `Event not found` on `show` vs other errors;
@@ -347,7 +347,10 @@ The operator runs Gate 0; it is not an implementation task. Tasks 1-5 do not dep
   - unexpected JSON;
   - exact argv for each builder, including a title starting with `-` and an id after `--`;
   - two concurrent calls never overlap
-- [ ] gate passes
+- [x] gate passes
+- ⚠️ the crate is split into `src/lib.rs` (`#![forbid(unsafe_code)]`, `pub mod config; pub mod ekctl; pub mod model;`) and `src/main.rs` (the CLI, using the library). Without the split, items not yet reachable from `main` until Task 4 fail `clippy -D warnings` as dead code, and a blanket `allow(dead_code)` is forbidden. Later modules go into `lib.rs` too
+- ⚠️ `tokio` also needs the `io-util` feature, for reading `ekctl`'s pipes
+- ⚠️ timestamps the bridge passes to `ekctl` are formatted with whole seconds (`2026-10-05T11:00:00+02:00`); Task 4 should reject or accept fractional seconds knowingly
 
 ### Task 3: Policy
 
