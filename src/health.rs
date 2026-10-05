@@ -120,7 +120,7 @@ fn failure_reason(err: &EkctlError) -> DegradedReason {
         EkctlError::Spawn(_)
         | EkctlError::Io(_)
         | EkctlError::OutputTooLarge
-        | EkctlError::Exit { code: _, stderr: _ }
+        | EkctlError::Exit { code: _, reason: _ }
         | EkctlError::NotFound(_)
         | EkctlError::Reported(_)
         | EkctlError::UnexpectedOutput => DegradedReason::EkctlFailed,

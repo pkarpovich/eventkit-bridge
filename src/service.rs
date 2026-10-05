@@ -17,14 +17,17 @@ pub const LABEL: &str = "dev.pkarpovich.eventkit-bridge";
 /// The bundle id TCC keys the Calendars grant to; it must never change.
 pub const BUNDLE_ID: &str = "dev.pkarpovich.eventkit-bridge";
 
-/// How long one `launchctl` call may run before it is killed.
-pub const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one `launchctl` call may run before it is killed; above [`EXIT_TIMEOUT`], since
+/// `bootout` may wait for the daemon to drain.
+pub const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(EXIT_TIMEOUT.as_secs() + 10);
 
 const LAUNCHCTL: &str = "/bin/launchctl";
 const LAUNCH_AGENTS_DIR: &str = "Library/LaunchAgents";
 const LOG_RELATIVE_PATH: &str = "Library/Logs/eventkit-bridge.log";
 const STDERR_TAIL: usize = 500;
 const EXIT_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+const EXIT_TIMEOUT: Duration =
+    Duration::from_secs(SHUTDOWN_GRACE.as_secs() + EXIT_TIMEOUT_MARGIN.as_secs());
 
 /// Why installing or uninstalling the LaunchAgent failed.
 #[derive(Debug, thiserror::Error)]
@@ -252,7 +255,7 @@ pub fn housing(binary: &Path) -> Housing {
 pub fn render_plist(binary: &str, log: &str) -> String {
     let binary = escape_xml(binary);
     let log = escape_xml(log);
-    let exit_timeout = (SHUTDOWN_GRACE + EXIT_TIMEOUT_MARGIN).as_secs();
+    let exit_timeout = EXIT_TIMEOUT.as_secs();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -317,7 +320,7 @@ pub struct UnloadWait {
 impl Default for UnloadWait {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(5),
+            timeout: EXIT_TIMEOUT,
             poll: Duration::from_millis(100),
         }
     }
@@ -556,6 +559,13 @@ mod tests {
             code: Some(113),
             stderr: "Could not find service".to_owned(),
         }
+    }
+
+    #[test]
+    fn unload_waits_out_the_daemon_drain() {
+        let UnloadWait { timeout, poll: _ } = UnloadWait::default();
+        assert!(timeout > SHUTDOWN_GRACE);
+        assert!(LAUNCHCTL_TIMEOUT > timeout);
     }
 
     fn fast() -> UnloadWait {

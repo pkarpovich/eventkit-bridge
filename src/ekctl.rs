@@ -44,12 +44,12 @@ pub enum EkctlError {
     #[error("output too large")]
     OutputTooLarge,
     /// `ekctl` exited unsuccessfully.
-    #[error("{}", exit_message(*.code, .stderr))]
+    #[error("{}", exit_message(*.code, .reason))]
     Exit {
         /// The exit code, `None` when a signal ended the process.
         code: Option<i32>,
-        /// The last bytes `ekctl` wrote to stderr.
-        stderr: String,
+        /// The error envelope's message when stdout carries one, otherwise the last bytes of stderr.
+        reason: String,
     },
     /// `show event` reported that the event does not exist.
     #[error("{0}")]
@@ -62,15 +62,15 @@ pub enum EkctlError {
     UnexpectedOutput,
 }
 
-fn exit_message(code: Option<i32>, stderr: &str) -> String {
+fn exit_message(code: Option<i32>, reason: &str) -> String {
     let status = match code {
         Some(code) => format!("ekctl exited with code {code}"),
         None => "ekctl was killed by a signal".to_owned(),
     };
-    if stderr.is_empty() {
+    if reason.is_empty() {
         return status;
     }
-    format!("{status}: {stderr}")
+    format!("{status}: {reason}")
 }
 
 /// The calendars and time range of an events query.
@@ -542,10 +542,13 @@ impl Runner {
             }
         };
         if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr);
+            let reason = match envelope_error(&stdout) {
+                Some(message) => message,
+                None => String::from_utf8_lossy(&stderr).trim().to_owned(),
+            };
             return Err(EkctlError::Exit {
                 code: status.code(),
-                stderr: stderr.trim().to_owned(),
+                reason,
             });
         }
         Ok(stdout)
@@ -628,11 +631,11 @@ fn outcome(result: &Result<Vec<u8>, EkctlError>) -> CallOutcome {
         EkctlError::Io(_) | EkctlError::OutputTooLarge => CallOutcome::Killed,
         EkctlError::Exit {
             code: Some(code),
-            stderr: _,
+            reason: _,
         } => CallOutcome::Exited(*code),
         EkctlError::Exit {
             code: None,
-            stderr: _,
+            reason: _,
         } => CallOutcome::Signalled,
         EkctlError::NotFound(_) | EkctlError::Reported(_) | EkctlError::UnexpectedOutput => {
             CallOutcome::Exited(0)
@@ -703,6 +706,15 @@ fn parse<T: DeserializeOwned>(subcommand: Subcommand, stdout: &[u8]) -> Result<T
         return Err(reported(subcommand, message));
     }
     serde_json::from_value(value).map_err(|_| EkctlError::UnexpectedOutput)
+}
+
+fn envelope_error(stdout: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(stdout).ok()?;
+    if value.get("status").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let message = value.get("error").and_then(Value::as_str)?;
+    Some(message.to_owned())
 }
 
 fn reported(subcommand: Subcommand, message: &str) -> EkctlError {
@@ -1180,7 +1192,11 @@ mod tests {
         );
         let runner = fake.runner();
         let err = runner.session().await.list_calendars().await.unwrap_err();
-        let EkctlError::Exit { code, stderr } = &err else {
+        let EkctlError::Exit {
+            code,
+            reason: stderr,
+        } = &err
+        else {
             panic!("unexpected error: {err:?}");
         };
         assert_eq!(*code, Some(3));
@@ -1205,7 +1221,11 @@ mod tests {
         let err = log
             .scope(async { runner.session().await.list_calendars().await.unwrap_err() })
             .await;
-        let EkctlError::Exit { code: None, stderr } = &err else {
+        let EkctlError::Exit {
+            code: None,
+            reason: stderr,
+        } = &err
+        else {
             panic!("unexpected error: {err:?}");
         };
         assert_eq!(stderr, "");
@@ -1215,6 +1235,25 @@ mod tests {
             rendered.push(call.to_string());
         }
         assert_eq!(rendered, vec!["list calendars=signalled"]);
+    }
+
+    #[tokio::test]
+    async fn non_zero_exit_reports_the_stdout_envelope() {
+        let fake = Fake::new(
+            "echo '{\"status\":\"error\",\"error\":\"Permission denied for both Calendar and Reminders.\"}'\necho 'noise' >&2\nexit 2",
+        );
+        let runner = fake.runner();
+        let session = runner.session().await;
+        let err = session.list_calendars().await.unwrap_err();
+        let EkctlError::Exit { code, reason } = &err else {
+            panic!("expected an exit error, got {err:?}");
+        };
+        assert_eq!(*code, Some(2));
+        assert_eq!(reason, "Permission denied for both Calendar and Reminders.");
+        assert_eq!(
+            err.to_string(),
+            "ekctl exited with code 2: Permission denied for both Calendar and Reminders."
+        );
     }
 
     #[tokio::test]

@@ -118,7 +118,8 @@ impl Params {
         Ok(value)
     }
 
-    fn number(&self, key: &str, default: u32, min: u32, max: u32) -> Result<u32, Invalid> {
+    fn number(&self, key: &str, bounds: Bounds) -> Result<u32, Invalid> {
+        let Bounds { default, min, max } = bounds;
         let Some(value) = self.get(key) else {
             return Ok(default);
         };
@@ -158,12 +159,53 @@ fn parse_timestamp(key: &str, value: &str) -> Result<DateTime<FixedOffset>, Inva
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    default: u32,
+    min: u32,
+    max: u32,
+}
+
+const DURATION_BOUNDS: Bounds = Bounds {
+    default: 30,
+    min: 5,
+    max: 1440,
+};
+const BUFFER_BOUNDS: Bounds = Bounds {
+    default: 0,
+    min: 0,
+    max: 240,
+};
+const LIMIT_BOUNDS: Bounds = Bounds {
+    default: 20,
+    min: 1,
+    max: 100,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct RangeKeys {
+    from: &'static str,
+    to: &'static str,
+}
+
+const FROM_TO: RangeKeys = RangeKeys {
+    from: "from",
+    to: "to",
+};
+const START_END: RangeKeys = RangeKeys {
+    from: "start",
+    to: "end",
+};
+
 fn check_range(
+    keys: RangeKeys,
     from: DateTime<FixedOffset>,
     to: DateTime<FixedOffset>,
-    from_key: &str,
-    to_key: &str,
 ) -> Result<(), Invalid> {
+    let RangeKeys {
+        from: from_key,
+        to: to_key,
+    } = keys;
     if to <= from {
         return Err(Invalid::new(format!(
             "`{to_key}` must be after `{from_key}`"
@@ -186,7 +228,7 @@ pub fn events_query(raw: Option<&str>) -> Result<EventRange, Invalid> {
     let params = Params::parse(raw, &["from", "to"])?;
     let from = params.required_timestamp("from")?;
     let to = params.required_timestamp("to")?;
-    check_range(from, to, "from", "to")?;
+    check_range(FROM_TO, from, to)?;
     check_span(from, to)?;
     let Params {
         single: _,
@@ -213,7 +255,7 @@ pub fn free_query(raw: Option<&str>) -> Result<FreeQuery, Invalid> {
             "to",
         ],
     )?;
-    let duration_minutes = params.number("duration", 30, 5, 1440)?;
+    let duration_minutes = params.number("duration", DURATION_BOUNDS)?;
     let working_hours = match params.get("working_hours") {
         Some(value) => parse_working_hours(value)?,
         None => WorkingHours::Window {
@@ -225,13 +267,13 @@ pub fn free_query(raw: Option<&str>) -> Result<FreeQuery, Invalid> {
         Some(value) => parse_weekdays(value)?,
         None => Weekdays::Weekdays,
     };
-    let buffer_minutes = params.number("buffer", 0, 0, 240)?;
-    let limit = params.number("limit", 20, 1, 100)?;
+    let buffer_minutes = params.number("buffer", BUFFER_BOUNDS)?;
+    let limit = params.number("limit", LIMIT_BOUNDS)?;
     let from = params.timestamp("from")?;
     let to = params.timestamp("to")?;
     match (from, to) {
         (Some(from), Some(to)) => {
-            check_range(from, to, "from", "to")?;
+            check_range(FROM_TO, from, to)?;
             check_span(from, to)?;
         }
         (None, None) => {}
@@ -406,7 +448,7 @@ pub fn create_body(body: &[u8]) -> Result<NewEvent, Invalid> {
     let title = parse_title(title)?;
     let start = parse_timestamp("start", &start)?;
     let end = parse_timestamp("end", &end)?;
-    check_range(start, end, "start", "end")?;
+    check_range(START_END, start, end)?;
     Ok(NewEvent {
         title,
         start,
@@ -456,7 +498,7 @@ pub fn merged_range(changes: &EventChanges, existing: &Event) -> Result<(), Inva
         Some(end) => end,
         None => existing.end.as_datetime(),
     };
-    check_range(start, end, "start", "end")
+    check_range(START_END, start, end)
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Invalid> {

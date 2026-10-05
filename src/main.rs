@@ -157,7 +157,15 @@ async fn daemon(
         let app = Arc::clone(&app);
         tokio::spawn(async move { app.announce_calendars(ANNOUNCE_RETRY).await })
     };
-    let result = server::serve(listener, app, shutdown, SHUTDOWN_GRACE).await;
+    let result = server::serve(
+        listener,
+        app,
+        server::Shutdown {
+            signal: shutdown,
+            grace: SHUTDOWN_GRACE,
+        },
+    )
+    .await;
     announcer.abort();
     result.map_err(|err| format!("server failed: {err}"))?;
     tracing::info!("stopped");

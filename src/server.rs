@@ -136,7 +136,6 @@ impl App {
     }
 }
 
-/// An error answered as `{"error": message}`.
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
@@ -191,7 +190,7 @@ fn ekctl_status(err: &EkctlError) -> StatusCode {
         EkctlError::Spawn(_)
         | EkctlError::Io(_)
         | EkctlError::OutputTooLarge
-        | EkctlError::Exit { code: _, stderr: _ }
+        | EkctlError::Exit { code: _, reason: _ }
         | EkctlError::Reported(_)
         | EkctlError::UnexpectedOutput => StatusCode::BAD_GATEWAY,
     }
@@ -247,14 +246,24 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// Serves `app` on `listener` until `shutdown` resolves, then lets in-flight requests finish
-/// for at most `grace`.
-pub async fn serve(
-    listener: TcpListener,
-    app: Arc<App>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-    grace: Duration,
-) -> io::Result<()> {
+/// When the server stops accepting requests, and how long in-flight ones may run after that.
+pub struct Shutdown<F> {
+    /// Resolves when the server should stop accepting requests.
+    pub signal: F,
+    /// How long in-flight requests may run once `signal` resolved.
+    pub grace: Duration,
+}
+
+/// Serves `app` on `listener` until the shutdown signal resolves, then lets in-flight requests
+/// finish for at most the grace period.
+pub async fn serve<F>(listener: TcpListener, app: Arc<App>, shutdown: Shutdown<F>) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Shutdown {
+        signal: shutdown,
+        grace,
+    } = shutdown;
     let (stopping, mut stopped) = watch::channel(false);
     let server = axum::serve(listener, router(app))
         .with_graceful_shutdown(async move {
@@ -515,23 +524,21 @@ mod tests {
         ])
     }
 
-    async fn send(
-        router: &Router,
-        method: Method,
-        uri: &str,
-        body: Option<&[u8]>,
-    ) -> (StatusCode, Value) {
-        let body = match body {
-            Some(body) => Body::from(body.to_vec()),
-            None => Body::empty(),
-        };
-        let request = Request::builder()
+    fn build_request(method: Method, uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
             .method(method)
             .uri(uri)
             .header("host", HOST)
             .header("content-type", "application/json")
             .body(body)
-            .unwrap();
+            .unwrap()
+    }
+
+    fn json_request(method: Method, uri: &str, body: &Value) -> Request<Body> {
+        build_request(method, uri, Body::from(serde_json::to_vec(body).unwrap()))
+    }
+
+    async fn send(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
         let response = router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -542,22 +549,7 @@ mod tests {
     }
 
     async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
-        send(router, Method::GET, uri, None).await
-    }
-
-    async fn send_json(
-        router: &Router,
-        method: Method,
-        uri: &str,
-        body: Value,
-    ) -> (StatusCode, Value) {
-        send(
-            router,
-            method,
-            uri,
-            Some(&serde_json::to_vec(&body).unwrap()),
-        )
-        .await
+        send(router, build_request(Method::GET, uri, Body::empty())).await
     }
 
     fn error(message: &str) -> Value {
@@ -752,18 +744,22 @@ mod tests {
         for method in [Method::GET, Method::PATCH, Method::DELETE] {
             let (status, body) = send(
                 &router,
-                method.clone(),
-                "/v1/events/a%0Ab",
-                Some(b"{\"title\":\"x\"}"),
+                build_request(
+                    method.clone(),
+                    "/v1/events/a%0Ab",
+                    Body::from(b"{\"title\":\"x\"}".to_vec()),
+                ),
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{method}");
             assert_eq!(body, error("event id contains a control character"));
             let (status, body) = send(
                 &router,
-                method.clone(),
-                "/v1/events/",
-                Some(b"{\"title\":\"x\"}"),
+                build_request(
+                    method.clone(),
+                    "/v1/events/",
+                    Body::from(b"{\"title\":\"x\"}".to_vec()),
+                ),
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{method}");
@@ -892,18 +888,20 @@ mod tests {
     async fn create_event() {
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) = send_json(
+        let (status, body) = send(
             &router,
-            Method::POST,
-            "/v1/events",
-            json!({
-                "title": "-Lunch",
-                "start": "2026-02-10T12:30:00Z",
-                "end": "2026-02-10T14:30:00+01:00",
-                "location": "Cafe",
-                "notes": "a\nb",
-                "url": "https://example.com/"
-            }),
+            json_request(
+                Method::POST,
+                "/v1/events",
+                &json!({
+                    "title": "-Lunch",
+                    "start": "2026-02-10T12:30:00Z",
+                    "end": "2026-02-10T14:30:00+01:00",
+                    "location": "Cafe",
+                    "notes": "a\nb",
+                    "url": "https://example.com/"
+                }),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -972,7 +970,11 @@ mod tests {
     async fn create_without_write_calendar() {
         let fake = write_fake();
         let router = app(&read_only(), fake.runner());
-        let (status, body) = send_json(&router, Method::POST, "/v1/events", create_body()).await;
+        let (status, body) = send(
+            &router,
+            json_request(Method::POST, "/v1/events", &create_body()),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, error("no write calendar configured"));
         assert!(fake.calls().is_empty());
@@ -1033,11 +1035,16 @@ mod tests {
         for (key, value, message) in cases {
             let mut body = create_body();
             body[key] = value;
-            let (status, body) = send_json(&router, Method::POST, "/v1/events", body).await;
+            let (status, body) =
+                send(&router, json_request(Method::POST, "/v1/events", &body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
             assert_eq!(body, error(message), "{key}");
         }
-        let (status, body) = send(&router, Method::POST, "/v1/events", Some(b"{")).await;
+        let (status, body) = send(
+            &router,
+            build_request(Method::POST, "/v1/events", Body::from(b"{".to_vec())),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
             body["error"]
@@ -1045,8 +1052,11 @@ mod tests {
                 .unwrap()
                 .starts_with("invalid JSON body: ")
         );
-        let (status, body) =
-            send_json(&router, Method::POST, "/v1/events", json!({"title": "x"})).await;
+        let (status, body) = send(
+            &router,
+            json_request(Method::POST, "/v1/events", &json!({"title": "x"})),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("missing field"));
         assert!(fake.calls().is_empty());
@@ -1058,7 +1068,7 @@ mod tests {
         let router = app(&configured(), fake.runner());
         let mut body = create_body();
         body["notes"] = json!("a".repeat(BODY_LIMIT));
-        let (status, body) = send_json(&router, Method::POST, "/v1/events", body).await;
+        let (status, body) = send(&router, json_request(Method::POST, "/v1/events", &body)).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(body["error"].is_string());
         assert!(fake.calls().is_empty());
@@ -1068,11 +1078,13 @@ mod tests {
     async fn update_event() {
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) = send_json(
+        let (status, body) = send(
             &router,
-            Method::PATCH,
-            EVENT_PATH,
-            json!({"title": "Renamed", "end": "2026-10-05T12:00:00+02:00"}),
+            json_request(
+                Method::PATCH,
+                EVENT_PATH,
+                &json!({"title": "Renamed", "end": "2026-10-05T12:00:00+02:00"}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1093,21 +1105,25 @@ mod tests {
     async fn update_start_checked_against_existing_end() {
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) = send_json(
+        let (status, body) = send(
             &router,
-            Method::PATCH,
-            EVENT_PATH,
-            json!({"start": "2026-10-05T11:30:00+02:00"}),
+            json_request(
+                Method::PATCH,
+                EVENT_PATH,
+                &json!({"start": "2026-10-05T11:30:00+02:00"}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, error("`end` must be after `start`"));
         assert_eq!(fake.calls(), vec![format!("show event -- {EVENT_ID}")]);
-        let (status, _) = send_json(
+        let (status, _) = send(
             &router,
-            Method::PATCH,
-            EVENT_PATH,
-            json!({"start": "2026-10-05T11:29:00+02:00"}),
+            json_request(
+                Method::PATCH,
+                EVENT_PATH,
+                &json!({"start": "2026-10-05T11:29:00+02:00"}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1118,7 +1134,8 @@ mod tests {
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
         for body in [json!({}), json!({"notes": null})] {
-            let (status, body) = send_json(&router, Method::PATCH, EVENT_PATH, body).await;
+            let (status, body) =
+                send(&router, json_request(Method::PATCH, EVENT_PATH, &body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body, error("the update changes no field"));
         }
@@ -1129,15 +1146,16 @@ mod tests {
     async fn update_validation() {
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) =
-            send_json(&router, Method::PATCH, EVENT_PATH, json!({"title": ""})).await;
+        let (status, body) = send(
+            &router,
+            json_request(Method::PATCH, EVENT_PATH, &json!({"title": ""})),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, error("`title` must not be blank"));
-        let (status, body) = send_json(
+        let (status, body) = send(
             &router,
-            Method::PATCH,
-            EVENT_PATH,
-            json!({"calendar": WRITE_ID}),
+            json_request(Method::PATCH, EVENT_PATH, &json!({"calendar": WRITE_ID})),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1154,11 +1172,9 @@ mod tests {
     async fn update_of_a_user_event_is_refused() {
         let fake = user_event_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) = send_json(
+        let (status, body) = send(
             &router,
-            Method::PATCH,
-            EVENT_PATH,
-            json!({"title": "Mine now"}),
+            json_request(Method::PATCH, EVENT_PATH, &json!({"title": "Mine now"})),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1170,8 +1186,11 @@ mod tests {
     async fn update_without_write_calendar() {
         let fake = write_fake();
         let router = app(&read_only(), fake.runner());
-        let (status, body) =
-            send_json(&router, Method::PATCH, EVENT_PATH, json!({"title": "x"})).await;
+        let (status, body) = send(
+            &router,
+            json_request(Method::PATCH, EVENT_PATH, &json!({"title": "x"})),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, error("no write calendar configured"));
         assert!(fake.calls().is_empty());
@@ -1181,11 +1200,13 @@ mod tests {
     async fn update_not_found() {
         let fake = Fake::printing("error.json");
         let router = app(&configured(), fake.runner());
-        let (status, body) = send_json(
+        let (status, body) = send(
             &router,
-            Method::PATCH,
-            "/v1/events/nonexistent-id",
-            json!({"title": "x"}),
+            json_request(
+                Method::PATCH,
+                "/v1/events/nonexistent-id",
+                &json!({"title": "x"}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1196,7 +1217,11 @@ mod tests {
     async fn delete_event() {
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) = send(&router, Method::DELETE, EVENT_PATH, None).await;
+        let (status, body) = send(
+            &router,
+            build_request(Method::DELETE, EVENT_PATH, Body::empty()),
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(body, Value::Null);
         assert_eq!(
@@ -1250,8 +1275,10 @@ esac"#,
                 let method = method.clone();
                 tokio::spawn(async move {
                     match body {
-                        Some(body) => send_json(&router, method, EVENT_PATH, body).await,
-                        None => send(&router, method, EVENT_PATH, None).await,
+                        Some(body) => send(&router, json_request(method, EVENT_PATH, &body)).await,
+                        None => {
+                            send(&router, build_request(method, EVENT_PATH, Body::empty())).await
+                        }
                     }
                 })
             };
@@ -1270,7 +1297,11 @@ esac"#,
     async fn delete_of_a_user_event_is_refused() {
         let fake = user_event_fake();
         let router = app(&configured(), fake.runner());
-        let (status, body) = send(&router, Method::DELETE, EVENT_PATH, None).await;
+        let (status, body) = send(
+            &router,
+            build_request(Method::DELETE, EVENT_PATH, Body::empty()),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, error("event is not in the write calendar"));
         assert_no_writes(&fake);
@@ -1281,12 +1312,20 @@ esac"#,
     async fn delete_without_write_calendar_and_not_found() {
         let fake = write_fake();
         let router = app(&read_only(), fake.runner());
-        let (status, _) = send(&router, Method::DELETE, EVENT_PATH, None).await;
+        let (status, _) = send(
+            &router,
+            build_request(Method::DELETE, EVENT_PATH, Body::empty()),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(fake.calls().is_empty());
         let fake = Fake::printing("error.json");
         let router = app(&configured(), fake.runner());
-        let (status, _) = send(&router, Method::DELETE, "/v1/events/nonexistent-id", None).await;
+        let (status, _) = send(
+            &router,
+            build_request(Method::DELETE, "/v1/events/nonexistent-id", Body::empty()),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -1370,22 +1409,22 @@ esac"#,
             "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\", \"{OTHER_ID}\"]"
         ))
         .unwrap();
+        let short = Duration::from_millis(200);
+        let usual = Duration::from_secs(10);
         let cases = [
-            (unconfigured(), "cat /dev/null", "unconfigured"),
-            (configured(), "sleep 2", "timeout"),
-            (configured(), "exit 1", "ekctl failed"),
+            (unconfigured(), "cat /dev/null", usual, "unconfigured"),
+            (configured(), "sleep 2", short, "timeout"),
+            (configured(), "exit 1", usual, "ekctl failed"),
             (
                 missing,
                 &format!("cat '{}'", fixture("list_calendars.json").display()) as &str,
+                usual,
                 "calendar missing",
             ),
         ];
-        for (config, script, reason) in cases {
+        for (config, script, timeout, reason) in cases {
             let fake = Fake::new(script);
-            let router = app(
-                &config,
-                fake.runner_with_timeout(Duration::from_millis(200)),
-            );
+            let router = app(&config, fake.runner_with_timeout(timeout));
             let (status, body) = get(&router, "/healthz").await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reason}");
             assert_eq!(body, json!({"status": "degraded", "reason": reason}));
@@ -1413,7 +1452,11 @@ esac"#,
         let (status, body) = get(&router, "/v1/reminders").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, error("not found"));
-        let (status, body) = send(&router, Method::DELETE, "/v1/calendars", None).await;
+        let (status, body) = send(
+            &router,
+            build_request(Method::DELETE, "/v1/calendars", Body::empty()),
+        )
+        .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(body, error("method not allowed"));
     }
@@ -1583,18 +1626,20 @@ esac"#,
         let (captured, _guard) = capture();
         let fake = write_fake();
         let router = app(&configured(), fake.runner());
-        let (status, _) = send_json(
+        let (status, _) = send(
             &router,
-            Method::POST,
-            "/v1/events",
-            json!({
-                "title": "Secret title",
-                "start": "2026-02-10T12:30:00Z",
-                "end": "2026-02-10T13:30:00Z",
-                "location": "Secret location",
-                "notes": "Secret notes",
-                "url": "https://secret.example.com/"
-            }),
+            json_request(
+                Method::POST,
+                "/v1/events",
+                &json!({
+                    "title": "Secret title",
+                    "start": "2026-02-10T12:30:00Z",
+                    "end": "2026-02-10T13:30:00Z",
+                    "location": "Secret location",
+                    "notes": "Secret notes",
+                    "url": "https://secret.example.com/"
+                }),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -1653,7 +1698,11 @@ esac"#,
         let (captured, _guard) = capture();
         let fake = user_event_fake();
         let router = app(&configured(), fake.runner());
-        send(&router, Method::DELETE, EVENT_PATH, None).await;
+        send(
+            &router,
+            build_request(Method::DELETE, EVENT_PATH, Body::empty()),
+        )
+        .await;
         let log = captured.text();
         assert!(
             log.contains(r#"reason=event is not in the write calendar"#),
@@ -1735,10 +1784,12 @@ esac"#,
         let server = tokio::spawn(serve(
             listener,
             app,
-            async move {
-                stopped.await.ok();
+            Shutdown {
+                signal: async move {
+                    stopped.await.ok();
+                },
+                grace: Duration::from_millis(300),
             },
-            Duration::from_millis(300),
         ));
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
@@ -1769,10 +1820,12 @@ esac"#,
         let server = tokio::spawn(serve(
             listener,
             app,
-            async move {
-                stopped.await.ok();
+            Shutdown {
+                signal: async move {
+                    stopped.await.ok();
+                },
+                grace: Duration::from_secs(10),
             },
-            Duration::from_secs(10),
         ));
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
