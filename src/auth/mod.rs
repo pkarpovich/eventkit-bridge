@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Method};
@@ -7,6 +8,12 @@ use jsonwebtoken::{Algorithm, DecodingKey, Header, TokenData, Validation};
 use serde::Deserialize;
 
 use crate::config::AuthConfig;
+
+mod fetch;
+mod jwks;
+
+pub use fetch::HttpJwksSource;
+pub use jwks::{FetchError, Jwks, JwksSource};
 
 const LEEWAY_SECONDS: u64 = 60;
 const BEARER_SCHEME: &str = "bearer";
@@ -247,6 +254,32 @@ impl Validator {
     }
 }
 
+/// Validates a request's bearer token against the provider's current keys.
+pub struct Authenticator {
+    validator: Validator,
+    jwks: Arc<Jwks>,
+}
+
+impl Authenticator {
+    /// Validates against the `[auth]` table's issuer, audience and scope prefix and the keys in `jwks`.
+    pub fn new(config: &AuthConfig, jwks: Arc<Jwks>) -> Self {
+        Self {
+            validator: Validator::new(config),
+            jwks,
+        }
+    }
+
+    /// Validates the request's token; a token naming an unknown `kid` triggers one gated refetch and one more lookup.
+    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        let result = self.validator.validate(headers, &self.jwks.keys());
+        let Err(AuthError::UnknownKey) = result else {
+            return result;
+        };
+        self.jwks.refetch_unknown_key().await;
+        self.validator.validate(headers, &self.jwks.keys())
+    }
+}
+
 /// The scope name `method` on the route template `route` needs, before the prefix; `None` when the pair has no row.
 pub fn scope_for(method: &Method, route: &str) -> Option<&'static str> {
     for (row_method, row_route, name) in SCOPE_TABLE {
@@ -413,6 +446,11 @@ mod tests {
     use serde_json::{Value, json};
     use url::Url;
 
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    use super::jwks::test_source::{ScriptedSource, body};
     use super::test_keys::{KEY, OTHER_KEY, header, jwk, mint, mint_hs256};
     use super::*;
 
@@ -932,5 +970,128 @@ mod tests {
             Validator::new(&config).required_scope(&Method::GET, "/v1/free"),
             Some("calendar.read".to_owned())
         );
+    }
+
+    struct AuthHarness {
+        _dir: TempDir,
+        source: Arc<ScriptedSource>,
+        authenticator: Authenticator,
+    }
+
+    fn auth_harness(script: Vec<Result<Vec<u8>, FetchError>>) -> AuthHarness {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(ScriptedSource::new(script));
+        let jwks = Jwks::new(
+            Arc::clone(&source) as Arc<dyn JwksSource>,
+            dir.path().join("jwks-cache.json"),
+        );
+        AuthHarness {
+            _dir: dir,
+            source,
+            authenticator: Authenticator::new(&config(), Arc::new(jwks)),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_kid_fetches_once_then_succeeds() {
+        let harness = auth_harness(vec![Ok(body(&[KID]))]);
+
+        let principal = harness
+            .authenticator
+            .authenticate(&bearer(&mint(&claims(), KID)))
+            .await
+            .unwrap();
+
+        assert_eq!(principal.client, CLIENT);
+        assert_eq!(harness.source.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn known_kid_does_not_fetch() {
+        let harness = auth_harness(vec![Ok(body(&[KID]))]);
+        let headers = bearer(&mint(&claims(), KID));
+        harness.authenticator.authenticate(&headers).await.unwrap();
+
+        harness.authenticator.authenticate(&headers).await.unwrap();
+
+        assert_eq!(harness.source.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_unknown_kid_fetches_again_only_after_60_s() {
+        let harness = auth_harness(vec![Ok(body(&[KID])), Ok(body(&[KID, "key-2"]))]);
+        let headers = bearer(&mint(&claims(), "key-2"));
+
+        let first = harness.authenticator.authenticate(&headers).await;
+        assert_eq!(first, Err(AuthError::UnknownKey));
+        assert_eq!(harness.source.calls(), 1);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let second = harness.authenticator.authenticate(&headers).await;
+        assert_eq!(second, Err(AuthError::UnknownKey));
+        assert_eq!(harness.source.calls(), 1);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let third = harness.authenticator.authenticate(&headers).await;
+
+        assert_eq!(third.unwrap().client, CLIENT);
+        assert_eq!(harness.source.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_unknown_kids_share_one_fetch() {
+        let harness = auth_harness(vec![Ok(body(&[KID])), Ok(body(&[KID]))]);
+        let headers = bearer(&mint(&claims(), KID));
+
+        let (first, second, third) = tokio::join!(
+            harness.authenticator.authenticate(&headers),
+            harness.authenticator.authenticate(&headers),
+            harness.authenticator.authenticate(&headers),
+        );
+
+        assert_eq!(first.unwrap().client, CLIENT);
+        assert_eq!(second.unwrap().client, CLIENT);
+        assert_eq!(third.unwrap().client, CLIENT);
+        assert_eq!(harness.source.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_refetch_is_unknown_key() {
+        let harness = auth_harness(vec![Err(FetchError::Status(503))]);
+
+        let result = harness
+            .authenticator
+            .authenticate(&bearer(&mint(&claims(), KID)))
+            .await;
+
+        assert_eq!(result, Err(AuthError::UnknownKey));
+        assert_eq!(harness.source.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_tokens_never_fetch() {
+        let harness = auth_harness(vec![Ok(body(&[KID]))]);
+        let mut no_kid = header(KID);
+        no_kid.kid = None;
+        let cases = [
+            HeaderMap::new(),
+            authorization("Basic dXNlcjpwYXNz"),
+            bearer("not-a-jwt"),
+            bearer(&KEY.sign(&no_kid, &claims())),
+            bearer(&mint_hs256(&claims(), "key-9")),
+        ];
+        for headers in cases {
+            assert!(harness.authenticator.authenticate(&headers).await.is_err());
+        }
+
+        assert_eq!(harness.source.calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_invalid_after_refetch_is_invalid() {
+        let harness = auth_harness(vec![Ok(body(&[KID]))]);
+        let token = OTHER_KEY.sign(&header(KID), &claims());
+
+        let result = harness.authenticator.authenticate(&bearer(&token)).await;
+
+        assert_eq!(result, Err(AuthError::Invalid));
     }
 }

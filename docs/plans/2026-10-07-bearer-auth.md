@@ -181,13 +181,21 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 **Files:**
 - Modify: `src/auth.rs` (or split into `src/auth/mod.rs`, `src/auth/jwks.rs`, `src/auth/fetch.rs` if it passes 1000 lines)
 
-- [ ] `JwksSource` trait, `Jwks` with the startup load, the 12 h / 5 min refresh loop as `run_refresh(self: Arc<Self>)`, the unknown-`kid` refetch with the 60 s gate and the shared `Mutex`
-- [ ] parsing and filtering of `JwkSet`; zero usable keys is a failed fetch
-- [ ] persistence: write through temp file and rename, load at startup, `fetched_at`, `age()`, `key_count()`
-- [ ] `HttpJwksSource` over `ureq` with the timeout, body cap, `http_status_as_error` and `RootCerts::PlatformVerifier`, on `spawn_blocking`
-- [ ] tests with paused time and a scripted source: unknown `kid` triggers exactly one fetch then succeeds; a second unknown `kid` 30 s later does not fetch and fails, one at 61 s fetches; a failed startup fetch retries after 30 s and succeeds; the 12 h refresh fires; a failed refresh keeps the old keys and retries in 5 min; a body with no RSA keys keeps the old keys; a body over the cap is a failure; the file is written after a good fetch and loaded by a fresh `Jwks` with the same count and an age computed from `fetched_at`; a corrupt file is ignored; a key with `use: enc` and one with `alg: ES256` are dropped
-- [ ] `HttpJwksSource` tests against a local listener: `200` body; `500`; a body over 64 KiB; a server that accepts and never answers, with the client timeout shortened for the test
-- [ ] run tests, `mise run check`
+- [x] `JwksSource` trait, `Jwks` with the startup load, the 12 h / 5 min refresh loop as `run_refresh(self: Arc<Self>)`, the unknown-`kid` refetch with the 60 s gate and the shared `Mutex`
+- [x] parsing and filtering of `JwkSet`; zero usable keys is a failed fetch
+- [x] persistence: write through temp file and rename, load at startup, `fetched_at`, `age()`, `key_count()`
+- [x] `HttpJwksSource` over `ureq` with the timeout, body cap, `http_status_as_error` and `RootCerts::PlatformVerifier`, on `spawn_blocking`
+- [x] tests with paused time and a scripted source: unknown `kid` triggers exactly one fetch then succeeds; a second unknown `kid` 30 s later does not fetch and fails, one at 61 s fetches; a failed startup fetch retries after 30 s and succeeds; the 12 h refresh fires; a failed refresh keeps the old keys and retries in 5 min; a body with no RSA keys keeps the old keys; a body over the cap is a failure; the file is written after a good fetch and loaded by a fresh `Jwks` with the same count and an age computed from `fetched_at`; a corrupt file is ignored; a key with `use: enc` and one with `alg: ES256` are dropped
+- [x] `HttpJwksSource` tests against a local listener: `200` body; `500`; a body over 64 KiB; a server that accepts and never answers, with the client timeout shortened for the test
+- [x] run tests, `mise run check` (the three cargo commands run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ Split into `src/auth/mod.rs` (validation, scope table, `Authenticator`), `src/auth/jwks.rs` (`JwksSource`, `FetchError`, `Jwks`) and `src/auth/fetch.rs` (`HttpJwksSource`): with the cache the single file would pass 1000 lines.
+- ⚠️ `JwksSource::fetch` is synchronous; `Jwks` runs every fetch on `spawn_blocking`, so a scripted source needs no runtime and `HttpJwksSource` blocks only a pool thread.
+- ⚠️ `Authenticator { validator, jwks }` lands here rather than in Task 4: `authenticate(headers)` validates, and on `UnknownKey` calls `Jwks::refetch_unknown_key` and looks up once more. The periodic refresh and the unknown-`kid` refetch share the one `tokio::sync::Mutex`, so two fetches never run (or write the cache file) at once.
+- ⚠️ The body is parsed as `{"keys": [..]}` with each key deserialised into a `Jwk` on its own, instead of one `JwkSet`: a single key that `jsonwebtoken` cannot parse is dropped instead of failing the whole set.
+- ⚠️ `Jwks` also refuses a body over 64 KiB from any source, so the cap is tested with the scripted source as well as over HTTP. ureq's `limit(n)` fails a body of exactly `n` bytes, so `HttpJwksSource` passes `BODY_CAP + 1`, and a 64 KiB body is accepted.
+- ⚠️ `HttpJwksSource` sets `proxy(None)`: the provider is on the private network, and an `HTTP_PROXY` in the environment must not reroute the fetch.
+- ⚠️ `kind(ureq::Error)` has one `_ => Transport` arm: `ureq::Error` is `#[non_exhaustive]`, so a wildcard is required.
+- ⚠️ `tokio` is also listed under dev-dependencies with `test-util`, for `start_paused` and `advance`.
 
 ### Task 4: Middleware, logging, health, wiring
 
