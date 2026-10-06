@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 const CONFIG_RELATIVE_PATH: &str = ".config/eventkit-bridge/config.toml";
 const EKCTL_FILE_NAME: &str = "ekctl";
@@ -30,6 +31,9 @@ pub const DEFAULT_EXCLUDED_MAILBOXES: [&str; 8] = [
     "[Gmail]/Trash",
     "[Gmail]/Spam",
 ];
+
+/// The prefix every route scope gets when `[auth]` has no `scope_prefix`.
+pub const DEFAULT_SCOPE_PREFIX: &str = "bridge:";
 
 /// The radius in meters a place gets when the config gives none.
 pub const DEFAULT_RADIUS: u32 = 100;
@@ -338,6 +342,21 @@ pub fn discover_mail_root(mail: &Path) -> Result<PathBuf, MailRootError> {
     Ok(root)
 }
 
+/// The `[auth]` table; its presence turns the bearer-token gate on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    /// Compared exactly with a token's `iss`.
+    pub issuer: String,
+    /// Must be contained in a token's `aud`.
+    pub audience: String,
+    /// Where the provider's signing keys are fetched from.
+    pub jwks_url: Url,
+    /// Whether a request without a token is refused; `false` lets it through as `anonymous`.
+    pub required: bool,
+    /// Prepended to a route's scope name to form the scope a token must carry.
+    pub scope_prefix: String,
+}
+
 /// A DNS name clients may use to reach the bridge, stored lowercase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostName(String);
@@ -385,6 +404,8 @@ pub struct Config {
     pub remindctl: Option<PathBuf>,
     /// The `[mail]` table; `None` turns mail off.
     pub mail: Option<MailConfig>,
+    /// The `[auth]` table; `None` leaves the network bind and the `Host` check as the whole access control.
+    pub auth: Option<AuthConfig>,
 }
 
 /// Why a config file was rejected; every rule violation names its key.
@@ -533,6 +554,28 @@ pub enum ConfigError {
     /// `mail.root` is set to an empty path.
     #[error("`mail.root` must not be empty")]
     EmptyMailRoot,
+    /// A required key of `[auth]` is absent.
+    #[error("`auth.{0}` is required")]
+    MissingAuthKey(&'static str),
+    /// `auth.issuer` or `auth.audience` is blank.
+    #[error("`auth.{0}` must not be empty")]
+    EmptyAuthKey(&'static str),
+    /// `auth.issuer` or `auth.audience` contains whitespace.
+    #[error("`auth.{0}` must not contain whitespace")]
+    AuthKeyWhitespace(&'static str),
+    /// `auth.jwks_url` is not an absolute `http` or `https` URL.
+    #[error("`auth.jwks_url` must be an absolute http or https URL, got {value:?}: {reason}")]
+    InvalidJwksUrl {
+        /// The URL as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// `auth.scope_prefix` has a character outside the OAuth scope-token set.
+    #[error(
+        "`auth.scope_prefix` may contain only printable ASCII other than space, `\"` and `\\`, got {0:?}"
+    )]
+    InvalidScopePrefix(String),
 }
 
 #[derive(Deserialize)]
@@ -553,6 +596,7 @@ struct RawConfig {
     places: Option<toml::Value>,
     remindctl: Option<PathBuf>,
     mail: Option<RawMail>,
+    auth: Option<RawAuth>,
 }
 
 #[derive(Deserialize)]
@@ -562,6 +606,16 @@ struct RawMail {
     root: Option<PathBuf>,
     #[serde(default)]
     accounts: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuth {
+    issuer: Option<String>,
+    audience: Option<String>,
+    jwks_url: Option<String>,
+    required: Option<bool>,
+    scope_prefix: Option<String>,
 }
 
 impl Config {
@@ -589,6 +643,7 @@ impl Config {
             places,
             remindctl,
             mail,
+            auth,
         } = match toml::from_str(text) {
             Ok(raw) => raw,
             Err(err) => return Err(parse_error(text, &err)),
@@ -667,6 +722,11 @@ impl Config {
             Some(mail) => Some(parse_mail(mail)?),
         };
 
+        let auth = match auth {
+            None => None,
+            Some(auth) => Some(parse_auth(auth)?),
+        };
+
         Ok(Self {
             listen,
             hosts: names,
@@ -678,6 +738,7 @@ impl Config {
             places: configured,
             remindctl,
             mail,
+            auth,
         })
     }
 
@@ -914,6 +975,82 @@ fn parse_mail(mail: RawMail) -> Result<MailConfig, ConfigError> {
     })
 }
 
+fn parse_auth(auth: RawAuth) -> Result<AuthConfig, ConfigError> {
+    let RawAuth {
+        issuer,
+        audience,
+        jwks_url,
+        required,
+        scope_prefix,
+    } = auth;
+    let issuer = parse_auth_value("issuer", issuer)?;
+    let audience = parse_auth_value("audience", audience)?;
+    let Some(jwks_url) = jwks_url else {
+        return Err(ConfigError::MissingAuthKey("jwks_url"));
+    };
+    let jwks_url = parse_jwks_url(jwks_url)?;
+    let scope_prefix = match scope_prefix {
+        None => DEFAULT_SCOPE_PREFIX.to_owned(),
+        Some(prefix) => prefix,
+    };
+    for c in scope_prefix.chars() {
+        if !is_scope_token_char(c) {
+            return Err(ConfigError::InvalidScopePrefix(scope_prefix));
+        }
+    }
+    Ok(AuthConfig {
+        issuer,
+        audience,
+        jwks_url,
+        required: required.unwrap_or(true),
+        scope_prefix,
+    })
+}
+
+fn parse_auth_value(key: &'static str, value: Option<String>) -> Result<String, ConfigError> {
+    let Some(value) = value else {
+        return Err(ConfigError::MissingAuthKey(key));
+    };
+    if value.trim().is_empty() {
+        return Err(ConfigError::EmptyAuthKey(key));
+    }
+    for c in value.chars() {
+        if c.is_whitespace() {
+            return Err(ConfigError::AuthKeyWhitespace(key));
+        }
+    }
+    Ok(value)
+}
+
+fn parse_jwks_url(value: String) -> Result<Url, ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::InvalidJwksUrl {
+            value,
+            reason: "empty",
+        });
+    }
+    let url = match Url::parse(&value) {
+        Ok(url) => url,
+        Err(_) => {
+            return Err(ConfigError::InvalidJwksUrl {
+                value,
+                reason: "not an absolute URL",
+            });
+        }
+    };
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        _ => Err(ConfigError::InvalidJwksUrl {
+            value,
+            reason: "the scheme must be http or https",
+        }),
+    }
+}
+
+fn is_scope_token_char(c: char) -> bool {
+    c == '!' || ('#'..='[').contains(&c) || (']'..='~').contains(&c)
+}
+
 pub(crate) fn is_decimal(value: &str) -> bool {
     if value.is_empty() {
         return false;
@@ -1011,6 +1148,7 @@ mod tests {
                 places: Vec::new(),
                 remindctl: None,
                 mail: None,
+                auth: None,
             }
         );
     }
@@ -1996,5 +2134,193 @@ mod tests {
             panic!("unexpected error: {err:?}");
         };
         assert_eq!(source.kind(), io::ErrorKind::NotFound);
+    }
+
+    const AUTH_ISSUER: &str = "issuer = \"https://auth.example.com\"\n";
+    const AUTH_AUDIENCE: &str = "audience = \"https://eventkit-bridge\"\n";
+    const AUTH_JWKS: &str = "jwks_url = \"https://auth.example.com/jwks.json\"\n";
+
+    fn with_auth(auth: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!("listen = \"127.0.0.1:8790\"\n[auth]\n{auth}"))
+    }
+
+    fn auth_with(key: &str, line: &str) -> Result<Config, ConfigError> {
+        let mut auth = String::new();
+        for (name, default) in [
+            ("issuer", AUTH_ISSUER),
+            ("audience", AUTH_AUDIENCE),
+            ("jwks_url", AUTH_JWKS),
+        ] {
+            if name == key {
+                auth.push_str(line);
+            } else {
+                auth.push_str(default);
+            }
+        }
+        if key == "scope_prefix" {
+            auth.push_str(line);
+        }
+        with_auth(&auth)
+    }
+
+    #[test]
+    fn valid_auth_config() {
+        let config = with_auth(&format!(
+            "{AUTH_ISSUER}{AUTH_AUDIENCE}{AUTH_JWKS}required = false\nscope_prefix = \"eventkit/\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.auth,
+            Some(AuthConfig {
+                issuer: "https://auth.example.com".to_owned(),
+                audience: "https://eventkit-bridge".to_owned(),
+                jwks_url: Url::parse("https://auth.example.com/jwks.json").unwrap(),
+                required: false,
+                scope_prefix: "eventkit/".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn auth_defaults() {
+        let config = with_auth(&format!("{AUTH_ISSUER}{AUTH_AUDIENCE}{AUTH_JWKS}")).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.required);
+        assert_eq!(auth.scope_prefix, "bridge:");
+    }
+
+    #[test]
+    fn auth_absent() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        assert_eq!(config.auth, None);
+    }
+
+    #[test]
+    fn auth_http_jwks_url_accepted() {
+        let config = auth_with(
+            "jwks_url",
+            "jwks_url = \"http://10.0.0.5:9091/jwks.json\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.auth.unwrap().jwks_url.as_str(),
+            "http://10.0.0.5:9091/jwks.json"
+        );
+    }
+
+    #[test]
+    fn auth_missing_keys() {
+        for key in ["issuer", "audience", "jwks_url"] {
+            let err = auth_with(key, "").unwrap_err();
+            let ConfigError::MissingAuthKey(missing) = err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(missing, key);
+            assert_eq!(err.to_string(), format!("`auth.{key}` is required"));
+        }
+    }
+
+    #[test]
+    fn auth_blank_issuer() {
+        let err = auth_with("issuer", "issuer = \"  \"\n").unwrap_err();
+        let ConfigError::EmptyAuthKey("issuer") = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(err.to_string(), "`auth.issuer` must not be empty");
+    }
+
+    #[test]
+    fn auth_issuer_with_whitespace() {
+        let err = auth_with("issuer", "issuer = \"https://auth.example.com \"\n").unwrap_err();
+        let ConfigError::AuthKeyWhitespace("issuer") = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(err.to_string(), "`auth.issuer` must not contain whitespace");
+    }
+
+    #[test]
+    fn auth_blank_audience() {
+        let err = auth_with("audience", "audience = \"\"\n").unwrap_err();
+        let ConfigError::EmptyAuthKey("audience") = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(err.to_string(), "`auth.audience` must not be empty");
+    }
+
+    #[test]
+    fn auth_audience_with_whitespace() {
+        let err = auth_with("audience", "audience = \"event kit\"\n").unwrap_err();
+        let ConfigError::AuthKeyWhitespace("audience") = err else {
+            panic!("unexpected error: {err:?}");
+        };
+    }
+
+    #[test]
+    fn auth_invalid_jwks_url() {
+        for (value, reason) in [
+            ("/jwks.json", "not an absolute URL"),
+            (
+                "ftp://auth.example.com/jwks.json",
+                "the scheme must be http or https",
+            ),
+            ("", "empty"),
+            (" ", "empty"),
+        ] {
+            let err = auth_with("jwks_url", &format!("jwks_url = \"{value}\"\n")).unwrap_err();
+            let ConfigError::InvalidJwksUrl {
+                value: written,
+                reason: why,
+            } = &err
+            else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(written, value);
+            assert_eq!(*why, reason);
+            assert!(
+                err.to_string().starts_with("`auth.jwks_url` must be"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_invalid_scope_prefix() {
+        for value in ["bridge :", "bri\\\"dge:", "bri\\\\dge:", "brü:"] {
+            let err =
+                auth_with("scope_prefix", &format!("scope_prefix = \"{value}\"\n")).unwrap_err();
+            let ConfigError::InvalidScopePrefix(_) = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert!(err.to_string().contains("auth.scope_prefix"), "{err}");
+        }
+    }
+
+    #[test]
+    fn auth_empty_scope_prefix() {
+        let config = auth_with("scope_prefix", "scope_prefix = \"\"\n").unwrap();
+        assert_eq!(config.auth.unwrap().scope_prefix, "");
+    }
+
+    #[test]
+    fn auth_scope_prefix_edge_characters() {
+        let config = auth_with("scope_prefix", "scope_prefix = \"!#[]~:/\"\n").unwrap();
+        assert_eq!(config.auth.unwrap().scope_prefix, "!#[]~:/");
+    }
+
+    #[test]
+    fn auth_unknown_key() {
+        let err = auth_with("scope_prefix", "algorithms = [\"RS256\"]\n").unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(err.to_string().contains("algorithms"), "{err}");
+    }
+
+    #[test]
+    fn auth_required_wrong_type() {
+        let err = auth_with("scope_prefix", "required = \"yes\"\n").unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
     }
 }

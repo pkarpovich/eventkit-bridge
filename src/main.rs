@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
 
-use eventkit_bridge::config::{Config, MailAccount, MailConfig, Place};
+use eventkit_bridge::config::{AuthConfig, Config, MailAccount, MailConfig, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
 use eventkit_bridge::mail::script;
@@ -290,6 +290,7 @@ fn describe(path: &Path, config: &Config) -> String {
         places,
         remindctl: _,
         mail,
+        auth,
     } = config;
     let (ekctl, remindctl) = match executable::canonical() {
         Ok(executable) => (
@@ -340,7 +341,24 @@ fn describe(path: &Path, config: &Config) -> String {
         None => out.push_str("mail: off\n"),
         Some(mail) => out.push_str(&describe_mail(mail)),
     }
+    match auth {
+        None => out.push_str("auth: off\n"),
+        Some(auth) => out.push_str(&describe_auth(auth)),
+    }
     out
+}
+
+fn describe_auth(auth: &AuthConfig) -> String {
+    let AuthConfig {
+        issuer,
+        audience,
+        jwks_url,
+        required,
+        scope_prefix,
+    } = auth;
+    format!(
+        "auth: on\nauth issuer: {issuer}\nauth audience: {audience}\nauth jwks_url: {jwks_url}\nauth required: {required}\nauth scope_prefix: {scope_prefix:?}\n"
+    )
 }
 
 fn describe_mail(mail: &MailConfig) -> String {
@@ -520,7 +538,59 @@ mod tests {
     fn describe_mail_off() {
         let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
-        assert!(text.ends_with("mail: off\n"), "{text}");
+        assert!(text.contains("mail: off\n"), "{text}");
+    }
+
+    #[test]
+    fn describe_auth_off() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.ends_with("mail: off\nauth: off\n"), "{text}");
+    }
+
+    #[test]
+    fn describe_auth_on() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+
+            [auth]
+            issuer = "https://auth.example.com"
+            audience = "https://eventkit-bridge"
+            jwks_url = "https://auth.example.com/jwks.json"
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(
+            text.ends_with(
+                "auth: on\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth required: true\nauth scope_prefix: \"bridge:\"\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("auth: off"), "{text}");
+    }
+
+    #[test]
+    fn describe_auth_transition() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+
+            [auth]
+            issuer = "https://auth.example.com"
+            audience = "https://eventkit-bridge"
+            jwks_url = "https://auth.example.com/jwks.json"
+            required = false
+            scope_prefix = ""
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(
+            text.ends_with("auth required: false\nauth scope_prefix: \"\"\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -542,7 +612,7 @@ mod tests {
         );
         assert!(
             text.ends_with(
-                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\n"
+                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\nauth: off\n"
             ),
             "{text}"
         );

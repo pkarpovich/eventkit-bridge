@@ -154,10 +154,10 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 **Files:**
 - Modify: `src/config.rs`, `src/main.rs`
 
-- [ ] `RawAuth` with `deny_unknown_fields`, `AuthConfig { issuer, audience, jwks_url: url::Url, required, scope_prefix }`, every rule from Design, new `ConfigError` variants naming the key
-- [ ] `--check-config` output from Design
-- [ ] tests: full table; defaults for `required` and `scope_prefix`; absent table is `None`; blank issuer; issuer with whitespace; blank audience; `jwks_url` relative, `ftp://`, blank; `scope_prefix` with a space, a quote, a backslash; empty `scope_prefix` accepted; unknown key; `describe` output with and without `[auth]`
-- [ ] run tests, `mise run check`
+- [x] `RawAuth` with `deny_unknown_fields`, `AuthConfig { issuer, audience, jwks_url: url::Url, required, scope_prefix }`, every rule from Design, new `ConfigError` variants naming the key
+- [x] `--check-config` output from Design
+- [x] tests: full table; defaults for `required` and `scope_prefix`; absent table is `None`; blank issuer; issuer with whitespace; blank audience; `jwks_url` relative, `ftp://`, blank; `scope_prefix` with a space, a quote, a backslash; empty `scope_prefix` accepted; unknown key; `describe` output with and without `[auth]`
+- [x] run tests, `mise run check`
 
 ### Task 2: Token validation
 
