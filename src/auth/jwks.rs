@@ -557,6 +557,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn persisted_keys_serve_while_the_startup_fetch_keeps_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache(&dir, unix_now() - 600, &body(&[KID]));
+        let harness = Harness::in_dir(
+            dir,
+            vec![
+                Err(FetchError::Transport),
+                Err(FetchError::Status(502)),
+                Ok(body(&[KID, "key-2"])),
+            ],
+        );
+        let task = harness.spawn_refresh();
+
+        harness.wait_for(1, 1).await;
+        assert!(harness.jwks.keys().get(KID).is_some());
+        assert!((600..=601).contains(&harness.jwks.age().unwrap()));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        harness.wait_for(2, 1).await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        settle().await;
+        assert_eq!(harness.source.calls(), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        harness.wait_for(3, 2).await;
+        assert!(harness.jwks.age().unwrap() <= 1);
+
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn failed_persist_still_loads_the_keys() {
         let dir = tempfile::tempdir().unwrap();
         let source = Arc::new(ScriptedSource::new(vec![Ok(body(&[KID]))]));

@@ -220,9 +220,10 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] every row of the response table, the scope table and the JWKS cache rules has a test
-- [ ] every existing `server.rs` test still passes with `[auth]` absent
-- [ ] `mise run check` passes
+- [x] every row of the response table, the scope table and the JWKS cache rules has a test
+- [x] every existing `server.rs` test still passes with `[auth]` absent
+- [x] `mise run check` passes (the three cargo commands and `shellcheck` run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ The audit found one JWKS rule without a direct test: keys persisted from an earlier run must keep serving while the provider stays down at startup. Added `persisted_keys_serve_while_the_startup_fetch_keeps_failing` in `src/auth/jwks.rs`. It also checks that the startup retry stays at 30 s after a second failure.
 
 ### Task 6: Docs and version
 
