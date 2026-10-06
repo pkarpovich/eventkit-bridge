@@ -78,9 +78,8 @@ impl Priority {
     }
 }
 
-/// A repeat rule clients may set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// A repeat rule clients may set; it displays as `remindctl --repeat` spells it, such as `every 2 months`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeat {
     /// Every day.
     Daily,
@@ -92,17 +91,85 @@ pub enum Repeat {
     Monthly,
     /// Every year.
     Yearly,
+    /// Every two or more days, weeks, months or years.
+    Every(Interval),
 }
 
-impl Repeat {
-    /// The rule as `remindctl --repeat` spells it.
+impl fmt::Display for Repeat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Repeat::Daily => f.write_str("daily"),
+            Repeat::Weekly => f.write_str("weekly"),
+            Repeat::Biweekly => f.write_str("biweekly"),
+            Repeat::Monthly => f.write_str("monthly"),
+            Repeat::Yearly => f.write_str("yearly"),
+            Repeat::Every(Interval { count, unit }) => write!(f, "every {count} {}", unit.as_str()),
+        }
+    }
+}
+
+/// Two or more units between occurrences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interval {
+    count: u16,
+    unit: Unit,
+}
+
+impl Interval {
+    /// The longest interval, in units.
+    pub const MAX: u16 = 999;
+
+    /// An interval of `count` units, when `count` is 2 to [`Interval::MAX`].
+    pub fn new(count: u16, unit: Unit) -> Option<Interval> {
+        if !(2..=Self::MAX).contains(&count) {
+            return None;
+        }
+        Some(Interval { count, unit })
+    }
+}
+
+/// The unit of an [`Interval`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// Days.
+    Days,
+    /// Weeks.
+    Weeks,
+    /// Months.
+    Months,
+    /// Years.
+    Years,
+}
+
+impl Unit {
+    /// The plural name used in `every N <unit>`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Repeat::Daily => "daily",
-            Repeat::Weekly => "weekly",
-            Repeat::Biweekly => "biweekly",
-            Repeat::Monthly => "monthly",
-            Repeat::Yearly => "yearly",
+            Unit::Days => "days",
+            Unit::Weeks => "weeks",
+            Unit::Months => "months",
+            Unit::Years => "years",
+        }
+    }
+
+    /// The unit named by its plural, such as `months`.
+    pub fn parse(value: &str) -> Option<Unit> {
+        match value {
+            "days" => Some(Unit::Days),
+            "weeks" => Some(Unit::Weeks),
+            "months" => Some(Unit::Months),
+            "years" => Some(Unit::Years),
+            _other => None,
+        }
+    }
+
+    fn from_frequency(frequency: &str) -> Option<Unit> {
+        match frequency {
+            "daily" => Some(Unit::Days),
+            "weekly" => Some(Unit::Weeks),
+            "monthly" => Some(Unit::Months),
+            "yearly" => Some(Unit::Years),
+            _other => None,
         }
     }
 }
@@ -119,7 +186,7 @@ pub enum ReminderRepeat {
 impl Serialize for ReminderRepeat {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            ReminderRepeat::Rule(repeat) => serializer.serialize_str(repeat.as_str()),
+            ReminderRepeat::Rule(repeat) => serializer.collect_str(repeat),
             ReminderRepeat::Custom => serializer.serialize_str("custom"),
         }
     }
@@ -425,14 +492,27 @@ fn repeat(rule: &RcRecurrence) -> ReminderRepeat {
         frequency,
         interval,
     } = rule;
-    match (frequency.as_str(), interval) {
+    match (frequency.as_str(), *interval) {
         ("daily", 1) => ReminderRepeat::Rule(Repeat::Daily),
         ("weekly", 1) => ReminderRepeat::Rule(Repeat::Weekly),
         ("weekly", 2) => ReminderRepeat::Rule(Repeat::Biweekly),
         ("monthly", 1) => ReminderRepeat::Rule(Repeat::Monthly),
         ("yearly", 1) => ReminderRepeat::Rule(Repeat::Yearly),
-        (_, _) => ReminderRepeat::Custom,
+        (frequency, interval) => every(frequency, interval),
     }
+}
+
+fn every(frequency: &str, interval: u32) -> ReminderRepeat {
+    let Some(unit) = Unit::from_frequency(frequency) else {
+        return ReminderRepeat::Custom;
+    };
+    let Ok(count) = u16::try_from(interval) else {
+        return ReminderRepeat::Custom;
+    };
+    let Some(interval) = Interval::new(count, unit) else {
+        return ReminderRepeat::Custom;
+    };
+    ReminderRepeat::Rule(Repeat::Every(interval))
 }
 
 fn location(trigger: RcLocationTrigger, places: &[Place]) -> ReminderLocation {
@@ -561,7 +641,7 @@ mod tests {
             converted["location"],
             json!({"place": "shop", "proximity": "arriving"})
         );
-        assert_eq!(converted["repeat"], "custom");
+        assert_eq!(converted["repeat"], "every 3 days");
     }
 
     #[test]
@@ -636,10 +716,15 @@ mod tests {
             ("weekly", 2, ReminderRepeat::Rule(Repeat::Biweekly)),
             ("monthly", 1, ReminderRepeat::Rule(Repeat::Monthly)),
             ("yearly", 1, ReminderRepeat::Rule(Repeat::Yearly)),
-            ("daily", 2, ReminderRepeat::Custom),
-            ("weekly", 3, ReminderRepeat::Custom),
-            ("monthly", 6, ReminderRepeat::Custom),
+            ("daily", 2, every_rule(2, Unit::Days)),
+            ("weekly", 3, every_rule(3, Unit::Weeks)),
+            ("monthly", 2, every_rule(2, Unit::Months)),
+            ("monthly", 6, every_rule(6, Unit::Months)),
+            ("yearly", 999, every_rule(999, Unit::Years)),
+            ("yearly", 1000, ReminderRepeat::Custom),
+            ("monthly", 0, ReminderRepeat::Custom),
             ("hourly", 1, ReminderRepeat::Custom),
+            ("hourly", 2, ReminderRepeat::Custom),
         ];
         for (frequency, interval, expected) in cases {
             let rule = RcRecurrence {
@@ -648,6 +733,57 @@ mod tests {
             };
             assert_eq!(repeat(&rule), expected, "{frequency} {interval}");
         }
+    }
+
+    fn every_rule(count: u16, unit: Unit) -> ReminderRepeat {
+        ReminderRepeat::Rule(Repeat::Every(Interval::new(count, unit).unwrap()))
+    }
+
+    #[test]
+    fn repeat_display() {
+        let cases = [
+            (Repeat::Daily, "daily"),
+            (Repeat::Weekly, "weekly"),
+            (Repeat::Biweekly, "biweekly"),
+            (Repeat::Monthly, "monthly"),
+            (Repeat::Yearly, "yearly"),
+            (
+                Repeat::Every(Interval::new(2, Unit::Months).unwrap()),
+                "every 2 months",
+            ),
+            (
+                Repeat::Every(Interval::new(3, Unit::Days).unwrap()),
+                "every 3 days",
+            ),
+            (
+                Repeat::Every(Interval::new(10, Unit::Weeks).unwrap()),
+                "every 10 weeks",
+            ),
+            (
+                Repeat::Every(Interval::new(999, Unit::Years).unwrap()),
+                "every 999 years",
+            ),
+        ];
+        for (repeat, expected) in cases {
+            assert_eq!(repeat.to_string(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(every_rule(6, Unit::Months)).unwrap(),
+            "every 6 months"
+        );
+        assert_eq!(
+            serde_json::to_value(ReminderRepeat::Custom).unwrap(),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn interval_bounds() {
+        assert_eq!(Interval::new(0, Unit::Days), None);
+        assert_eq!(Interval::new(1, Unit::Days), None);
+        assert!(Interval::new(2, Unit::Days).is_some());
+        assert!(Interval::new(Interval::MAX, Unit::Days).is_some());
+        assert_eq!(Interval::new(Interval::MAX + 1, Unit::Days), None);
     }
 
     #[test]

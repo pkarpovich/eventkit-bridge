@@ -2509,7 +2509,7 @@ esac"#,
             reminders[3]["location"],
             json!({"place": "shop", "proximity": "arriving"})
         );
-        assert_eq!(reminders[3]["repeat"], json!("custom"));
+        assert_eq!(reminders[3]["repeat"], json!("every 3 days"));
         assert_eq!(
             reminders[4]["location"],
             json!({"place": null, "proximity": "leaving"})
@@ -2863,7 +2863,7 @@ esac"#,
         let bodies = [
             (
                 json!({"list": WRITE_ID, "title": "x", "due": "2026-10-07", "repeat": "hourly"}),
-                "`repeat` must be daily, weekly, biweekly, monthly or yearly",
+                "`repeat` must be daily, weekly, biweekly, monthly, yearly or every N days, weeks, months or years, with N from 2 to 999",
             ),
             (
                 json!({"list": WRITE_ID, "title": "x", "place": "shop", "proximity": "near"}),
@@ -3133,7 +3133,7 @@ esac"#,
             ),
             (
                 json!({"repeat": "hourly"}),
-                "`repeat` must be daily, weekly, biweekly, monthly or yearly",
+                "`repeat` must be daily, weekly, biweekly, monthly, yearly or every N days, weeks, months or years, with N from 2 to 999",
             ),
             (
                 json!({"notes": "a\rb"}),
