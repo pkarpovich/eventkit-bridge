@@ -8,7 +8,7 @@ use crate::mail::MessageId;
 use crate::mail::store::{Cursor, CursorError, DEFAULT_LIMIT, MAX_LIMIT, MessageQuery, ReadFilter};
 use crate::model::Event;
 use crate::remindctl::{Change, Completion, NewReminder, ReminderChanges, ShowFilter, Trigger};
-use crate::reminders_model::{Due, Priority, Proximity, RcReminder, Repeat};
+use crate::reminders_model::{Due, Interval, Priority, Proximity, RcReminder, Repeat, Unit};
 
 const MAX_SPAN_DAYS: i64 = 62;
 const MAX_TITLE: usize = 500;
@@ -745,10 +745,29 @@ fn parse_repeat(value: &str) -> Result<Repeat, Invalid> {
         "biweekly" => Ok(Repeat::Biweekly),
         "monthly" => Ok(Repeat::Monthly),
         "yearly" => Ok(Repeat::Yearly),
-        _other => Err(Invalid::new(
-            "`repeat` must be daily, weekly, biweekly, monthly or yearly",
-        )),
+        other => parse_every(other).ok_or_else(|| {
+            Invalid::new(
+                "`repeat` must be daily, weekly, biweekly, monthly, yearly or every N days, weeks, months or years, with N from 2 to 999",
+            )
+        }),
     }
+}
+
+fn parse_every(value: &str) -> Option<Repeat> {
+    let rest = value.strip_prefix("every ")?;
+    let (count, unit) = rest.split_once(' ')?;
+    if count.starts_with('0') {
+        return None;
+    }
+    for byte in count.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+    }
+    let count = count.parse::<u16>().ok()?;
+    let unit = Unit::parse(unit)?;
+    let interval = Interval::new(count, unit)?;
+    Some(Repeat::Every(interval))
 }
 
 fn parse_priority(value: &str) -> Result<Priority, Invalid> {
@@ -1599,6 +1618,80 @@ mod tests {
             message(update_reminder_body(&body(json!({"priority": null})))),
             "the update changes no field"
         );
+    }
+
+    #[test]
+    fn repeat_values() {
+        let accepted = [
+            ("daily", Repeat::Daily),
+            ("weekly", Repeat::Weekly),
+            ("biweekly", Repeat::Biweekly),
+            ("monthly", Repeat::Monthly),
+            ("yearly", Repeat::Yearly),
+            (
+                "every 2 days",
+                Repeat::Every(Interval::new(2, Unit::Days).unwrap()),
+            ),
+            (
+                "every 2 weeks",
+                Repeat::Every(Interval::new(2, Unit::Weeks).unwrap()),
+            ),
+            (
+                "every 2 months",
+                Repeat::Every(Interval::new(2, Unit::Months).unwrap()),
+            ),
+            (
+                "every 6 months",
+                Repeat::Every(Interval::new(6, Unit::Months).unwrap()),
+            ),
+            (
+                "every 999 years",
+                Repeat::Every(Interval::new(999, Unit::Years).unwrap()),
+            ),
+        ];
+        for (value, expected) in accepted {
+            assert_eq!(parse_repeat(value).unwrap(), expected, "{value}");
+        }
+        let rejected = [
+            "",
+            "hourly",
+            "Monthly",
+            "every 1 months",
+            "every 0 months",
+            "every 1000 days",
+            "every 02 months",
+            "every +2 months",
+            "every -2 months",
+            "every 2 month",
+            "every 2 Months",
+            "every 2 hours",
+            "every  2 months",
+            "every 2  months",
+            "every 2 months ",
+            " every 2 months",
+            "every two months",
+            "every 2",
+            "every months",
+            "every 99999999999999999999 days",
+        ];
+        for value in rejected {
+            assert!(
+                message(parse_repeat(value)).starts_with("`repeat` must be daily"),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_in_bodies() {
+        let changes = update_reminder_body(&body(json!({"repeat": "every 2 months"}))).unwrap();
+        assert_eq!(
+            changes.repeat,
+            Some(Change::Set(Repeat::Every(
+                Interval::new(2, Unit::Months).unwrap()
+            )))
+        );
+        assert!(update_reminder_body(&body(json!({"repeat": "every 1 months"}))).is_err());
     }
 
     #[test]

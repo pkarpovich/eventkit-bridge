@@ -322,7 +322,7 @@ fn add(reminder: &NewReminder) -> Invocation {
     invocation.option("list-id", list.as_str());
     invocation.optional("notes", notes.as_deref());
     invocation.optional("due", due.map(|due| due.to_string()).as_deref());
-    invocation.optional("repeat", repeat.map(Repeat::as_str));
+    invocation.optional("repeat", repeat.map(|repeat| repeat.to_string()).as_deref());
     invocation.optional("priority", priority.map(Priority::as_str));
     if let Some(trigger) = location {
         trigger_options(&mut invocation, trigger);
@@ -374,7 +374,7 @@ fn edit(id: &ReminderId, changes: &ReminderChanges) -> Invocation {
     }
     match repeat {
         None => {}
-        Some(Change::Set(repeat)) => invocation.option("repeat", repeat.as_str()),
+        Some(Change::Set(repeat)) => invocation.option("repeat", &repeat.to_string()),
         Some(Change::Clear) => invocation.flag("no-repeat"),
     }
     invocation.optional("priority", priority.map(Priority::as_str));
@@ -552,6 +552,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::fake_ekctl::{Fake, fixture};
+    use crate::reminders_model::{Interval, Unit};
     use crate::subprocess::{STDERR_TAIL, STDOUT_CAP};
 
     const WRITE_LIST: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
@@ -722,6 +723,36 @@ mod tests {
                 "--repeat=yearly",
                 "--priority=none",
                 "--complete",
+                "--",
+                REMINDER,
+            ])
+        );
+    }
+
+    #[test]
+    fn repeat_interval_argv() {
+        let every_two_months = Repeat::Every(Interval::new(2, Unit::Months).unwrap());
+        let reminder = NewReminder {
+            due: Some(Due::Day(NaiveDate::from_ymd_opt(2026, 11, 3).unwrap())),
+            repeat: Some(every_two_months),
+            ..new_reminder()
+        };
+        assert!(
+            add(&reminder)
+                .args
+                .contains(&"--repeat=every 2 months".to_owned())
+        );
+        let changes = ReminderChanges {
+            repeat: Some(Change::Set(every_two_months)),
+            ..ReminderChanges::default()
+        };
+        assert_eq!(
+            edit(&reminder_id(), &changes).args,
+            strings(&[
+                "edit",
+                "--json",
+                "--no-input",
+                "--repeat=every 2 months",
                 "--",
                 REMINDER,
             ])

@@ -396,7 +396,7 @@ A reminder:
 ```
 
 - `due` is `null` without a due date. A timed reminder's `due` is RFC 3339 in the Mac's time zone. An all-day reminder's `due` is `YYYY-MM-DD` with `all_day: true`. `completed_at` is RFC 3339 in the Mac's time zone, or `null`.
-- `repeat` is `null` or one of `daily`, `weekly`, `biweekly`, `monthly` and `yearly`. A rule set elsewhere with another frequency or interval is reported as `custom`.
+- `repeat` is `null`, one of `daily`, `weekly`, `biweekly`, `monthly` and `yearly`, or `every N days`, `every N weeks`, `every N months` or `every N years` for an interval of 2 to 999 units (every two weeks reads as `biweekly`). `remindctl` reports only a rule's frequency and interval, so a rule set elsewhere that also picks days, such as "monthly on the fourth weekday" or "every 2 months on the last weekend day", reads as its frequency and interval alone (`monthly`, `every 2 months`). A rule with any other frequency or interval is reported as `custom`.
 - `priority` is `none`, `low`, `medium` or `high`.
 - `location` is `null` without a location trigger. `place` is the config name whose address matches the trigger; a trigger that matches no configured place, such as one set on a phone, has `"place": null` and only its `proximity`. Addresses and coordinates are never returned.
 
@@ -467,7 +467,7 @@ curl -X POST http://100.64.0.1:8790/v1/reminders \
 | `title` | Required. Not blank, at most 500 characters. |
 | `notes` | At most 10 000 characters. |
 | `due` | An RFC 3339 date-time with an offset and whole seconds, which makes a timed reminder that notifies at that time, or `YYYY-MM-DD`, which makes an all-day reminder without a notification. |
-| `repeat` | `daily`, `weekly`, `biweekly`, `monthly` or `yearly`. Needs `due`. |
+| `repeat` | `daily`, `weekly`, `biweekly`, `monthly`, `yearly`, or `every N days`, `every N weeks`, `every N months` or `every N years` with N from 2 to 999, spelled exactly so (lowercase, one space, plural unit). Needs `due`. |
 | `priority` | `none`, `low`, `medium` or `high`. |
 | `place` | The name of a configured place, which adds a location trigger. Geocoding the place's address needs the Mac to be online. |
 | `proximity` | `arriving` (default) or `leaving`. Only allowed with `place`. |
@@ -492,7 +492,7 @@ Deletes a reminder in a write list and answers `204` with no body. The same look
 
 ### Not available
 
-Reminder sections, tags, subtasks, smart lists, the Groceries list type and the Urgent toggle have no public EventKit API, so neither `remindctl` nor the bridge can read or set them. Alarms separate from the due time, URLs, custom repeat rules, moving a reminder between lists, and creating or renaming lists are not supported either.
+Reminder sections, tags, subtasks, smart lists, the Groceries list type and the Urgent toggle have no public EventKit API, so neither `remindctl` nor the bridge can read or set them. Alarms separate from the due time, URLs, repeat rules that pick days (such as "the fourth weekday of the month" or "the last weekend day"), moving a reminder between lists, and creating or renaming lists are not supported either.
 
 ## Mail API
 
@@ -622,7 +622,7 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.4.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95}
+{"status":"ok","version":"0.5.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95}
 ```
 
 `calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config.
