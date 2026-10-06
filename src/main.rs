@@ -14,6 +14,7 @@ use tracing::Level;
 use eventkit_bridge::config::{Config, MailAccount, MailConfig, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
+use eventkit_bridge::mail::script;
 use eventkit_bridge::remindctl;
 use eventkit_bridge::server::{self, App, Runners, SHUTDOWN_GRACE};
 use eventkit_bridge::service::{
@@ -140,6 +141,7 @@ fn run_daemon() -> Result<(), String> {
     let runners = Runners {
         calendars,
         reminders,
+        mail: script::Runner::new(PathBuf::from(script::OSASCRIPT), script::DEADLINE),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -597,6 +599,7 @@ mod tests {
         let runners = Runners {
             calendars,
             reminders,
+            mail: script::Runner::new(dir.path().join("osascript"), script::DEADLINE),
         };
         let result = daemon(config, runners, std::future::pending()).await;
         let Err(message) = result else {
