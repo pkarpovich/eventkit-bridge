@@ -27,6 +27,10 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_LIMIT: u32 = 25;
 /// The largest page a client may ask for.
 pub const MAX_LIMIT: u32 = 100;
+/// The junk mailbox paths, in order of preference, each matched against a whole path ignoring case.
+pub const JUNK_MAILBOXES: [&str; 5] = ["[Gmail]/Spam", "Junk Email", "Junk E-mail", "Junk", "Spam"];
+/// The inbox path, matched against a whole path ignoring case.
+pub const INBOX_MAILBOX: &str = "INBOX";
 
 const RECIPIENT_TO: i64 = 0;
 const RECIPIENT_CC: i64 = 1;
@@ -68,6 +72,12 @@ LEFT JOIN addresses a ON a.ROWID = m.sender
 WHERE m.ROWID = :id
   AND m.deleted IS NOT 1
   AND m.mailbox IN rarray(:mailboxes)";
+
+const MESSAGE_MAILBOX_SQL: &str = "
+SELECT mailbox FROM messages
+WHERE ROWID = :id
+  AND deleted IS NOT 1
+  AND mailbox IN rarray(:mailboxes)";
 
 const RECIPIENTS_SQL: &str = "
 SELECT r.message, r.type, a.address, a.comment
@@ -416,6 +426,37 @@ pub struct Message {
     pub partial: bool,
     /// The attachments, without their contents.
     pub attachments: Vec<Attachment>,
+}
+
+/// Whether a mailbox shows through the bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// No `mail.exclude_mailboxes` entry names it.
+    Visible,
+    /// `mail.exclude_mailboxes` names it.
+    Excluded,
+}
+
+/// A mailbox a message can be moved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveTarget {
+    /// The decoded path, in the case Mail stores it.
+    pub path: String,
+    /// Whether the bridge shows the mailbox.
+    pub visibility: Visibility,
+}
+
+/// Where a visible message is, with its account's junk mailbox and inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePlace {
+    /// The configured account holding the message.
+    pub account: MailAccount,
+    /// The decoded path of its mailbox, in the case Mail stores it.
+    pub mailbox: String,
+    /// The account's junk mailbox: the first of [`JUNK_MAILBOXES`] it has.
+    pub junk: Option<MoveTarget>,
+    /// The account's inbox: [`INBOX_MAILBOX`] in whatever case it is stored.
+    pub inbox: Option<MoveTarget>,
 }
 
 /// What `/healthz` reports about the mail store.
@@ -774,6 +815,55 @@ impl MailReader<'_> {
         }))
     }
 
+    /// Where the visible message `id` is and where it can be moved; `None` when it is deleted,
+    /// excluded, in an unconfigured account or unknown.
+    pub fn place(&self, id: MessageId) -> Result<Option<MessagePlace>, StoreError> {
+        let mailboxes = self.visible_mailboxes()?;
+        let mut ids = Vec::new();
+        for mailbox in &mailboxes {
+            ids.push(Value::from(mailbox.id));
+        }
+        let mut stmt = self.conn.prepare_cached(MESSAGE_MAILBOX_SQL)?;
+        let mailbox: Option<i64> = stmt
+            .query_row(
+                named_params! { ":id": id.get(), ":mailboxes": Rc::new(ids) },
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(mailbox) = mailbox else {
+            return Ok(None);
+        };
+        let Some(mailbox) = find_mailbox(&mailboxes, mailbox) else {
+            return Ok(None);
+        };
+        let mut paths = Vec::new();
+        for MailboxRecord {
+            id: _,
+            url,
+            total: _,
+            unread: _,
+        } in self.mailbox_records()?
+        {
+            if url.account == mailbox.account.id {
+                paths.push(url.path.to_string());
+            }
+        }
+        let mut junk = None;
+        for candidate in JUNK_MAILBOXES {
+            let Some(target) = self.target(&paths, candidate) else {
+                continue;
+            };
+            junk = Some(target);
+            break;
+        }
+        Ok(Some(MessagePlace {
+            account: mailbox.account.clone(),
+            mailbox: mailbox.display.clone(),
+            junk,
+            inbox: self.target(&paths, INBOX_MAILBOX),
+        }))
+    }
+
     /// Every account in the `mailboxes` table with its counts, the configured name and, when
     /// `Accounts4.sqlite` is readable, its type and description.
     pub fn listing(&self) -> Result<Vec<AccountListing>, StoreError> {
@@ -1013,6 +1103,24 @@ impl MailReader<'_> {
             return Err(StoreError::UnknownMailbox(path.clone()));
         }
         Ok(selected)
+    }
+
+    fn target(&self, paths: &[String], wanted: &str) -> Option<MoveTarget> {
+        let wanted = wanted.to_lowercase();
+        for path in paths {
+            if path.to_lowercase() != wanted {
+                continue;
+            }
+            let visibility = match self.config.is_excluded(path) {
+                true => Visibility::Excluded,
+                false => Visibility::Visible,
+            };
+            return Some(MoveTarget {
+                path: path.clone(),
+                visibility,
+            });
+        }
+        None
     }
 
     fn recipients(
@@ -2269,5 +2377,179 @@ mod tests {
         assert_eq!(AccountKind::Exchange.to_string(), "exchange");
         assert_eq!(AccountKind::Imap.to_string(), "imap");
         assert_eq!(AccountKind::Local.to_string(), "local");
+    }
+
+    fn place(config: MailConfig, id: i64) -> Option<MessagePlace> {
+        let store = MailStore::new(config);
+        store.open().unwrap().place(message_id(id)).unwrap()
+    }
+
+    fn add_mailbox(fixture: &Fixture, id: i64, url: String) {
+        fixture.mailbox(&MailboxRow {
+            id,
+            url,
+            total: 0,
+            unread: 0,
+        });
+    }
+
+    fn target(path: &str, visibility: Visibility) -> Option<MoveTarget> {
+        Some(MoveTarget {
+            path: path.to_owned(),
+            visibility,
+        })
+    }
+
+    fn account(id: &str, value: &str) -> MailAccount {
+        MailAccount {
+            id: AccountId::parse(id).unwrap(),
+            name: name(value),
+        }
+    }
+
+    #[test]
+    fn place_finds_the_gmail_spam_mailbox_and_inbox() {
+        let fixture = Fixture::standard();
+        assert_eq!(
+            place(fixture.config(), fixture::MULTIPART),
+            Some(MessagePlace {
+                account: account(fixture::GMAIL, "gmail"),
+                mailbox: "INBOX".to_owned(),
+                junk: target("[Gmail]/Spam", Visibility::Excluded),
+                inbox: target("INBOX", Visibility::Visible),
+            })
+        );
+        let found = place(fixture.config(), fixture::MULTIPART_ALL_MAIL).unwrap();
+        assert_eq!(found.mailbox, "[Gmail]/All Mail");
+        assert_eq!(found.junk, target("[Gmail]/Spam", Visibility::Excluded));
+    }
+
+    #[test]
+    fn place_finds_the_exchange_junk_email_mailbox_and_inbox() {
+        let fixture = Fixture::standard();
+        add_mailbox(
+            &fixture,
+            20,
+            format!("ews://{}/Junk%20Email", fixture::MAIN),
+        );
+        assert_eq!(
+            place(fixture.config(), fixture::PLAIN),
+            Some(MessagePlace {
+                account: account(fixture::MAIN, "main"),
+                mailbox: "Inbox".to_owned(),
+                junk: target("Junk Email", Visibility::Excluded),
+                inbox: target("Inbox", Visibility::Visible),
+            })
+        );
+    }
+
+    #[test]
+    fn place_finds_the_icloud_junk_mailbox() {
+        let fixture = Fixture::standard();
+        add_mailbox(&fixture, 20, format!("imap://{}/Junk", fixture::OTHER));
+        let mut config = fixture.config();
+        config.accounts.push(account(fixture::OTHER, "icloud"));
+        assert_eq!(
+            place(config, fixture::UNCONFIGURED),
+            Some(MessagePlace {
+                account: account(fixture::OTHER, "icloud"),
+                mailbox: "INBOX".to_owned(),
+                junk: target("Junk", Visibility::Excluded),
+                inbox: target("INBOX", Visibility::Visible),
+            })
+        );
+    }
+
+    #[test]
+    fn place_without_a_junk_mailbox_has_no_junk_target() {
+        let fixture = Fixture::standard();
+        let found = place(fixture.config(), fixture::PLAIN).unwrap();
+        assert_eq!(found.junk, None);
+        assert_eq!(found.inbox, target("Inbox", Visibility::Visible));
+    }
+
+    #[test]
+    fn place_without_an_inbox_has_no_inbox_target() {
+        let fixture = Fixture::empty();
+        add_mailbox(
+            &fixture,
+            1,
+            format!("imap://{}/%5BGmail%5D/All%20Mail", fixture::GMAIL),
+        );
+        add_mailbox(&fixture, 2, format!("imap://{}/INBOX", fixture::OTHER));
+        add_mailbox(&fixture, 3, format!("imap://{}/Spam", fixture::OTHER));
+        fixture.insert(&Row::new(10, 1, fixture::T));
+        let found = place(fixture.config(), 10).unwrap();
+        assert_eq!(found.mailbox, "[Gmail]/All Mail");
+        assert_eq!(found.junk, None);
+        assert_eq!(found.inbox, None);
+    }
+
+    #[test]
+    fn place_matches_the_whole_mailbox_path() {
+        let fixture = Fixture::empty();
+        add_mailbox(&fixture, 1, format!("imap://{}/Notes", fixture::MAIN));
+        for (id, path) in [
+            (2, "Archive/Spam"),
+            (3, "Spam%20Archive"),
+            (4, "Old%20Junk"),
+            (5, "INBOX/Receipts"),
+            (6, "Archive/INBOX"),
+        ] {
+            add_mailbox(&fixture, id, format!("imap://{}/{path}", fixture::MAIN));
+        }
+        fixture.insert(&Row::new(10, 1, fixture::T));
+        let found = place(fixture.config(), 10).unwrap();
+        assert_eq!(found.mailbox, "Notes");
+        assert_eq!(found.junk, None);
+        assert_eq!(found.inbox, None);
+    }
+
+    #[test]
+    fn place_prefers_the_earlier_junk_candidate_in_its_stored_case() {
+        let fixture = Fixture::standard();
+        add_mailbox(&fixture, 20, format!("ews://{}/SPAM", fixture::MAIN));
+        add_mailbox(&fixture, 21, format!("ews://{}/junk", fixture::MAIN));
+        let found = place(fixture.config(), fixture::PLAIN).unwrap();
+        assert_eq!(found.junk, target("junk", Visibility::Excluded));
+        add_mailbox(
+            &fixture,
+            22,
+            format!("ews://{}/Junk%20E-mail", fixture::MAIN),
+        );
+        let found = place(fixture.config(), fixture::PLAIN).unwrap();
+        assert_eq!(found.junk, target("Junk E-mail", Visibility::Visible));
+    }
+
+    #[test]
+    fn place_reports_a_target_left_visible_by_the_config() {
+        let fixture = Fixture::standard();
+        let mut config = fixture.config();
+        config.exclude_mailboxes = Vec::new();
+        let found = place(config.clone(), fixture::IN_SPAM).unwrap();
+        assert_eq!(found.mailbox, "[Gmail]/Spam");
+        assert_eq!(found.junk, target("[Gmail]/Spam", Visibility::Visible));
+        assert_eq!(found.inbox, target("INBOX", Visibility::Visible));
+        config.exclude_mailboxes = vec!["inbox".to_owned()];
+        let found = place(config, fixture::MULTIPART_ALL_MAIL).unwrap();
+        assert_eq!(found.inbox, target("INBOX", Visibility::Excluded));
+    }
+
+    #[test]
+    fn place_hides_every_invisible_row() {
+        let fixture = Fixture::standard();
+        for id in [
+            fixture::IN_DELETED_ITEMS,
+            fixture::DELETED_ROW,
+            fixture::UNCONFIGURED,
+            fixture::IN_SPAM,
+            fixture::IN_CRAFTED,
+            999_999,
+        ] {
+            assert_eq!(place(fixture.config(), id), None, "{id}");
+        }
+        let mut config = fixture.config();
+        config.accounts = Vec::new();
+        assert_eq!(place(config, fixture::PLAIN), None);
     }
 }

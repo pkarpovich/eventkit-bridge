@@ -1,4 +1,5 @@
 pub mod emlx;
+pub mod script;
 pub mod store;
 
 #[cfg(test)]

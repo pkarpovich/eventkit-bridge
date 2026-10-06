@@ -5,6 +5,7 @@ use url::Url;
 use crate::config::{AccountName, CalendarId, ListId, Place};
 use crate::ekctl::{EventChanges, EventRange, FreeQuery, NewEvent, Weekdays, WorkingHours};
 use crate::mail::MessageId;
+use crate::mail::script::JunkStatus;
 use crate::mail::store::{Cursor, CursorError, DEFAULT_LIMIT, MAX_LIMIT, MessageQuery, ReadFilter};
 use crate::model::Event;
 use crate::remindctl::{Change, Completion, NewReminder, ReminderChanges, ShowFilter, Trigger};
@@ -666,6 +667,27 @@ pub fn mail_message_id(value: &str) -> Result<MessageId, Invalid> {
         return Err(Invalid::new("message id must be a positive integer"));
     };
     Ok(id)
+}
+
+/// The body of `PATCH /v1/mail/messages/{id}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailJunkBody {
+    /// Whether the message is junk.
+    pub junk: bool,
+}
+
+/// Parses a `PATCH /v1/mail/messages/{id}` body, whose only and required field is `junk`.
+pub fn mail_junk_body(body: &[u8]) -> Result<JunkStatus, Invalid> {
+    let body: serde_json::Value = parse_json(body)?;
+    if !body.is_object() {
+        return Err(Invalid::new("invalid JSON body: expected an object"));
+    }
+    let MailJunkBody { junk } = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
+    };
+    Ok(JunkStatus::from(junk))
 }
 
 /// The body of `POST /v1/reminders`.
@@ -1829,6 +1851,49 @@ mod tests {
                 "message id must be a positive integer",
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn mail_junk_body_takes_one_boolean() {
+        assert_eq!(
+            mail_junk_body(&body(json!({"junk": true}))),
+            Ok(JunkStatus::Junk)
+        );
+        assert_eq!(
+            mail_junk_body(&body(json!({"junk": false}))),
+            Ok(JunkStatus::NotJunk)
+        );
+    }
+
+    #[test]
+    fn mail_junk_body_refuses_everything_else() {
+        let cases = [
+            (b"".to_vec(), "invalid JSON body: EOF while parsing"),
+            (body(json!({})), "invalid JSON body: missing field `junk`"),
+            (
+                body(json!({"junk": null})),
+                "invalid JSON body: invalid type: null, expected a boolean",
+            ),
+            (
+                body(json!({"junk": "true"})),
+                "invalid JSON body: invalid type: string \"true\", expected a boolean",
+            ),
+            (
+                body(json!({"junk": 1})),
+                "invalid JSON body: invalid type: integer `1`, expected a boolean",
+            ),
+            (
+                body(json!({"junk": true, "mailbox": "Archive"})),
+                "invalid JSON body: unknown field `mailbox`",
+            ),
+            (body(json!([true])), "invalid JSON body: expected an object"),
+            (b"null".to_vec(), "invalid JSON body: expected an object"),
+            (b"junk=true".to_vec(), "invalid JSON body: expected value"),
+        ];
+        for (input, expected) in cases {
+            let message = message(mail_junk_body(&input));
+            assert!(message.starts_with(expected), "{message}");
         }
     }
 }

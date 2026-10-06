@@ -21,11 +21,16 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{self, Instant};
 
-use crate::config::{Config, HostName, Place};
+use crate::config::{AccountName, Config, HostName, Place};
 use crate::ekctl::{self, EkctlError};
 use crate::health::{HEALTH_TTL, HealthCheck, Probe};
+use crate::mail::MessageId;
 use crate::mail::emlx::EmlxError;
-use crate::mail::store::{AccountListing, MailReader, MailStore, RegisteredAccount, StoreError};
+use crate::mail::script::{self, JunkMove, JunkStatus, Moved, ScriptError};
+use crate::mail::store::{
+    AccountListing, MailReader, MailStore, MessagePlace, MoveTarget, RegisteredAccount, StoreError,
+    Visibility,
+};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
 use crate::policy::{GuardError, Policy, PolicyError, ReminderGuardError};
 use crate::remindctl::{self, RemindctlError};
@@ -86,13 +91,15 @@ impl KnownHosts {
     }
 }
 
-/// The runners for the two EventKit CLIs; they share one lock.
+/// The runners for the two EventKit CLIs, which share one lock, and for Mail's `osascript`.
 #[derive(Debug)]
 pub struct Runners {
     /// Runs `ekctl` for calendars.
     pub calendars: ekctl::Runner,
     /// Runs `remindctl` for reminders.
     pub reminders: remindctl::Runner,
+    /// Runs `osascript` to mark mail junk or not junk.
+    pub mail: script::Runner,
 }
 
 /// The state every route shares.
@@ -105,10 +112,24 @@ pub struct App {
     health: HealthCheck,
     hosts: KnownHosts,
     mail: Option<Arc<MailStore>>,
+    mail_script: script::Runner,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Rows(usize);
+
+#[derive(Debug)]
+struct JunkRequest {
+    place: MessagePlace,
+    id: MessageId,
+    status: JunkStatus,
+}
+
+#[derive(Debug, Clone)]
+struct JunkWrite {
+    account: AccountName,
+    status: JunkStatus,
+}
 
 impl App {
     /// The bridge for `config`, running `ekctl` and `remindctl` through `runners`.
@@ -116,6 +137,7 @@ impl App {
         let Runners {
             calendars,
             reminders,
+            mail: mail_script,
         } = runners;
         Self {
             runner: calendars,
@@ -131,6 +153,7 @@ impl App {
                 .mail
                 .clone()
                 .map(|mail| Arc::new(MailStore::new(mail))),
+            mail_script,
         }
     }
 
@@ -263,7 +286,14 @@ enum ApiError {
     Ekctl(EkctlError),
     Remindctl(RemindctlError),
     Mail(StoreError),
+    MailScript(ScriptError),
     Status(StatusCode, String),
+}
+
+impl From<ScriptError> for ApiError {
+    fn from(err: ScriptError) -> Self {
+        ApiError::MailScript(err)
+    }
 }
 
 impl From<StoreError> for ApiError {
@@ -363,6 +393,7 @@ impl IntoResponse for ApiError {
             ApiError::Ekctl(err) => (ekctl_status(&err), err.to_string()),
             ApiError::Remindctl(err) => (remindctl_status(&err), err.to_string()),
             ApiError::Mail(err) => mail_failure(err),
+            ApiError::MailScript(err) => mail_script_failure(err),
             ApiError::Status(status, message) => (status, message),
         };
         (status, Json(json!({"error": message}))).into_response()
@@ -399,6 +430,26 @@ fn mail_failure(err: StoreError) -> (StatusCode, String) {
                 format!("cannot read the message file: {reason}"),
             )
         }
+    }
+}
+
+fn mail_script_failure(err: ScriptError) -> (StatusCode, String) {
+    tracing::warn!(error = %err, "Mail call failed");
+    match err {
+        ScriptError::NotPermitted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Mail automation not permitted: allow EventKitBridge to control Mail in System Settings > Privacy & Security > Automation".to_owned(),
+        ),
+        ScriptError::NotFound => (StatusCode::NOT_FOUND, "message not found".to_owned()),
+        ScriptError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "Mail did not answer".to_owned(),
+        ),
+        ScriptError::Spawn(_)
+        | ScriptError::Io(_)
+        | ScriptError::OutputTooLarge
+        | ScriptError::Failed { code: _ }
+        | ScriptError::UnexpectedOutput => (StatusCode::BAD_GATEWAY, "Mail failed".to_owned()),
     }
 }
 
@@ -458,7 +509,10 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/v1/mail/accounts", get(mail_accounts))
         .route("/v1/mail/messages", get(mail_messages))
-        .route("/v1/mail/messages/{id}", get(mail_message))
+        .route(
+            "/v1/mail/messages/{id}",
+            get(mail_message).patch(mark_mail_junk.layer(middleware::from_fn(require_json))),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -527,7 +581,22 @@ async fn log_request(request: Request, next: Next) -> Response {
     let ekctl = joined(ekctl_calls.calls());
     let remindctl = joined(remindctl_calls.calls());
     let rows = response.extensions().get::<Rows>().map(|Rows(rows)| *rows);
-    tracing::info!(%method, %route, status, duration_ms, ekctl, remindctl, rows, "request");
+    let (account, junk) = match response.extensions().get::<JunkWrite>() {
+        Some(JunkWrite { account, status }) => (Some(account.to_string()), Some(status.is_junk())),
+        None => (None, None),
+    };
+    tracing::info!(
+        %method,
+        %route,
+        status,
+        duration_ms,
+        ekctl,
+        remindctl,
+        rows,
+        account,
+        junk,
+        "request"
+    );
     response
 }
 
@@ -844,6 +913,71 @@ async fn mail_message(
     Ok(with_rows(1, Json(message)))
 }
 
+async fn mark_mail_junk(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let Path(id) = id?;
+    let id = request::mail_message_id(&id)?;
+    let status = request::mail_junk_body(&body?)?;
+    let place = read_mail(store, move |reader| reader.place(id)).await?;
+    let Some(place) = place else {
+        return Err(ApiError::Status(
+            StatusCode::NOT_FOUND,
+            "message not found".to_owned(),
+        ));
+    };
+    let logged = JunkWrite {
+        account: place.account.name.clone(),
+        status,
+    };
+    let request = JunkRequest { place, id, status };
+    let mut response = match move_junk(&app.mail_script, request).await {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    };
+    response.extensions_mut().insert(logged);
+    Ok(response)
+}
+
+async fn move_junk(runner: &script::Runner, request: JunkRequest) -> Result<Response, ApiError> {
+    let JunkRequest { place, id, status } = request;
+    let MessagePlace {
+        account,
+        mailbox,
+        junk,
+        inbox,
+    } = place;
+    let (target, missing) = match status {
+        JunkStatus::Junk => (junk, "account has no junk mailbox"),
+        JunkStatus::NotJunk => (inbox, "account has no inbox"),
+    };
+    let Some(MoveTarget { path, visibility }) = target else {
+        return Err(ApiError::Status(StatusCode::CONFLICT, missing.to_owned()));
+    };
+    let request = JunkMove {
+        account: account.id,
+        source: mailbox,
+        id,
+        target: path,
+        status,
+    };
+    let Moved(moved) = runner.junk(&request).await?;
+    let id = match visibility {
+        Visibility::Visible => moved,
+        Visibility::Excluded => None,
+    };
+    Ok(Json(json!({
+        "id": id,
+        "account": account.name,
+        "mailbox": request.target,
+        "junk": status.is_junk(),
+    }))
+    .into_response())
+}
+
 async fn empty_event_id() -> ApiError {
     ApiError::BadRequest(InvalidEventId::Empty.to_string())
 }
@@ -917,7 +1051,15 @@ mod tests {
         Runners {
             calendars: runner,
             reminders,
+            mail: no_osascript(),
         }
+    }
+
+    fn no_osascript() -> script::Runner {
+        script::Runner::new(
+            PathBuf::from("/nonexistent/osascript"),
+            Duration::from_secs(5),
+        )
     }
 
     fn app(config: &Config, runner: Runner) -> Router {
@@ -2374,6 +2516,7 @@ esac"#,
             Runners {
                 calendars,
                 reminders,
+                mail: no_osascript(),
             },
         )))
     }
@@ -3324,6 +3467,7 @@ esac"#,
             Runners {
                 calendars,
                 reminders,
+                mail: no_osascript(),
             },
         )));
         let (status, body) = get(&router, "/v1/lists").await;
@@ -3471,6 +3615,7 @@ esac"#,
             Runners {
                 calendars,
                 reminders,
+                mail: no_osascript(),
             },
         );
         app.announce_lists(Duration::from_millis(10)).await;
@@ -3822,26 +3967,33 @@ esac"#,
     }
 
     #[tokio::test]
-    async fn mail_routes_are_get_only_and_check_the_host() {
+    async fn mail_routes_refuse_other_methods_and_check_the_host() {
         let fixture = MailFixture::standard();
         let router = mail_app(&fixture);
         for (method, uri) in [
             (Method::POST, "/v1/mail/accounts"),
+            (Method::PATCH, "/v1/mail/accounts"),
             (Method::POST, "/v1/mail/messages"),
-            (Method::PATCH, "/v1/mail/messages/830"),
+            (Method::PATCH, "/v1/mail/messages"),
+            (Method::POST, "/v1/mail/messages/830"),
+            (Method::PUT, "/v1/mail/messages/830"),
             (Method::DELETE, "/v1/mail/messages/830"),
         ] {
             let (status, body) = send(&router, build_request(method, uri, Body::empty())).await;
             assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{uri}");
             assert_eq!(body, error("method not allowed"));
         }
-        let request = Request::builder()
-            .uri("/v1/mail/messages/830")
-            .header("host", "rebound.example.com:8790")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = send(&router, request).await;
-        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+        for method in [Method::GET, Method::PATCH] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/v1/mail/messages/830")
+                .header("host", "rebound.example.com:8790")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"junk": true}"#))
+                .unwrap();
+            let (status, _) = send(&router, request).await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+        }
     }
 
     #[tokio::test]
@@ -3851,8 +4003,12 @@ esac"#,
         if let Some(mail) = &mut config.mail {
             mail.root = Some(fixture.root.join("missing"));
         }
-        let router = app(&config, no_ekctl());
+        let fake = osascript_fake();
+        let router = junk_app(&config, &fake);
         let (status, body) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, error("cannot open the mail store"));
+        let (status, body) = mark(&router, mail_fixture::PLAIN, true).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, error("cannot open the mail store"));
 
@@ -3877,6 +4033,17 @@ esac"#,
                 "{body}"
             );
         }
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::PLAIN, true).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Envelope Index query failed"),
+            "{body}"
+        );
+        assert_eq!(fake.log(), "");
     }
 
     #[tokio::test]
@@ -4074,6 +4241,22 @@ esac"#,
         std::os::unix::fs::symlink(outside.path().join("Inbox.mbox"), &inbox).unwrap();
         let (status, _) = get(&router, "/v1/mail/messages?account=main").await;
         assert_eq!(status, StatusCode::OK);
+        let fake = osascript_fake();
+        let junk = junk_app(&mail_config(&fixture), &fake);
+        let (status, _) = mark(&junk, mail_fixture::MULTIPART, true).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = mark(&junk, mail_fixture::MULTIPART_ALL_MAIL, false).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = mark(&junk, mail_fixture::PLAIN, true).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = mark(&junk, mail_fixture::IN_SPAM, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let failing = Fake::new(
+            "echo 'execution error: Secret \"[Gmail]/Spam\" <hidden-id@example.com> (-10000)' >&2\nexit 1",
+        );
+        let junk = junk_app(&mail_config(&fixture), &failing);
+        let (status, _) = mark(&junk, mail_fixture::MULTIPART, true).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
         let log = captured.text();
         assert!(log.contains("message file refused"), "{log}");
         for secret in [
@@ -4102,8 +4285,25 @@ esac"#,
             "Subject",
             "sender@example.com",
             "Secret",
+            "hidden-id@example.com",
+            "Spam",
+            "INBOX",
+            "All Mail",
+            "Gmail",
         ] {
             assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
+        for expected in [
+            "method=PATCH route=/v1/mail/messages/{id} status=200 duration_ms=",
+            r#"account="gmail" junk=true"#,
+            r#"account="gmail" junk=false"#,
+            "method=PATCH route=/v1/mail/messages/{id} status=409",
+            r#"account="main" junk=true"#,
+            "method=PATCH route=/v1/mail/messages/{id} status=404",
+            "method=PATCH route=/v1/mail/messages/{id} status=502",
+            "Mail failed with error -10000",
+        ] {
+            assert!(log.contains(expected), "{expected} missing from:\n{log}");
         }
         assert!(
             log.contains("method=GET route=/v1/mail/accounts status=200"),
@@ -4127,8 +4327,11 @@ esac"#,
             if !line.contains("route=/v1/mail/") {
                 continue;
             }
-            if line.contains("route=/v1/mail/messages/{id} status=200") {
+            if line.contains("method=GET route=/v1/mail/messages/{id} status=200") {
                 assert!(line.ends_with(" rows=1"), "{line}");
+            }
+            if line.contains("method=PATCH") {
+                assert!(!line.contains("rows="), "{line}");
             }
             if line.contains("status=400") || line.contains("status=404") {
                 assert!(!line.contains("rows="), "{line}");
@@ -4216,5 +4419,382 @@ esac"#,
         let app = App::new(&configured(), runners(no_ekctl()));
         app.announce_mail(Duration::from_millis(10)).await;
         assert!(!captured.text().contains("mail account"));
+    }
+
+    const RECORD_ARGS: &str = "for arg in \"$@\"; do printf '%s\\0' \"$arg\" >> \"$LOG\"; done";
+    const MOVED_ID: i64 = 900_001;
+
+    fn osascript_fake() -> Fake {
+        Fake::new(&format!(
+            "{RECORD_ARGS}\nif [ \"$4\" = \"$6\" ]; then echo \"$5\"; else echo {MOVED_ID}; fi"
+        ))
+    }
+
+    fn junk_app(config: &Config, fake: &Fake) -> Router {
+        junk_app_with_timeout(config, fake, Duration::from_secs(10))
+    }
+
+    fn junk_app_with_timeout(config: &Config, fake: &Fake, timeout: Duration) -> Router {
+        let mut runners = runners(no_ekctl());
+        runners.mail = script::Runner::new(fake.program().to_owned(), timeout);
+        router(Arc::new(App::new(config, runners)))
+    }
+
+    fn without_exclusions(fixture: &MailFixture) -> Config {
+        let mut config = mail_config(fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.exclude_mailboxes = Vec::new();
+        }
+        config
+    }
+
+    async fn mark(router: &Router, id: i64, junk: bool) -> (StatusCode, Value) {
+        send(
+            router,
+            json_request(
+                Method::PATCH,
+                &format!("/v1/mail/messages/{id}"),
+                &json!({ "junk": junk }),
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn mark_mail_junk_moves_to_the_junk_mailbox() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&without_exclusions(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::MULTIPART, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": MOVED_ID, "account": "gmail", "mailbox": "[Gmail]/Spam", "junk": true})
+        );
+        assert_eq!(
+            fake.recorded_args(),
+            [
+                "-e",
+                script::SCRIPT,
+                mail_fixture::GMAIL,
+                "INBOX",
+                "383621",
+                "[Gmail]/Spam",
+                "true"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_mail_not_junk_moves_to_the_inbox() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&without_exclusions(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::IN_SPAM, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": MOVED_ID, "account": "gmail", "mailbox": "INBOX", "junk": false})
+        );
+        assert_eq!(
+            fake.recorded_args(),
+            [
+                "-e",
+                script::SCRIPT,
+                mail_fixture::GMAIL,
+                "[Gmail]/Spam",
+                &mail_fixture::IN_SPAM.to_string(),
+                "INBOX",
+                "false"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_mail_already_in_its_target_passes_the_same_source_and_target() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::PLAIN, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": mail_fixture::PLAIN, "account": "main", "mailbox": "Inbox", "junk": false})
+        );
+        assert_eq!(
+            fake.recorded_args(),
+            [
+                "-e",
+                script::SCRIPT,
+                mail_fixture::MAIN,
+                "Inbox",
+                "830",
+                "Inbox",
+                "false"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_mail_junk_into_an_excluded_mailbox_has_no_id() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::MULTIPART_ALL_MAIL, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": null, "account": "gmail", "mailbox": "[Gmail]/Spam", "junk": true})
+        );
+        assert_eq!(fake.recorded_args()[3], "[Gmail]/All Mail");
+    }
+
+    #[tokio::test]
+    async fn mark_mail_whose_copy_did_not_show_up_has_no_id() {
+        let fixture = MailFixture::standard();
+        let fake = Fake::new("echo");
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::MULTIPART_ALL_MAIL, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": null, "account": "gmail", "mailbox": "INBOX", "junk": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_mail_without_a_target_mailbox_is_a_conflict() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::PLAIN, true).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, error("account has no junk mailbox"));
+
+        let fixture = MailFixture::empty();
+        fixture.mailbox(&mail_fixture::MailboxRow {
+            id: 1,
+            url: format!("imap://{}/%5BGmail%5D/All%20Mail", mail_fixture::GMAIL),
+            total: 0,
+            unread: 0,
+        });
+        fixture.insert(&mail_fixture::Row::new(10, 1, mail_fixture::T));
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, 10, false).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, error("account has no inbox"));
+        let (status, body) = mark(&router, 10, true).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, error("account has no junk mailbox"));
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mark_invisible_mail_is_not_found() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        for id in [
+            mail_fixture::IN_DELETED_ITEMS,
+            mail_fixture::DELETED_ROW,
+            mail_fixture::UNCONFIGURED,
+            mail_fixture::IN_SPAM,
+            mail_fixture::IN_CRAFTED,
+            999_999,
+        ] {
+            for junk in [true, false] {
+                let (status, body) = mark(&router, id, junk).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+                assert_eq!(body, error("message not found"), "{id}");
+            }
+        }
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.accounts = Vec::new();
+        }
+        let router = junk_app(&config, &fake);
+        let (status, _) = mark(&router, mail_fixture::PLAIN, true).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mark_mail_maps_mail_failures() {
+        let fixture = MailFixture::standard();
+        let fail = |stderr: &str| format!("cat >&2 <<'ERR'\n{stderr}\nERR\nexit 1");
+        let cases = [
+            (
+                fail(
+                    "0:120: execution error: Not authorized to send Apple events to Mail. (-1743)",
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Mail automation not permitted: allow EventKitBridge to control Mail in System Settings > Privacy & Security > Automation",
+            ),
+            (
+                fail(
+                    "0:215: execution error: Mail got an error: Can’t get message 1 of mailbox \"INBOX\". (-1728)",
+                ),
+                StatusCode::NOT_FOUND,
+                "message not found",
+            ),
+            (
+                fail("0:301: execution error: Mail got an error: AppleEvent timed out. (-1712)"),
+                StatusCode::GATEWAY_TIMEOUT,
+                "Mail did not answer",
+            ),
+            (
+                fail(
+                    "0:88: execution error: Mail got an error: \"[Gmail]/Spam\" <hidden@example.com> (-10000)",
+                ),
+                StatusCode::BAD_GATEWAY,
+                "Mail failed",
+            ),
+            (
+                fail("osascript: no such file"),
+                StatusCode::BAD_GATEWAY,
+                "Mail failed",
+            ),
+            (
+                "echo 'missing value'".to_owned(),
+                StatusCode::BAD_GATEWAY,
+                "Mail failed",
+            ),
+        ];
+        for (script, expected, message) in cases {
+            let fake = Fake::new(&script);
+            let router = junk_app(&mail_config(&fixture), &fake);
+            let (status, body) = mark(&router, mail_fixture::MULTIPART, true).await;
+            assert_eq!(status, expected, "{script}");
+            assert_eq!(body, error(message), "{script}");
+        }
+
+        let fake = Fake::new("sleep 5\necho 1");
+        let router =
+            junk_app_with_timeout(&mail_config(&fixture), &fake, Duration::from_millis(200));
+        let (status, body) = mark(&router, mail_fixture::MULTIPART, true).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body, error("Mail did not answer"));
+
+        let router = mail_app(&fixture);
+        let (status, body) = mark(&router, mail_fixture::MULTIPART, true).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, error("Mail failed"));
+    }
+
+    #[tokio::test]
+    async fn mark_mail_validates_the_request() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let uri = format!("/v1/mail/messages/{}", mail_fixture::PLAIN);
+        for body in [
+            "",
+            "{}",
+            "null",
+            r#"{"junk": null}"#,
+            r#"{"junk": "true"}"#,
+            r#"{"junk": 1}"#,
+            r#"{"junk": true, "mailbox": "Archive"}"#,
+            "[true]",
+        ] {
+            let (status, response) = send(
+                &router,
+                build_request(Method::PATCH, &uri, Body::from(body)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                response["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("invalid JSON body: "),
+                "{response}"
+            );
+        }
+        for id in ["abc", "0", "-1", "01", "1.5"] {
+            let (status, body) = send(
+                &router,
+                json_request(
+                    Method::PATCH,
+                    &format!("/v1/mail/messages/{id}"),
+                    &json!({"junk": true}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
+            assert_eq!(body, error("message id must be a positive integer"));
+        }
+        let request = Request::builder()
+            .method(Method::PATCH)
+            .uri(&uri)
+            .header("host", HOST)
+            .body(Body::from(r#"{"junk": true}"#))
+            .unwrap();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(body, error("content type must be application/json"));
+        let big = format!(r#"{{"junk": true, "pad": "{}"}}"#, "x".repeat(BODY_LIMIT));
+        let (status, _) = send(&router, build_request(Method::PATCH, &uri, Body::from(big))).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mark_mail_when_mail_is_off() {
+        let fake = osascript_fake();
+        let router = junk_app(&configured(), &fake);
+        for id in ["830", "abc"] {
+            let (status, body) = send(
+                &router,
+                json_request(
+                    Method::PATCH,
+                    &format!("/v1/mail/messages/{id}"),
+                    &json!({"junk": true}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(body, error("mail is off: add [mail] to the config"));
+        }
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mail_writes_do_not_wait_for_the_store_lock() {
+        let fixture = MailFixture::standard();
+        let calendars = Fake::new("echo start >> \"$LOG\"\nsleep 5");
+        let osascript = osascript_fake();
+        let mut runners = runners(calendars.runner());
+        runners.mail = script::Runner::new(osascript.program().to_owned(), Duration::from_secs(10));
+        let router = router(Arc::new(App::new(&mail_config(&fixture), runners)));
+        let held = tokio::spawn({
+            let router = router.clone();
+            async move { get(&router, "/v1/calendars").await }
+        });
+        while calendars.log().is_empty() {
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        let (status, _) = time::timeout(
+            Duration::from_secs(3),
+            mark(&router, mail_fixture::MULTIPART_ALL_MAIL, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_mail_writes_reach_mail_one_at_a_time() {
+        let fixture = MailFixture::standard();
+        let fake = Fake::new("echo start >> \"$LOG\"\nsleep 0.2\necho end >> \"$LOG\"\necho 7");
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let ((first, _), (second, _)) = tokio::join!(
+            mark(&router, mail_fixture::MULTIPART_ALL_MAIL, false),
+            mark(&router, mail_fixture::PLAIN, false),
+        );
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(fake.calls(), ["start", "end", "start", "end"]);
     }
 }

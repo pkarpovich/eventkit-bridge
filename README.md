@@ -1,16 +1,17 @@
 # eventkit-bridge
 
-`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger. Optionally, it also reads the mail Apple Mail has already downloaded, for every account configured in Mail, without ever writing to it.
+`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger. Optionally, it also reads the mail Apple Mail has already downloaded, for every account configured in Mail, and asks Mail to move a message to junk or back to the inbox; it never writes Mail's files.
 
 ```
 HTTP client (on the tailnet) --HTTP--> eventkit-bridge (LaunchAgent, EventKitBridge.app) --exec--> ekctl     --EventKit--> calendars
                                                                                           --exec--> remindctl --EventKit--> reminders
                                                                                           --read-only-------------------> ~/Library/Mail
+                                                                                          --exec--> osascript --Apple Events--> Mail.app (junk / not junk)
 ```
 
 The bridge does not call EventKit itself. It ships pinned copies of two native Swift command-line tools over EventKit inside its app bundle: [`ekctl`](https://github.com/schappim/ekctl) v1.8.0 for calendars and [`remindctl`](https://github.com/openclaw/remindctl) v0.3.8 for reminders. Each API request is turned into an `ekctl` or `remindctl` invocation, and the tool's JSON output is turned into the bridge's own JSON. Clients never see either tool and never pass it arguments.
 
-Mail is read straight from the files Mail keeps on disk: the Envelope Index, a SQLite database with one row per message, and the `.emlx` files that hold each message. The bridge never talks to Mail.app or to a mail server, and needs no account credentials.
+Mail is read straight from the files Mail keeps on disk: the Envelope Index, a SQLite database with one row per message, and the `.emlx` files that hold each message. The one mail write, marking a message as junk or not junk, goes through Mail.app over Apple Events, so Mail moves the message and syncs the move to the server as if you had clicked Junk in Mail. The bridge never talks to a mail server itself and needs no account credentials.
 
 It requires macOS 14 Sonoma or later on Apple Silicon.
 
@@ -24,9 +25,10 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **Reminders follow the same rules.** Reads touch only the reminder lists you list, and writes only the write lists. Before every change or delete, the bridge looks up the reminder and refuses unless it is in a write list.
 - **Location triggers name a place from the config.** A client picks a place such as `shop` by name; street addresses and coordinates never cross the API in either direction.
 - **The bridge builds every `ekctl` and `remindctl` command itself.** There is no generic passthrough, so a client cannot inject options into either tool. Reminder and list ids must be full UUIDs, because `remindctl` reads a short number as a row index from its last listing.
-- **Mail is off unless you turn it on, and then read-only.** Without a `[mail]` table no mail code runs. With it, the Envelope Index is opened read-only, no message data is ever written (the only files the bridge can create under `~/Library/Mail` are SQLite's own `-shm` and `-wal` files next to the Envelope Index, when Mail is not running), and only the accounts you name in `[mail.accounts]` are visible. Mail routes accept `GET` only; sending, moving, flagging and deleting mail are not possible.
+- **Mail is off unless you turn it on, and then read from disk read-only.** Without a `[mail]` table no mail code runs. With it, the Envelope Index is opened read-only, no message data is ever written by the bridge (the only files the bridge can create under `~/Library/Mail` are SQLite's own `-shm` and `-wal` files next to the Envelope Index, when Mail is not running), and only the accounts you name in `[mail.accounts]` are visible.
+- **The single mail write is junk or not junk, done by Mail.app.** `PATCH /v1/mail/messages/{id}` asks Mail over Apple Events to move one visible message to its account's junk mailbox or back to its inbox. The bridge runs `/usr/bin/osascript` directly with a fixed script and passes the account, mailboxes and message id as separate arguments, never as script text. Sending, replying, deleting, flagging, marking read and moving to any other mailbox are not possible. macOS asks once before EventKitBridge may control Mail.
 - **Reading mail needs Full Disk Access, for the whole bridge.** macOS has no narrower permission for `~/Library/Mail`. Granting it to EventKitBridge lets the bridge process read every file your user can, not just mail. The bridge itself only opens the Envelope Index, the `.emlx` files under the mail folder and `~/Library/Accounts/Accounts4.sqlite`, and refuses any message path that leads outside the mail folder. Leave mail off if you do not want to grant it.
-- **Contents are never logged.** Request logs carry the method, route, status and timing, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies and attachment names.
+- **Contents are never logged.** Request logs carry the method, route, status and timing, plus a row count for mail reads and the account name and junk value for junk requests, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths.
 
 ## Install
 
@@ -124,6 +126,8 @@ Mail is optional. Skip this section to keep it off.
    ```
 
    Accounts not listed stay invisible to clients.
+
+5. The first `PATCH /v1/mail/messages/{id}` (junk or not junk) shows the prompt "EventKitBridge wants to control Mail". Allow it. Mail is launched if it is not running. If you deny it, every junk request fails with `503` until you switch EventKitBridge on under System Settings, Privacy & Security, Automation, Mail. Reading mail does not need this permission.
 
 The Envelope Index is an undocumented Apple format. The bridge was built against Mail data version `V10` on macOS 27, and a macOS release may change it; `/healthz` reports `mail schema changed` when a table or column the bridge reads disappears.
 
@@ -344,7 +348,7 @@ A write is `400` when:
 - any string contains a control character other than newline and tab;
 - the body is not valid JSON or has an unknown field.
 
-A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events with a cross-site form or `fetch` request.
+A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events or marking mail as junk with a cross-site form or `fetch` request.
 
 ### Status codes
 
@@ -496,9 +500,9 @@ Reminder sections, tags, subtasks, smart lists, the Groceries list type and the 
 
 ## Mail API
 
-The mail routes follow the same rules as the other routes: the `Host` check, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET` only; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
+The mail routes follow the same rules as the other routes: the `Host` check, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
 
-Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request.
+Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request. Junk requests do not wait for them either; they wait only for each other, one Mail call at a time.
 
 ### Types
 
@@ -599,19 +603,42 @@ curl http://100.64.0.1:8790/v1/mail/messages/383621
 
 An id that is not a positive integer is `400`. A message that is deleted, in an excluded mailbox, in an account not in `[mail.accounts]`, or does not exist is `404 message not found`; the four cases look the same.
 
+### `PATCH /v1/mail/messages/{id}`
+
+Marks a message as junk and moves it to its account's junk mailbox, or marks it as not junk and moves it back to the inbox. Mail.app does the move and syncs it to the server, so Gmail and Exchange learn from it the same way as from a click in Mail. The body is `{"junk": true}` or `{"junk": false}`, sent as `application/json`; `junk` is required and is the only field.
+
+```sh
+curl -X PATCH -H 'content-type: application/json' -d '{"junk": false}' http://100.64.0.1:8790/v1/mail/messages/383621
+```
+
+```json
+{"id":383622,"account":"work","mailbox":"Inbox","junk":false}
+```
+
+- The message must be visible, as for `GET`; otherwise it is `404 message not found`.
+- The junk mailbox is the first of the account's mailboxes named `[Gmail]/Spam`, `Junk Email`, `Junk E-mail`, `Junk` or `Spam`, in that order, compared case-insensitively. The inbox is the mailbox named `INBOX`, in any case. An account without one is `409 account has no junk mailbox` or `409 account has no inbox`.
+- Mail gives a moved message a new id. `id` is that new id, or the same id when the message was already in the target mailbox. It is `null` when the moved copy did not show up within about 5 seconds, when the message has no Message-ID to find the copy by, or when the target mailbox is in `mail.exclude_mailboxes`. The default `exclude_mailboxes` hides every junk mailbox except `Junk E-mail`, so with it a message marked as junk usually gets `id: null`, and a message in junk is not visible and cannot be marked as not junk; remove the junk mailbox from `exclude_mailboxes` to rescue mail from it.
+- `account` is the configured account name, `mailbox` the target mailbox path and `junk` the requested value.
+- One message per request. Junk requests run one at a time.
+
 ### Mail status codes
 
 | Status | Meaning |
 | --- | --- |
 | `400` | The request is invalid; the message names the parameter. |
-| `404` | Mail is off, the message is not visible, or the route does not exist. |
-| `405` | A method other than `GET`. |
+| `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to mark (it moved or was deleted in the meantime). |
+| `405` | A method other than `GET`, or other than `GET` and `PATCH` on `/v1/mail/messages/{id}`. |
+| `409` | The account has no junk mailbox, or no inbox. |
+| `413` | A `PATCH` body larger than 64 KiB. |
+| `415` | A `PATCH` body that is not `application/json`. |
 | `500` | A query against the Envelope Index failed, or a message file could not be read. The error names only the kind of failure, never the file path. |
-| `503` | The mail store could not be opened. This is how a missing Full Disk Access grant shows up. |
+| `502` | `Mail failed`: `osascript` could not start, Mail returned an error while marking the message, or `osascript` printed output the bridge does not understand. |
+| `503` | The mail store could not be opened, which is how a missing Full Disk Access grant shows up; or `Mail automation not permitted`, when EventKitBridge may not control Mail. |
+| `504` | `Mail did not answer` within 30 seconds. |
 
 ### Not available
 
-Sending, moving, flagging, marking read and deleting mail; attachment contents; full-text search over message bodies; and de-duplicating a message that appears in several mailboxes.
+Sending, replying, flagging, marking read, deleting mail, and moving it anywhere but junk and the inbox; marking several messages in one request; attachment contents; full-text search over message bodies; and de-duplicating a message that appears in several mailboxes.
 
 ## Health check
 
@@ -622,7 +649,7 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.5.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95}
+{"status":"ok","version":"0.6.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95}
 ```
 
 `calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config.
@@ -655,15 +682,16 @@ There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; 
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail request also logs how many rows it returned:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, and a junk request for a visible message logs the account name and the requested junk value, whatever its outcome:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
 2026-10-05T09:13:02.104377Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/reminders/{id} status=200 duration_ms=164 remindctl="info=0, edit=0"
 2026-10-05T09:13:40.402118Z  INFO eventkit_bridge::server: request method=GET route=/v1/mail/messages status=200 duration_ms=18 rows=25
+2026-10-05T09:14:05.611904Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/mail/messages/{id} status=200 duration_ms=1240 account="work" junk=true
 ```
 
-Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies and attachment names are never logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. The description of an IMAP account is often its email address; it appears once, in the startup listing.
+Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths of junk requests are never logged; of a failed Mail call, only its error code is logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. The description of an IMAP account is often its email address; it appears once, in the startup listing.
 
 The log is not rotated. To truncate it:
 
@@ -691,6 +719,12 @@ The log is not rotated. To truncate it:
 - **A reminder request fails with `502 remindctl: List not found`.** A list in `read_lists` or `write_lists` was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **`/healthz` says `calendar missing`.** A calendar in the config was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **`/healthz` says `mail no access`, or mail requests fail with `503`.** The bridge has no Full Disk Access. Check System Settings, Privacy & Security, Full Disk Access, and make sure `EventKitBridge` is listed and switched on, then run `eventkit-bridge install` to restart the daemon.
+- **Junk requests fail with `503 Mail automation not permitted`.** Mail answered with error `-1743`: EventKitBridge is not allowed to control Mail. Open System Settings, Privacy & Security, Automation, expand EventKitBridge, and switch on Mail. If EventKitBridge is not listed or the prompt never appeared, reset the permission to get a fresh prompt on the next junk request:
+
+  ```sh
+  tccutil reset AppleEvents dev.pkarpovich.eventkit-bridge
+  ```
+
 - **`/healthz` says `mail account missing`.** An account in `[mail.accounts]` was removed from Mail or re-added under a new uuid. Look up the current uuids in the startup listing in the log and update the config.
 - **`/healthz` says `mail schema changed`.** A macOS update changed the Envelope Index. Mail reads stay unreliable until the bridge is updated for the new format; remove `[mail]` to keep the rest of the bridge healthy meanwhile.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
@@ -726,7 +760,7 @@ For a local signed build, run `scripts/build-signed.sh <team-id>`. It builds the
 
 ## Development
 
-The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl` or `launchctl` for real, and no test reads a real `~/Library/Mail`: mail tests build a fixture store from `fixtures/mail_schema.sql`.
+The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl`, `osascript` or `launchctl` for real, talks to Mail, or reads a real `~/Library/Mail`: mail tests build a fixture store from `fixtures/mail_schema.sql`.
 
 ```sh
 mise run check
@@ -734,7 +768,7 @@ mise run check
 
 runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. CI also runs `shellcheck scripts/*.sh`.
 
-Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars, reminders or mail: TCC would grant access to the terminal app, not to EventKitBridge, and reading mail would need Full Disk Access for the terminal. Test on the Mac with the bundled app started by the LaunchAgent.
+Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars, reminders or mail: TCC would grant access, including the Automation permission to control Mail, to the terminal app, not to EventKitBridge, and reading mail would need Full Disk Access for the terminal. Test on the Mac with the bundled app started by the LaunchAgent.
 
 ## Credits
 
