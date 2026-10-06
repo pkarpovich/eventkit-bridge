@@ -165,12 +165,16 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 - Create: `src/auth.rs` (the module is declared in `src/lib.rs` the moment it exists)
 - Modify: `Cargo.toml`, `src/lib.rs`
 
-- [ ] `cargo add` the crates from Design; confirm `cargo tree -i rsa` shows one copy
-- [ ] `Claims`, `OneOrMany`, `Principal`, the `Validate` steps 1-6 over a given key set, `AuthError` kinds without values
-- [ ] the scope table, `scope_for(method, route) -> Option<&'static str>`, and the required scope as `scope_prefix` + name
-- [ ] a test key module under `#[cfg(test)]`: the `LazyLock` key pair, `jwk(kid)`, `mint(claims, kid)` and `mint_hs256(claims)` helpers
-- [ ] tests: valid token with `scp` array; valid with `scope` string; both at once unioned; missing token; `basic` scheme; two headers; empty token; wrong signature (a second key pair); unknown `kid`; no `kid`; expired beyond leeway and expired within 60 s; `nbf` 120 s ahead refused, 30 s ahead accepted; wrong `iss`; `aud` missing; `aud` without the audience; `aud` as a plain matching string; `alg: none`; HS256 signed with the public key bytes; `typ` missing; `typ` `JWT`; `typ` `application/AT+JWT` accepted; neither `sub` nor `client_id`; `client_id` preferred over `sub` as the principal; the error `Display` and `Debug` of every kind contain no claim value
-- [ ] run tests, `mise run check`
+- [x] `cargo add` the crates from Design; confirm `cargo tree -i rsa` shows one copy
+- [x] `Claims`, `OneOrMany`, `Principal`, the `Validate` steps 1-6 over a given key set, `AuthError` kinds without values
+- [x] the scope table, `scope_for(method, route) -> Option<&'static str>`, and the required scope as `scope_prefix` + name
+- [x] a test key module under `#[cfg(test)]`: the `LazyLock` key pair, `jwk(kid)`, `mint(claims, kid)` and `mint_hs256(claims)` helpers
+- [x] tests: valid token with `scp` array; valid with `scope` string; both at once unioned; missing token; `basic` scheme; two headers; empty token; wrong signature (a second key pair); unknown `kid`; no `kid`; expired beyond leeway and expired within 60 s; `nbf` 120 s ahead refused, 30 s ahead accepted; wrong `iss`; `aud` missing; `aud` without the audience; `aud` as a plain matching string; `alg: none`; HS256 signed with the public key bytes; `typ` missing; `typ` `JWT`; `typ` `application/AT+JWT` accepted; neither `sub` nor `client_id`; `client_id` preferred over `sub` as the principal; the error `Display` and `Debug` of every kind contain no claim value
+- [x] run tests, `mise run check` (the three cargo commands run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ `Claims` leaves out `exp`, `nbf`, `iat` and `jti`: `jsonwebtoken` checks `exp` and `nbf` itself, and fields that are deserialised but never read are `dead_code` warnings. Serde ignores them, so a non-integer `iat` or `jti` cannot fail a token.
+- ⚠️ `KeySet::from_jwks` already does the JWK filtering from "Parsing" (RSA, `kid`, `alg` absent or `RS256`, `use` absent or `sig`), with a test. Task 3 adds the zero-keys-is-a-failure rule on top.
+- ⚠️ `scope_for` returns the scope name, and `Validator::required_scope(method, route)` adds `scope_prefix`.
+- ⚠️ `Cargo.toml` sets `[profile.dev.package.num-bigint-dig] opt-level = 3`: generating the two 2048-bit test keys drops from about 6 s to under 0.5 s.
 
 ### Task 3: JWKS cache
 

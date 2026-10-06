@@ -9,6 +9,7 @@ axum = "0.8.9"
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 html2text = "0.17.1"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 mail-parser = "0.11.9"
 percent-encoding = "2.3.2"
 rusqlite = { version = "0.40.2", features = ["array", "bundled", "functions"] }
@@ -20,10 +21,16 @@ tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process"
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
 url = "2.5.8"
 
 [dev-dependencies]
 http-body-util = "0.1.5"
 plist = "1.10.1"
+rand = "0.8.5"
+rsa = "0.9.10"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
