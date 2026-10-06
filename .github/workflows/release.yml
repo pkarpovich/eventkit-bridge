@@ -169,7 +169,9 @@ jobs:
               in System Settings > Privacy & Security > Full Disk Access (there is no prompt).
               This grants Full Disk Access to the whole bridge, not just mail. Then add [mail]
               to the config, run eventkit-bridge install, name the accounts from the log under
-              [mail.accounts], and run eventkit-bridge install again.
+              [mail.accounts], and run eventkit-bridge install again. The first request that
+              marks a message as junk or not junk shows "EventKitBridge wants to control Mail";
+              allow it.
 
               Upgrades need no action: the daemon restarts on the new version by itself.
               After upgrading from a version without reminders, approve the Reminders

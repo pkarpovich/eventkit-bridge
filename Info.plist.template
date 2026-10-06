@@ -20,6 +20,8 @@
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>EventKitBridge asks Mail to move a message to junk or back to the inbox when a client requests it.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>eventkit-bridge reads the calendars you allow and manages events in the one calendar you choose for it.</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
