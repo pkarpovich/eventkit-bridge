@@ -687,10 +687,7 @@ pub fn mail_junk_body(body: &[u8]) -> Result<JunkStatus, Invalid> {
         Ok(body) => body,
         Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
     };
-    match junk {
-        true => Ok(JunkStatus::Junk),
-        false => Ok(JunkStatus::NotJunk),
-    }
+    Ok(JunkStatus::from(junk))
 }
 
 /// The body of `POST /v1/reminders`.

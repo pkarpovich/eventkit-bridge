@@ -27,13 +27,20 @@ pub const SCRIPT: &str = r#"on run argv
       set rfcId to message id of m
       set junk mail status of m to (junkValue is "true")
       if sourcePath is targetPath then return msgId
+      if rfcId is missing value or rfcId is "" then
+        move m to mailbox targetPath of acct
+        return ""
+      end if
+      set known to id of (messages of mailbox targetPath of acct whose message id is rfcId)
       move m to mailbox targetPath of acct
-      repeat 25 times
-        set hits to (messages of mailbox targetPath of acct whose message id is rfcId)
-        if (count of hits) > 0 then return (id of item 1 of hits) as text
+      set giveUp to (current date) + 5
+      repeat
+        repeat with hit in (id of (messages of mailbox targetPath of acct whose message id is rfcId))
+          if known does not contain (contents of hit) then return (contents of hit) as text
+        end repeat
+        if (current date) > giveUp then return ""
         delay 0.2
       end repeat
-      return ""
     end timeout
   end tell
 end run"#;
@@ -97,7 +104,24 @@ pub enum JunkStatus {
     NotJunk,
 }
 
+impl From<bool> for JunkStatus {
+    fn from(junk: bool) -> Self {
+        match junk {
+            true => JunkStatus::Junk,
+            false => JunkStatus::NotJunk,
+        }
+    }
+}
+
 impl JunkStatus {
+    /// Whether this status is junk.
+    pub fn is_junk(self) -> bool {
+        match self {
+            JunkStatus::Junk => true,
+            JunkStatus::NotJunk => false,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             JunkStatus::Junk => "true",

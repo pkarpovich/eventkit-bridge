@@ -28,7 +28,7 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **Mail is off unless you turn it on, and then read from disk read-only.** Without a `[mail]` table no mail code runs. With it, the Envelope Index is opened read-only, no message data is ever written by the bridge (the only files the bridge can create under `~/Library/Mail` are SQLite's own `-shm` and `-wal` files next to the Envelope Index, when Mail is not running), and only the accounts you name in `[mail.accounts]` are visible.
 - **The single mail write is junk or not junk, done by Mail.app.** `PATCH /v1/mail/messages/{id}` asks Mail over Apple Events to move one visible message to its account's junk mailbox or back to its inbox. The bridge runs `/usr/bin/osascript` directly with a fixed script and passes the account, mailboxes and message id as separate arguments, never as script text. Sending, replying, deleting, flagging, marking read and moving to any other mailbox are not possible. macOS asks once before EventKitBridge may control Mail.
 - **Reading mail needs Full Disk Access, for the whole bridge.** macOS has no narrower permission for `~/Library/Mail`. Granting it to EventKitBridge lets the bridge process read every file your user can, not just mail. The bridge itself only opens the Envelope Index, the `.emlx` files under the mail folder and `~/Library/Accounts/Accounts4.sqlite`, and refuses any message path that leads outside the mail folder. Leave mail off if you do not want to grant it.
-- **Contents are never logged.** Request logs carry the method, route, status and timing, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies and attachment names.
+- **Contents are never logged.** Request logs carry the method, route, status and timing, plus a row count for mail reads and the account name and junk value for junk requests, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths.
 
 ## Install
 
@@ -348,7 +348,7 @@ A write is `400` when:
 - any string contains a control character other than newline and tab;
 - the body is not valid JSON or has an unknown field.
 
-A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events with a cross-site form or `fetch` request.
+A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events or marking mail as junk with a cross-site form or `fetch` request.
 
 ### Status codes
 
@@ -617,7 +617,7 @@ curl -X PATCH -H 'content-type: application/json' -d '{"junk": false}' http://10
 
 - The message must be visible, as for `GET`; otherwise it is `404 message not found`.
 - The junk mailbox is the first of the account's mailboxes named `[Gmail]/Spam`, `Junk Email`, `Junk E-mail`, `Junk` or `Spam`, in that order, compared case-insensitively. The inbox is the mailbox named `INBOX`, in any case. An account without one is `409 account has no junk mailbox` or `409 account has no inbox`.
-- Mail gives a moved message a new id. `id` is that new id, or the same id when the message was already in the target mailbox. It is `null` when the moved copy did not show up within 5 seconds, or when the target mailbox is in `mail.exclude_mailboxes`. The default `exclude_mailboxes` hides the junk mailboxes, so with it a message marked as junk gets `id: null`, and a message in junk is not visible and cannot be marked as not junk; remove the junk mailbox from `exclude_mailboxes` to rescue mail from it.
+- Mail gives a moved message a new id. `id` is that new id, or the same id when the message was already in the target mailbox. It is `null` when the moved copy did not show up within about 5 seconds, when the message has no Message-ID to find the copy by, or when the target mailbox is in `mail.exclude_mailboxes`. The default `exclude_mailboxes` hides every junk mailbox except `Junk E-mail`, so with it a message marked as junk usually gets `id: null`, and a message in junk is not visible and cannot be marked as not junk; remove the junk mailbox from `exclude_mailboxes` to rescue mail from it.
 - `account` is the configured account name, `mailbox` the target mailbox path and `junk` the requested value.
 - One message per request. Junk requests run one at a time.
 
@@ -629,9 +629,10 @@ curl -X PATCH -H 'content-type: application/json' -d '{"junk": false}' http://10
 | `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to mark (it moved or was deleted in the meantime). |
 | `405` | A method other than `GET`, or other than `GET` and `PATCH` on `/v1/mail/messages/{id}`. |
 | `409` | The account has no junk mailbox, or no inbox. |
+| `413` | A `PATCH` body larger than 64 KiB. |
 | `415` | A `PATCH` body that is not `application/json`. |
 | `500` | A query against the Envelope Index failed, or a message file could not be read. The error names only the kind of failure, never the file path. |
-| `502` | `Mail failed`: Mail returned an error while marking the message. |
+| `502` | `Mail failed`: `osascript` could not start, Mail returned an error while marking the message, or `osascript` printed output the bridge does not understand. |
 | `503` | The mail store could not be opened, which is how a missing Full Disk Access grant shows up; or `Mail automation not permitted`, when EventKitBridge may not control Mail. |
 | `504` | `Mail did not answer` within 30 seconds. |
 
@@ -681,7 +682,7 @@ There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; 
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, and a junk request logs the account name and the requested junk value:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, and a junk request for a visible message logs the account name and the requested junk value, whatever its outcome:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
@@ -759,7 +760,7 @@ For a local signed build, run `scripts/build-signed.sh <team-id>`. It builds the
 
 ## Development
 
-The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl` or `launchctl` for real, and no test reads a real `~/Library/Mail`: mail tests build a fixture store from `fixtures/mail_schema.sql`.
+The crate builds and its tests pass on macOS and Linux; no test runs `ekctl`, `remindctl`, `osascript` or `launchctl` for real, talks to Mail, or reads a real `~/Library/Mail`: mail tests build a fixture store from `fixtures/mail_schema.sql`.
 
 ```sh
 mise run check
@@ -767,7 +768,7 @@ mise run check
 
 runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. CI also runs `shellcheck scripts/*.sh`.
 
-Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars, reminders or mail: TCC would grant access to the terminal app, not to EventKitBridge, and reading mail would need Full Disk Access for the terminal. Test on the Mac with the bundled app started by the LaunchAgent.
+Do not run the daemon, `ekctl` or `remindctl` from a terminal against your real calendars, reminders or mail: TCC would grant access, including the Automation permission to control Mail, to the terminal app, not to EventKitBridge, and reading mail would need Full Disk Access for the terminal. Test on the Mac with the bundled app started by the LaunchAgent.
 
 ## Credits
 

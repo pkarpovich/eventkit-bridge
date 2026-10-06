@@ -582,7 +582,7 @@ async fn log_request(request: Request, next: Next) -> Response {
     let remindctl = joined(remindctl_calls.calls());
     let rows = response.extensions().get::<Rows>().map(|Rows(rows)| *rows);
     let (account, junk) = match response.extensions().get::<JunkWrite>() {
-        Some(JunkWrite { account, status }) => (Some(account.to_string()), Some(is_junk(*status))),
+        Some(JunkWrite { account, status }) => (Some(account.to_string()), Some(status.is_junk())),
         None => (None, None),
     };
     tracing::info!(
@@ -973,16 +973,9 @@ async fn move_junk(runner: &script::Runner, request: JunkRequest) -> Result<Resp
         "id": id,
         "account": account.name,
         "mailbox": request.target,
-        "junk": is_junk(status),
+        "junk": status.is_junk(),
     }))
     .into_response())
-}
-
-fn is_junk(status: JunkStatus) -> bool {
-    match status {
-        JunkStatus::Junk => true,
-        JunkStatus::NotJunk => false,
-    }
 }
 
 async fn empty_event_id() -> ApiError {
@@ -4010,8 +4003,12 @@ esac"#,
         if let Some(mail) = &mut config.mail {
             mail.root = Some(fixture.root.join("missing"));
         }
-        let router = app(&config, no_ekctl());
+        let fake = osascript_fake();
+        let router = junk_app(&config, &fake);
         let (status, body) = get(&router, "/v1/mail/messages").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, error("cannot open the mail store"));
+        let (status, body) = mark(&router, mail_fixture::PLAIN, true).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, error("cannot open the mail store"));
 
@@ -4036,6 +4033,17 @@ esac"#,
                 "{body}"
             );
         }
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = mark(&router, mail_fixture::PLAIN, true).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Envelope Index query failed"),
+            "{body}"
+        );
+        assert_eq!(fake.log(), "");
     }
 
     #[tokio::test]
@@ -4503,7 +4511,7 @@ esac"#,
     }
 
     #[tokio::test]
-    async fn mark_mail_already_in_its_target_keeps_its_id() {
+    async fn mark_mail_already_in_its_target_passes_the_same_source_and_target() {
         let fixture = MailFixture::standard();
         let fake = osascript_fake();
         let router = junk_app(&mail_config(&fixture), &fake);
@@ -4774,5 +4782,19 @@ esac"#,
         .unwrap();
         assert_eq!(status, StatusCode::OK);
         held.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_mail_writes_reach_mail_one_at_a_time() {
+        let fixture = MailFixture::standard();
+        let fake = Fake::new("echo start >> \"$LOG\"\nsleep 0.2\necho end >> \"$LOG\"\necho 7");
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let ((first, _), (second, _)) = tokio::join!(
+            mark(&router, mail_fixture::MULTIPART_ALL_MAIL, false),
+            mark(&router, mail_fixture::PLAIN, false),
+        );
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(fake.calls(), ["start", "end", "start", "end"]);
     }
 }

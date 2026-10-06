@@ -2486,6 +2486,26 @@ mod tests {
     }
 
     #[test]
+    fn place_matches_the_whole_mailbox_path() {
+        let fixture = Fixture::empty();
+        add_mailbox(&fixture, 1, format!("imap://{}/Notes", fixture::MAIN));
+        for (id, path) in [
+            (2, "Archive/Spam"),
+            (3, "Spam%20Archive"),
+            (4, "Old%20Junk"),
+            (5, "INBOX/Receipts"),
+            (6, "Archive/INBOX"),
+        ] {
+            add_mailbox(&fixture, id, format!("imap://{}/{path}", fixture::MAIN));
+        }
+        fixture.insert(&Row::new(10, 1, fixture::T));
+        let found = place(fixture.config(), 10).unwrap();
+        assert_eq!(found.mailbox, "Notes");
+        assert_eq!(found.junk, None);
+        assert_eq!(found.inbox, None);
+    }
+
+    #[test]
     fn place_prefers_the_earlier_junk_candidate_in_its_stored_case() {
         let fixture = Fixture::standard();
         add_mailbox(&fixture, 20, format!("ews://{}/SPAM", fixture::MAIN));
