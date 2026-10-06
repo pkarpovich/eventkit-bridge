@@ -272,6 +272,12 @@ mod tests {
     }
 
     #[test]
+    fn runs_the_system_osascript_with_a_thirty_second_deadline() {
+        assert_eq!(OSASCRIPT, "/usr/bin/osascript");
+        assert_eq!(DEADLINE, Duration::from_secs(30));
+    }
+
+    #[test]
     fn script_reads_every_value_from_argv() {
         assert!(SCRIPT.starts_with("on run argv\n"));
         assert!(SCRIPT.contains("set {acctId, sourcePath, msgId, targetPath, junkValue} to argv"));
