@@ -202,14 +202,21 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 **Files:**
 - Modify: `src/server.rs`, `src/health.rs`, `src/main.rs`
 
-- [ ] `App::new(config, runners, auth: Option<Arc<Authenticator>>)`; `main.rs` builds the `Authenticator` from `config.auth` with `HttpJwksSource` and the cache path beside the config file, spawns `run_refresh` next to the announcers and aborts it on shutdown
-- [ ] `require_bearer` middleware in the position from Design, the three responses with their `WWW-Authenticate` values, the `/healthz` exemption, the `Principal` response extension
-- [ ] `log_request` logs `client`; startup and refusal log lines from Design
-- [ ] health: `auth` object in the `200` body, `DegradedReason::AuthJwksUnavailable` serialised as `auth jwks unavailable`, only when no keys are loaded
-- [ ] the route-coverage test over `router()`
-- [ ] HTTP tests through `oneshot`, with the scripted source preloaded: one valid request per scope name against a route in its group; a read token on a write route is `403` with the exact header; `required = true` without a token is `401 Bearer`; `required = false` without a token reaches the handler and logs `anonymous`; `required = false` with a bad token is still `401`; `/healthz` without a token is `200` in both modes and carries `auth`; `/healthz` with no keys loaded is `503 auth jwks unavailable`; an unknown path with a valid token is `404`, without one `401`; the `Host` check still answers `421` before the token is read; the body limit still answers `413` after a valid token; no `[auth]` table leaves every existing test untouched
-- [ ] extend the never-logged test as described under Logging
-- [ ] run tests, `mise run check`
+- [x] `App::new(config, runners, auth: Option<Arc<Authenticator>>)`; `main.rs` builds the `Authenticator` from `config.auth` with `HttpJwksSource` and the cache path beside the config file, spawns `run_refresh` next to the announcers and aborts it on shutdown
+- [x] `require_bearer` middleware in the position from Design, the three responses with their `WWW-Authenticate` values, the `/healthz` exemption, the `Principal` response extension
+- [x] `log_request` logs `client`; startup and refusal log lines from Design
+- [x] health: `auth` object in the `200` body, `DegradedReason::AuthJwksUnavailable` serialised as `auth jwks unavailable`, only when no keys are loaded
+- [x] the route-coverage test over `router()`
+- [x] HTTP tests through `oneshot`, with the scripted source preloaded: one valid request per scope name against a route in its group; a read token on a write route is `403` with the exact header; `required = true` without a token is `401 Bearer`; `required = false` without a token reaches the handler and logs `anonymous`; `required = false` with a bad token is still `401`; `/healthz` without a token is `200` in both modes and carries `auth`; `/healthz` with no keys loaded is `503 auth jwks unavailable`; an unknown path with a valid token is `404`, without one `401`; the `Host` check still answers `421` before the token is read; the body limit still answers `413` after a valid token; no `[auth]` table leaves every existing test untouched
+- [x] extend the never-logged test as described under Logging
+- [x] run tests, `mise run check` (the three cargo commands and `shellcheck` run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ `scope_for` maps `HEAD` to the `GET` row: axum answers `HEAD` with the `GET` handler, so without the mapping a token with no scope could run every read route's handler through `HEAD`. Tested in `auth` and through the router, and the route-coverage test probes `HEAD` too.
+- ⚠️ `router()` registers the routes from a `routes()` list, so the coverage test walks exactly what the router serves: with a scopeless token every method on every route other than `/healthz` is either `403` (has a row) or `405` (no handler), and with every scope a row never answers `405` or carries a challenge.
+- ⚠️ `Authenticator` holds `required` and exposes `required()`, `jwks()` and `required_scope()`; the middleware's one transition branch is `Err(AuthError::Missing) if !auth.required()`.
+- ⚠️ `Probe` carries an `AuthStatus` snapshot taken per request, and `HealthCheck::check` applies it after the cached probe, so the key count and age are never 10 s stale; a calendar, reminder or mail failure still wins over `auth jwks unavailable`.
+- ⚠️ `main.rs` passes a `Setup { config, runners, auth }` to `daemon` (no function with 4 parameters); the `Authenticator` is built in `run_daemon`, after the subscriber, so `auth on` precedes `jwks loaded`.
+- ⚠️ A `403` for a missing scope also carries `client=<id>` on the request line; a `401` carries no client.
+- ⚠️ The never-logged check is a new test next to the existing ones, `auth_request_log_carries_the_client_but_no_token`, because the existing tests run without `[auth]`, and they stay unchanged.
 
 ### Task 5: Verify acceptance criteria
 

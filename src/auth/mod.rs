@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 
 use axum::http::header::AUTHORIZATION;
@@ -13,11 +14,16 @@ mod fetch;
 mod jwks;
 
 pub use fetch::HttpJwksSource;
+#[cfg(test)]
+pub(crate) use jwks::test_source;
 pub use jwks::{FetchError, Jwks, JwksSource};
 
 const LEEWAY_SECONDS: u64 = 60;
 const BEARER_SCHEME: &str = "bearer";
 const ACCEPTED_TYPES: [&str; 2] = ["at+jwt", "application/at+jwt"];
+
+/// The one route that needs no token.
+pub const EXEMPT_ROUTE: &str = "/healthz";
 
 const SCOPE_TABLE: [(&str, &str, &str); 21] = [
     ("GET", "/v1/calendars", "calendar.read"),
@@ -258,6 +264,7 @@ impl Validator {
 pub struct Authenticator {
     validator: Validator,
     jwks: Arc<Jwks>,
+    required: bool,
 }
 
 impl Authenticator {
@@ -266,7 +273,23 @@ impl Authenticator {
         Self {
             validator: Validator::new(config),
             jwks,
+            required: config.required,
         }
+    }
+
+    /// Whether a request without a token is refused, from the `[auth]` table's `required`.
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
+    /// The key cache tokens are validated against.
+    pub fn jwks(&self) -> &Arc<Jwks> {
+        &self.jwks
+    }
+
+    /// The scope a token needs for `method` on the route template `route`, `None` when the pair has no row.
+    pub fn required_scope(&self, method: &Method, route: &str) -> Option<String> {
+        self.validator.required_scope(method, route)
     }
 
     /// Validates the request's token; a token naming an unknown `kid` triggers one gated refetch and one more lookup.
@@ -280,10 +303,22 @@ impl Authenticator {
     }
 }
 
-/// The scope name `method` on the route template `route` needs, before the prefix; `None` when the pair has no row.
+impl fmt::Debug for Authenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Authenticator")
+            .field("required", &self.required)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The scope name `method` on the route template `route` needs, before the prefix; `None` when the pair has no row. `HEAD` needs what `GET` needs, because the router answers it with the `GET` handler.
 pub fn scope_for(method: &Method, route: &str) -> Option<&'static str> {
+    let method = match *method == Method::HEAD {
+        true => Method::GET.as_str(),
+        false => method.as_str(),
+    };
     for (row_method, row_route, name) in SCOPE_TABLE {
-        if row_method == method.as_str() && row_route == route {
+        if row_method == method && row_route == route {
             return Some(name);
         }
     }
@@ -943,8 +978,21 @@ mod tests {
     }
 
     #[test]
+    fn head_needs_the_get_scope() {
+        assert_eq!(
+            scope_for(&Method::HEAD, "/v1/calendars"),
+            Some("calendar.read")
+        );
+        assert_eq!(
+            scope_for(&Method::HEAD, "/v1/mail/messages/{id}"),
+            Some("mail.read")
+        );
+        assert_eq!(scope_for(&Method::HEAD, "/healthz"), None);
+    }
+
+    #[test]
     fn scope_table_has_no_row_for_health_or_unknown_pairs() {
-        assert_eq!(scope_for(&Method::GET, "/healthz"), None);
+        assert_eq!(scope_for(&Method::GET, EXEMPT_ROUTE), None);
         assert_eq!(scope_for(&Method::GET, "/v1/unknown"), None);
         assert_eq!(scope_for(&Method::PUT, "/v1/events/{id}"), None);
         assert_eq!(scope_for(&Method::DELETE, "/v1/mail/messages/{id}"), None);
@@ -990,6 +1038,28 @@ mod tests {
             source,
             authenticator: Authenticator::new(&config(), Arc::new(jwks)),
         }
+    }
+
+    #[test]
+    fn authenticator_reports_required_and_the_prefixed_scope() {
+        let harness = auth_harness(vec![]);
+        let optional = Authenticator::new(
+            &AuthConfig {
+                required: false,
+                ..config()
+            },
+            Arc::clone(harness.authenticator.jwks()),
+        );
+
+        assert!(harness.authenticator.required());
+        assert!(!optional.required());
+        assert_eq!(
+            harness
+                .authenticator
+                .required_scope(&Method::POST, "/v1/reminders"),
+            Some("bridge:reminders.write".to_owned())
+        );
+        assert_eq!(harness.authenticator.jwks().key_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]

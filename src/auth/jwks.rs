@@ -229,12 +229,14 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 pub(crate) mod test_source {
     use std::collections::VecDeque;
+    use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use serde_json::{Value, json};
 
-    use super::{FetchError, JwksSource};
+    use super::{FetchError, Jwks, JwksSource, unix_now};
     use crate::auth::test_keys::KEY;
 
     /// A source that answers each fetch with the next scripted result, then with `Transport`.
@@ -279,6 +281,17 @@ pub(crate) mod test_source {
     /// A JWK set body holding `keys` as given.
     pub(crate) fn body_of(keys: Vec<Value>) -> Vec<u8> {
         json!({ "keys": keys }).to_string().into_bytes()
+    }
+
+    /// A cache in `dir` loaded at construction with the trusted key under each of `kids`, whose source never answers; no file is written when `kids` is empty.
+    pub(crate) fn preloaded(dir: &Path, kids: &[&str]) -> Arc<Jwks> {
+        let path = dir.join("jwks-cache.json");
+        if !kids.is_empty() {
+            let jwks: Value = serde_json::from_slice(&body(kids)).unwrap();
+            let text = json!({ "fetched_at": unix_now(), "jwks": jwks }).to_string();
+            fs::write(&path, text).unwrap();
+        }
+        Arc::new(Jwks::new(Arc::new(ScriptedSource::default()), path))
     }
 }
 
