@@ -42,11 +42,11 @@ Without an `[auth]` table nothing changes, as before.
 **Files:**
 - Modify: `README.md`, `CLAUDE.md`, `Cargo.toml`
 
-- [ ] README: remove `required` from the config example and table, the rollout paragraph and any `anonymous` log mention; state that a configured `[auth]` is always enforced; a short upgrade note (delete `required` from the config before upgrading)
-- [ ] CLAUDE.md: drop the transition-switch wording
-- [ ] version 0.8.0 in `Cargo.toml` and the README health example
-- [ ] `mise run check`, `shellcheck scripts/*.sh`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: remove `required` from the config example and table, the rollout paragraph and any `anonymous` log mention; state that a configured `[auth]` is always enforced; a short upgrade note (delete `required` from the config before upgrading)
+- [x] CLAUDE.md: drop the transition-switch wording
+- [x] version 0.8.0 in `Cargo.toml` and the README health example
+- [x] `mise run check`, `shellcheck scripts/*.sh` (mise unavailable; ran cargo fmt --check, clippy -D warnings, cargo test directly)
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
