@@ -183,7 +183,6 @@ impl Validator {
             issuer,
             audience,
             jwks_url: _,
-            required: _,
             scope_prefix,
         } = config;
         let mut validation = Validation::new(Algorithm::RS256);
@@ -264,7 +263,6 @@ impl Validator {
 pub struct Authenticator {
     validator: Validator,
     jwks: Arc<Jwks>,
-    required: bool,
 }
 
 impl Authenticator {
@@ -273,13 +271,7 @@ impl Authenticator {
         Self {
             validator: Validator::new(config),
             jwks,
-            required: config.required,
         }
-    }
-
-    /// Whether a request without a token is refused, from the `[auth]` table's `required`.
-    pub fn required(&self) -> bool {
-        self.required
     }
 
     /// The key cache tokens are validated against.
@@ -305,9 +297,7 @@ impl Authenticator {
 
 impl fmt::Debug for Authenticator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Authenticator")
-            .field("required", &self.required)
-            .finish_non_exhaustive()
+        f.debug_struct("Authenticator").finish_non_exhaustive()
     }
 }
 
@@ -501,7 +491,6 @@ mod tests {
             issuer: ISSUER.to_owned(),
             audience: AUDIENCE.to_owned(),
             jwks_url: Url::parse("https://auth.example.com/jwks.json").unwrap(),
-            required: true,
             scope_prefix: "bridge:".to_owned(),
         }
     }
@@ -1041,18 +1030,9 @@ mod tests {
     }
 
     #[test]
-    fn authenticator_reports_required_and_the_prefixed_scope() {
+    fn authenticator_reports_the_prefixed_scope() {
         let harness = auth_harness(vec![]);
-        let optional = Authenticator::new(
-            &AuthConfig {
-                required: false,
-                ..config()
-            },
-            Arc::clone(harness.authenticator.jwks()),
-        );
 
-        assert!(harness.authenticator.required());
-        assert!(!optional.required());
         assert_eq!(
             harness
                 .authenticator

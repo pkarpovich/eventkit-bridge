@@ -91,7 +91,7 @@ The bridge runs as a LaunchAgent in your login session and needs a config before
 
    again. The daemon restarts with the new config, and the log lines show which calendars are now readable and writable.
 
-Upgrades need no action: the daemon restarts on the new version by itself. After upgrading from a version without reminders, the first reminders call shows the Reminders prompt once; approve it.
+Upgrades usually need no action: the daemon restarts on the new version by itself (see Upgrades for the exceptions). After upgrading from a version without reminders, the first reminders call shows the Reminders prompt once; approve it.
 
 ### Turning on mail
 
@@ -160,7 +160,6 @@ exclude_mailboxes = ["Trash", "Deleted Items", "Deleted Messages", "Junk", "Junk
 issuer = "https://auth.example.com"
 audience = "https://eventkit-bridge"
 jwks_url = "https://auth.example.com/jwks.json"
-# required = true
 # scope_prefix = "bridge:"
 ```
 
@@ -183,12 +182,11 @@ jwks_url = "https://auth.example.com/jwks.json"
 | `auth.issuer` | yes, in `[auth]` | The provider URL, compared exactly with the token's `iss`. Must not be blank or contain whitespace. |
 | `auth.audience` | yes, in `[auth]` | The audience the token's `aud` must contain. Must not be blank or contain whitespace. |
 | `auth.jwks_url` | yes, in `[auth]` | The absolute `http` or `https` URL of the provider's JWK set. There is no discovery. |
-| `auth.required` | no | Default `true`: a request without a token is `401`. `false` lets a request without `Authorization` through as `anonymous`, for the rollout; a token that is sent is still validated. |
 | `auth.scope_prefix` | no | Default `bridge:`. Put in front of every scope name, so `calendar.read` becomes `bridge:calendar.read`. May be empty. Only printable ASCII other than space, `"` and `\`. |
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
 
-`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url`, `required` and `scope_prefix`; it never fetches the keys.
+`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url` and `scope_prefix`; it never fetches the keys.
 
 #### Why places are named
 
@@ -198,7 +196,7 @@ A location trigger names a place from the config rather than taking an address f
 
 Authentication is optional. Without an `[auth]` table the bridge reads no token, and the network bind and the `Host` check are the whole access control.
 
-With `[auth]`, a client sends an OAuth 2.0 access token in the `Authorization: Bearer <token>` header. The bridge is not an OAuth provider and has no login: an external OpenID provider issues the token to the client through the `client_credentials` grant, and the bridge checks it locally against the provider's published keys, without calling the provider per request.
+With `[auth]`, every request except `GET /healthz` needs an OAuth 2.0 access token in the `Authorization: Bearer <token>` header; a request without one is refused with `401`. There is no setting that lets a request without a token through. The bridge is not an OAuth provider and has no login: an external OpenID provider issues the token to the client through the `client_credentials` grant, and the bridge checks it locally against the provider's published keys, without calling the provider per request.
 
 ```toml
 [auth]
@@ -242,8 +240,7 @@ A write scope does not include the read scope: a client that creates events and 
 
 | Case | Status | `WWW-Authenticate` | Body |
 | --- | --- | --- | --- |
-| No token, `required = true` | `401` | `Bearer` | `{"error":"missing bearer token"}` |
-| No token, `required = false` | passes as `anonymous` | | |
+| No token | `401` | `Bearer` | `{"error":"missing bearer token"}` |
 | A token that fails any check, including a second `Authorization` header or a scheme other than `Bearer` | `401` | `Bearer error="invalid_token"` | `{"error":"invalid bearer token"}` |
 | A valid token without the route's scope | `403` | `Bearer error="insufficient_scope", scope="bridge:calendar.write"` | `{"error":"insufficient scope: bridge:calendar.write needed"}` |
 
@@ -251,7 +248,7 @@ The error never says which check failed; the log records only the kind of failur
 
 The bridge fetches the provider's keys from `jwks_url` at startup, retries every 30 seconds until it succeeds, and refreshes them every 12 hours, or 5 minutes after a failed refresh. It keeps only `RSA` signing keys with a `kid`; a key set with none of them is treated as a failed fetch and the old keys stay. A token signed with a key the bridge does not know yet makes it fetch once more, at most once a minute, so a key rotated in at the provider works at once. The last good key set is saved to `~/.config/eventkit-bridge/jwks-cache.json` and loaded at startup, so a restart while the provider is down does not refuse every request. The file holds public keys only. The fetch trusts the certificates in the macOS keychain, so a provider behind a private CA the Mac already trusts works, and it ignores `HTTP_PROXY`. Each fetch gives up after 10 seconds and refuses a key set over 64 KiB.
 
-To turn authentication on without breaking clients that do not send tokens yet, start with `required = false`. A request with a token is then checked as usual and refused when the token is invalid, while a request without `Authorization` goes through and is logged with `client=anonymous`. Once the log shows no `anonymous` requests, remove the line (or set `required = true`) and run `eventkit-bridge install`. `required` is a transition setting: a later release removes it, and a configured `[auth]` will then always require a token.
+To turn authentication on, give every client a token first, then add `[auth]` and run `eventkit-bridge install`; from then on a client without a token gets `401`.
 
 ### Command line
 
@@ -428,7 +425,7 @@ A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: 
 | Status | Meaning |
 | --- | --- |
 | `400` | The request is invalid; the message names the parameter or field. |
-| `401` | With `[auth]`: the bearer token is missing (`missing bearer token`, unless `required = false`) or fails a check (`invalid bearer token`). `WWW-Authenticate` says which. |
+| `401` | With `[auth]`: the bearer token is missing (`missing bearer token`) or fails a check (`invalid bearer token`). `WWW-Authenticate` says which. |
 | `403` | The security policy refused the request, or, with `[auth]`, the token lacks the route's scope (`insufficient scope: <scope> needed`). |
 | `404` | The event, the reminder or the route does not exist. |
 | `409` | `PATCH` or `DELETE` on a recurring event. |
@@ -725,7 +722,7 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.7.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95,"auth":{"jwks_keys":2,"jwks_age_s":3120}}
+{"status":"ok","version":"0.8.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95,"auth":{"jwks_keys":2,"jwks_age_s":3120}}
 ```
 
 `calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config.
@@ -757,11 +754,13 @@ A calendar, reminder or mail problem is reported before `auth jwks unavailable`.
 
 ## Upgrades
 
-There is nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
+There is usually nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
+
+Upgrading to 0.8.0 with an `[auth]` table: delete the `required` line from `[auth]` first and run `eventkit-bridge install`. 0.8.0 no longer knows the key, so a config that still has it fails to load with an unknown-key error naming `required`. On 0.7.0 a missing `required` means `true`, so deleting the line changes nothing there; if it was `required = false`, make sure every client sends a token before deleting it, because 0.8.0 refuses a request without one with `401`.
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, and a junk request for a visible message logs the account name and the requested junk value, whatever its outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope, or `client=anonymous` when `required = false` let a request without a token through. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, and a junk request for a visible message logs the account name and the requested junk value, whatever its outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
@@ -771,7 +770,7 @@ The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces o
 2026-10-05T09:15:21.030455Z  INFO eventkit_bridge::server: request method=GET route=/v1/calendars status=200 duration_ms=95 client=my-agent
 ```
 
-A refused token also logs `token refused` with its kind (`missing`, `malformed`, `unknown key`, `invalid` or `insufficient scope`) and nothing else. At startup, `auth on` logs the issuer, audience, `required` and `scope_prefix`, and `jwks loaded` the number of keys and whether they came from the `file` or the `provider`; a failed fetch logs `cannot fetch the jwks` with the HTTP status or the kind of error, never the body.
+A refused token also logs `token refused` with its kind (`missing`, `malformed`, `unknown key`, `invalid` or `insufficient scope`) and nothing else. At startup, `auth on` logs the issuer, audience and `scope_prefix`, and `jwks loaded` the number of keys and whether they came from the `file` or the `provider`; a failed fetch logs `cannot fetch the jwks` with the HTTP status or the kind of error, never the body.
 
 Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths of junk requests are never logged; of a failed Mail call, only its error code is logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. Bearer tokens, the `Authorization` header and every token claim other than the client id are never logged. The description of an IMAP account is often its email address; it appears once, in the startup listing.
 
@@ -811,6 +810,7 @@ The log is not rotated. To truncate it:
 - **`/healthz` says `mail schema changed`.** A macOS update changed the Envelope Index. Mail reads stay unreliable until the bridge is updated for the new format; remove `[mail]` to keep the rest of the bridge healthy meanwhile.
 - **`/healthz` says `auth jwks unavailable`.** The bridge has never fetched the provider's keys and has no `jwks-cache.json` to fall back on, so every token is refused. Look for `cannot fetch the jwks` in the log: a `status` means the provider answered with an error, so check `jwks_url` in a browser; `timed out` or `transport error` means the Mac cannot reach the provider or does not trust its certificate. `no usable keys` means the key set has no `RSA` signing key with a `kid`. `body too large` means the key set is over 64 KiB, and `not a jwk set` means `jwks_url` did not return a `{"keys": [...]}` document, which usually means it points at a login or discovery page. The bridge retries every 30 seconds, and the check turns healthy with the first successful fetch.
 - **Every request with a token gets `401 invalid bearer token`, and the log says `token refused kind=invalid`.** Most often the token has no `aud`: some providers, Authelia among them, issue a token without one when the token request leaves out `audience`. Request the token with `audience` set to the `audience` in `[auth]`, and check that the client is allowed that audience in the provider. Decode the token's middle segment (base64url) to compare its `iss` and `aud` with the config; `iss` must match `issuer` exactly, including a trailing slash.
+- **The bridge is unreachable after upgrading to 0.8.0, and the log says ``unknown field `required` ``.** 0.8.0 removed `required` from `[auth]`, and launchd keeps restarting a daemon that cannot load its config. Delete the line from `~/.config/eventkit-bridge/config.toml`, check that every client sends a token (a request without one is now `401`), and run `eventkit-bridge install`.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
 - **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars, Reminders and Full Disk Access permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.
 

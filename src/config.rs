@@ -351,8 +351,6 @@ pub struct AuthConfig {
     pub audience: String,
     /// Where the provider's signing keys are fetched from.
     pub jwks_url: Url,
-    /// Whether a request without a token is refused; `false` lets it through as `anonymous`.
-    pub required: bool,
     /// Prepended to a route's scope name to form the scope a token must carry.
     pub scope_prefix: String,
 }
@@ -614,7 +612,6 @@ struct RawAuth {
     issuer: Option<String>,
     audience: Option<String>,
     jwks_url: Option<String>,
-    required: Option<bool>,
     scope_prefix: Option<String>,
 }
 
@@ -980,7 +977,6 @@ fn parse_auth(auth: RawAuth) -> Result<AuthConfig, ConfigError> {
         issuer,
         audience,
         jwks_url,
-        required,
         scope_prefix,
     } = auth;
     let issuer = parse_auth_value("issuer", issuer)?;
@@ -1002,7 +998,6 @@ fn parse_auth(auth: RawAuth) -> Result<AuthConfig, ConfigError> {
         issuer,
         audience,
         jwks_url,
-        required: required.unwrap_or(true),
         scope_prefix,
     })
 }
@@ -2166,7 +2161,7 @@ mod tests {
     #[test]
     fn valid_auth_config() {
         let config = with_auth(&format!(
-            "{AUTH_ISSUER}{AUTH_AUDIENCE}{AUTH_JWKS}required = false\nscope_prefix = \"eventkit/\"\n"
+            "{AUTH_ISSUER}{AUTH_AUDIENCE}{AUTH_JWKS}scope_prefix = \"eventkit/\"\n"
         ))
         .unwrap();
         assert_eq!(
@@ -2175,7 +2170,6 @@ mod tests {
                 issuer: "https://auth.example.com".to_owned(),
                 audience: "https://eventkit-bridge".to_owned(),
                 jwks_url: Url::parse("https://auth.example.com/jwks.json").unwrap(),
-                required: false,
                 scope_prefix: "eventkit/".to_owned(),
             })
         );
@@ -2185,7 +2179,6 @@ mod tests {
     fn auth_defaults() {
         let config = with_auth(&format!("{AUTH_ISSUER}{AUTH_AUDIENCE}{AUTH_JWKS}")).unwrap();
         let auth = config.auth.unwrap();
-        assert!(auth.required);
         assert_eq!(auth.scope_prefix, "bridge:");
     }
 
@@ -2317,10 +2310,16 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_wrong_type() {
-        let err = auth_with("scope_prefix", "required = \"yes\"\n").unwrap_err();
-        let ConfigError::Parse(_) = &err else {
-            panic!("unexpected error: {err:?}");
-        };
+    fn auth_required_is_an_unknown_key() {
+        for value in ["true", "false"] {
+            let err = auth_with("scope_prefix", &format!("required = {value}\n")).unwrap_err();
+            let ConfigError::Parse(_) = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert!(
+                err.to_string().contains("unknown field `required`"),
+                "{err}"
+            );
+        }
     }
 }
