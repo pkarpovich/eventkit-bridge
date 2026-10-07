@@ -4963,7 +4963,7 @@ esac"#,
     struct AuthApp {
         _dir: tempfile::TempDir,
         _fixture: MailFixture,
-        _osascript: Fake,
+        osascript: Fake,
         router: Router,
     }
 
@@ -4985,7 +4985,7 @@ esac"#,
         AuthApp {
             _dir: dir,
             _fixture: fixture,
-            _osascript: osascript,
+            osascript,
             router,
         }
     }
@@ -5183,8 +5183,9 @@ esac"#,
         let (captured, _guard) = capture();
         let fake = write_fake();
         let app = auth_app(&fake, &[KID]);
-        for case in scoped_cases() {
-            let answer = exchange(&app.router, scoped_request(&case)).await;
+        let cases = scoped_cases();
+        for case in &cases {
+            let answer = exchange(&app.router, scoped_request(case)).await;
 
             assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{}", case.scope);
             assert_eq!(
@@ -5195,10 +5196,29 @@ esac"#,
             );
             assert_eq!(answer.body, error("missing bearer token"), "{}", case.scope);
         }
+        let answer = exchange(&app.router, empty(Method::HEAD, EVENT_PATH)).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(answer.challenge.as_deref(), Some("Bearer"));
+
         assert!(fake.calls().is_empty());
+        assert!(app.osascript.calls().is_empty());
         let log = captured.text();
-        assert!(log.contains("token refused"), "{log}");
-        assert!(!log.contains("anonymous"), "{log}");
+        let mut requests = Vec::new();
+        let mut refusals = 0;
+        for line in log.lines() {
+            if line.contains(" request method=") {
+                requests.push(line);
+            }
+            if line.contains("token refused kind=missing") {
+                refusals += 1;
+            }
+        }
+        assert_eq!(requests.len(), cases.len() + 1, "{log}");
+        for line in requests {
+            assert!(line.contains(" status=401 "), "{log}");
+            assert!(!line.contains("client="), "{log}");
+        }
+        assert_eq!(refusals, cases.len() + 1, "{log}");
     }
 
     #[tokio::test]
