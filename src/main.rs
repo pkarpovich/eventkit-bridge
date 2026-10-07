@@ -431,6 +431,10 @@ fn describe_mail(mail: &MailConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use eventkit_bridge::auth::{FetchError, JwksSource};
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Cli, argh::EarlyExit> {
@@ -734,26 +738,26 @@ mod tests {
         assert!(text.contains("mail excluded mailboxes: none\n"), "{text}");
     }
 
+    fn missing_runners(dir: &Path) -> Runners {
+        let calendars = Runner::new(dir.join("ekctl"), DEFAULT_TIMEOUT);
+        let reminders =
+            remindctl::Runner::new(dir.join("remindctl"), DEFAULT_TIMEOUT, calendars.lock());
+        Runners {
+            calendars,
+            reminders,
+            mail: script::Runner::new(dir.join("osascript"), script::DEADLINE),
+        }
+    }
+
     #[tokio::test]
     async fn daemon_fails_when_listen_cannot_be_bound() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = taken.local_addr().unwrap();
         let config = Config::from_toml(&format!("listen = \"{listen}\"")).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let calendars = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
-        let reminders = remindctl::Runner::new(
-            dir.path().join("remindctl"),
-            DEFAULT_TIMEOUT,
-            calendars.lock(),
-        );
-        let runners = Runners {
-            calendars,
-            reminders,
-            mail: script::Runner::new(dir.path().join("osascript"), script::DEADLINE),
-        };
         let setup = Setup {
             config,
-            runners,
+            runners: missing_runners(dir.path()),
             auth: None,
         };
         let result = daemon(setup, std::future::pending()).await;
@@ -764,6 +768,68 @@ mod tests {
             message.starts_with(&format!("cannot listen on {listen}: ")),
             "{message}"
         );
+    }
+
+    #[derive(Default)]
+    struct CountingSource(AtomicUsize);
+
+    impl JwksSource for CountingSource {
+        fn fetch(&self) -> Result<Vec<u8>, FetchError> {
+            let Self(calls) = self;
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(FetchError::Transport)
+        }
+    }
+
+    async fn until(done: impl Fn() -> bool) {
+        let deadline = Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("condition not reached within {deadline:?}");
+    }
+
+    #[tokio::test]
+    async fn daemon_runs_the_jwks_refresh_until_shutdown() {
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = free.local_addr().unwrap();
+        drop(free);
+        let config = Config::from_toml(&format!(
+            "listen = \"{listen}\"\n[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\n"
+        ))
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(CountingSource::default());
+        let jwks = Arc::new(Jwks::new(
+            Arc::clone(&source) as Arc<dyn JwksSource>,
+            dir.path().join(JWKS_CACHE_FILE),
+        ));
+        let table = config.auth.clone().unwrap();
+        let setup = Setup {
+            config,
+            runners: missing_runners(dir.path()),
+            auth: Some(Arc::new(Authenticator::new(&table, Arc::clone(&jwks)))),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let driver = async {
+            until(|| source.0.load(Ordering::SeqCst) == 1).await;
+            stop.send(()).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            daemon(setup, async move {
+                stopped.await.ok();
+            }),
+            driver
+        );
+
+        result.unwrap();
+        until(|| Arc::strong_count(&jwks) == 1).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -124,8 +124,16 @@ impl Jwks {
         }
     }
 
-    /// Fetches once for a token naming an unknown `kid`, unless the last such fetch was under 60 s ago; concurrent callers share one fetch.
-    pub async fn refetch_unknown_key(&self) {
+    /// Fetches once for a token naming an unknown `kid`, unless the last such fetch was under 60 s ago; concurrent callers share one fetch, which finishes and stores its keys even when the caller is dropped.
+    pub async fn refetch_unknown_key(self: &Arc<Self>) {
+        let jwks = Arc::clone(self);
+        let refetch = tokio::spawn(async move { jwks.refetch_gated().await });
+        if let Err(err) = refetch.await {
+            tracing::warn!(error = %err, "jwks refetch task failed");
+        }
+    }
+
+    async fn refetch_gated(&self) {
         let mut last = self.last_refetch.lock().await;
         if let Some(at) = *last
             && at.elapsed() < REFETCH_GATE
@@ -298,6 +306,8 @@ pub(crate) mod test_source {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -308,7 +318,8 @@ mod tests {
 
     const KID: &str = "key-1";
     const SETTLE_ROUNDS: usize = 20;
-    const WAIT_ROUNDS: usize = 10_000;
+    const WAIT_BUDGET: Duration = Duration::from_millis(50);
+    const REAL_WAIT: Duration = Duration::from_secs(5);
 
     struct Harness {
         dir: TempDir,
@@ -336,7 +347,8 @@ mod tests {
         }
 
         async fn wait_for(&self, calls: usize, keys: usize) {
-            for _ in 0..WAIT_ROUNDS {
+            let start = Instant::now();
+            while start.elapsed() < WAIT_BUDGET {
                 if self.source.calls() == calls && self.jwks.key_count() == keys {
                     settle().await;
                     assert_eq!(self.source.calls(), calls);
@@ -621,6 +633,107 @@ mod tests {
 
         assert_eq!(harness.source.calls(), 1);
         assert_eq!(harness.jwks.key_count(), 0);
+    }
+
+    struct HeldSource {
+        started: AtomicUsize,
+        running: AtomicUsize,
+        peak: AtomicUsize,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl HeldSource {
+        fn new() -> (mpsc::Sender<()>, Arc<Self>) {
+            let (release, held) = mpsc::channel();
+            let source = Self {
+                started: AtomicUsize::new(0),
+                running: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                release: std::sync::Mutex::new(held),
+            };
+            (release, Arc::new(source))
+        }
+
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+    }
+
+    impl JwksSource for HeldSource {
+        fn fetch(&self) -> Result<Vec<u8>, FetchError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(running, Ordering::SeqCst);
+            let release = self.release.lock().unwrap_or_else(PoisonError::into_inner);
+            let released = release.recv();
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            let Ok(()) = released else {
+                return Err(FetchError::Transport);
+            };
+            Ok(body(&[KID]))
+        }
+    }
+
+    fn held_jwks(dir: &TempDir, source: &Arc<HeldSource>) -> Arc<Jwks> {
+        let source = Arc::clone(source) as Arc<dyn JwksSource>;
+        Arc::new(Jwks::new(source, cache_path(dir)))
+    }
+
+    async fn until(done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < REAL_WAIT {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("condition not reached within {REAL_WAIT:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_and_refetch_never_fetch_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, source) = HeldSource::new();
+        let jwks = held_jwks(&dir, &source);
+        let refreshing = tokio::spawn({
+            let jwks = Arc::clone(&jwks);
+            async move { jwks.refresh().await }
+        });
+        until(|| source.started() == 1).await;
+        let refetching = tokio::spawn({
+            let jwks = Arc::clone(&jwks);
+            async move { jwks.refetch_unknown_key().await }
+        });
+        settle().await;
+        assert_eq!(source.started(), 1);
+
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        refreshing.await.unwrap().unwrap();
+        refetching.await.unwrap();
+
+        assert_eq!(source.started(), 2);
+        assert_eq!(source.peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_refetch_still_stores_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, source) = HeldSource::new();
+        let jwks = held_jwks(&dir, &source);
+        let refetching = tokio::spawn({
+            let jwks = Arc::clone(&jwks);
+            async move { jwks.refetch_unknown_key().await }
+        });
+        until(|| source.started() == 1).await;
+
+        refetching.abort();
+        assert!(refetching.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+
+        until(|| jwks.key_count() == 1).await;
+        assert!(jwks.keys().get(KID).is_some());
+        assert!(cache_path(&dir).exists());
     }
 
     #[test]

@@ -766,24 +766,29 @@ fn refuse_token(err: AuthError) -> Response {
             ("invalid bearer token", r#"Bearer error="invalid_token""#)
         }
     };
-    challenged(StatusCode::UNAUTHORIZED, message.to_owned(), challenge)
-}
-
-fn insufficient_scope(scope: &str) -> Response {
     challenged(
-        StatusCode::FORBIDDEN,
-        format!("insufficient scope: {scope} needed"),
-        &format!(r#"Bearer error="insufficient_scope", scope="{scope}""#),
+        StatusCode::UNAUTHORIZED,
+        message.to_owned(),
+        HeaderValue::from_static(challenge),
     )
 }
 
-fn challenged(status: StatusCode, message: String, challenge: &str) -> Response {
+fn insufficient_scope(scope: &str) -> Response {
+    let challenge = format!(r#"Bearer error="insufficient_scope", scope="{scope}""#);
+    let challenge = HeaderValue::from_str(&challenge)
+        .unwrap_or_else(|_| HeaderValue::from_static(r#"Bearer error="insufficient_scope""#));
+    challenged(
+        StatusCode::FORBIDDEN,
+        format!("insufficient scope: {scope} needed"),
+        challenge,
+    )
+}
+
+fn challenged(status: StatusCode, message: String, challenge: HeaderValue) -> Response {
     let mut response = ApiError::Status(status, message).into_response();
-    if let Ok(challenge) = HeaderValue::from_str(challenge) {
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, challenge);
-    }
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, challenge);
     response
 }
 
@@ -5483,6 +5488,52 @@ esac"#,
         assert!(log.contains("token refused kind=missing"), "{log}");
         assert!(log.contains("status=403"), "{log}");
         assert!(log.contains("status=401"), "{log}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jwks_fetch_logs_only_the_failure_kind() {
+        let (captured, _guard) = capture();
+        let dir = tempfile::tempdir().unwrap();
+        let source = test_source::ScriptedSource::new(vec![
+            Ok(b"<html>jwks-body-marker</html>".to_vec()),
+            Err(crate::auth::FetchError::Status(503)),
+            Ok(test_source::body(&["kid-in-the-body"])),
+        ]);
+        let jwks = Arc::new(crate::auth::Jwks::new(
+            Arc::new(source),
+            dir.path().join("jwks-cache.json"),
+        ));
+
+        for _ in 0..3 {
+            jwks.refetch_unknown_key().await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+        }
+
+        assert_eq!(jwks.key_count(), 1);
+        let log = captured.text();
+        assert!(
+            log.contains("cannot fetch the jwks for an unknown key error=not a jwk set"),
+            "{log}"
+        );
+        assert!(
+            log.contains("cannot fetch the jwks for an unknown key error=status 503"),
+            "{log}"
+        );
+        assert!(
+            log.contains(r#"jwks loaded keys=1 from="provider""#),
+            "{log}"
+        );
+        let jwk = test_keys::KEY.jwk_json("kid-in-the-body");
+        let modulus = jwk["n"].as_str().unwrap();
+        for secret in [
+            "jwks-body-marker",
+            "<html>",
+            "kid-in-the-body",
+            "\"keys\"",
+            modulus,
+        ] {
+            assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
     }
 
     #[tokio::test]

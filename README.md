@@ -249,7 +249,7 @@ A write scope does not include the read scope: a client that creates events and 
 
 The error never says which check failed; the log records only the kind of failure (see Logs).
 
-The bridge fetches the provider's keys from `jwks_url` at startup, retries every 30 seconds until it succeeds, and refreshes them every 12 hours, or 5 minutes after a failed refresh. It keeps only `RSA` signing keys with a `kid`; a key set with none of them is treated as a failed fetch and the old keys stay. A token signed with a key the bridge does not know yet makes it fetch once more, at most once a minute, so a key rotated in at the provider works at once. The last good key set is saved to `~/.config/eventkit-bridge/jwks-cache.json` and loaded at startup, so a restart while the provider is down does not refuse every request. The file holds public keys only. The fetch trusts the certificates in the macOS keychain, so a provider behind a private CA the Mac already trusts works, and it ignores `HTTP_PROXY`.
+The bridge fetches the provider's keys from `jwks_url` at startup, retries every 30 seconds until it succeeds, and refreshes them every 12 hours, or 5 minutes after a failed refresh. It keeps only `RSA` signing keys with a `kid`; a key set with none of them is treated as a failed fetch and the old keys stay. A token signed with a key the bridge does not know yet makes it fetch once more, at most once a minute, so a key rotated in at the provider works at once. The last good key set is saved to `~/.config/eventkit-bridge/jwks-cache.json` and loaded at startup, so a restart while the provider is down does not refuse every request. The file holds public keys only. The fetch trusts the certificates in the macOS keychain, so a provider behind a private CA the Mac already trusts works, and it ignores `HTTP_PROXY`. Each fetch gives up after 10 seconds and refuses a key set over 64 KiB.
 
 To turn authentication on without breaking clients that do not send tokens yet, start with `required = false`. A request with a token is then checked as usual and refused when the token is invalid, while a request without `Authorization` goes through and is logged with `client=anonymous`. Once the log shows no `anonymous` requests, remove the line (or set `required = true`) and run `eventkit-bridge install`. `required` is a transition setting: a later release removes it, and a configured `[auth]` will then always require a token.
 
@@ -265,11 +265,11 @@ To turn authentication on without breaking clients that do not send tokens yet, 
 
 `install` points the LaunchAgent at the real binary inside `EventKitBridge.app`, not at the Homebrew symlink, because the Calendars, Reminders and Full Disk Access permissions belong to the app bundle. It warns when the binary is not inside an `.app` bundle, since the permissions would then not survive an upgrade.
 
-To remove the bridge completely, run `eventkit-bridge uninstall`, then `brew uninstall --cask --zap eventkit-bridge`, which also deletes the config, the LaunchAgent plist and the log.
+To remove the bridge completely, run `eventkit-bridge uninstall`, then `brew uninstall --cask --zap eventkit-bridge`, which also deletes the config directory (the config and, with `[auth]`, `jwks-cache.json`), the LaunchAgent plist and the log.
 
 ## HTTP API
 
-The examples use `http://100.64.0.1:8790`. Every response body is JSON. Every error is `{"error":"<message>"}` with the status codes below.
+The examples use `http://100.64.0.1:8790`. With `[auth]`, every example also needs `-H "Authorization: Bearer $TOKEN"` (see Authentication). Every response body is JSON. Every error is `{"error":"<message>"}` with the status codes below.
 
 ### Types
 
@@ -443,7 +443,7 @@ Requests are handled one `ekctl` or `remindctl` call at a time; both tools share
 
 ## Reminders API
 
-The reminder routes follow the same rules as the calendar routes: the `Host` check, `Content-Type: application/json` on `POST` and `PATCH`, the 64 KiB body limit, `{"error": ...}` errors, and `400` for unknown query parameters, unknown body fields and control characters other than newline and tab.
+The reminder routes follow the same rules as the calendar routes: the `Host` check, with `[auth]` a bearer token with the route's scope, `Content-Type: application/json` on `POST` and `PATCH`, the 64 KiB body limit, `{"error": ...}` errors, and `400` for unknown query parameters, unknown body fields and control characters other than newline and tab.
 
 ### Types
 
@@ -574,7 +574,7 @@ Reminder sections, tags, subtasks, smart lists, the Groceries list type and the 
 
 ## Mail API
 
-The mail routes follow the same rules as the other routes: the `Host` check, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
+The mail routes follow the same rules as the other routes: the `Host` check, with `[auth]` a bearer token with the route's scope, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
 
 Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request. Junk requests do not wait for them either; they wait only for each other, one Mail call at a time.
 
@@ -809,7 +809,7 @@ The log is not rotated. To truncate it:
 
 - **`/healthz` says `mail account missing`.** An account in `[mail.accounts]` was removed from Mail or re-added under a new uuid. Look up the current uuids in the startup listing in the log and update the config.
 - **`/healthz` says `mail schema changed`.** A macOS update changed the Envelope Index. Mail reads stay unreliable until the bridge is updated for the new format; remove `[mail]` to keep the rest of the bridge healthy meanwhile.
-- **`/healthz` says `auth jwks unavailable`.** The bridge has never fetched the provider's keys and has no `jwks-cache.json` to fall back on, so every token is refused. Look for `cannot fetch the jwks` in the log: a `status` means the provider answered with an error, so check `jwks_url` in a browser; `timed out` or `transport error` means the Mac cannot reach the provider or does not trust its certificate. `no usable keys` means the key set has no `RSA` signing key with a `kid`. The bridge retries every 30 seconds, and the check turns healthy with the first successful fetch.
+- **`/healthz` says `auth jwks unavailable`.** The bridge has never fetched the provider's keys and has no `jwks-cache.json` to fall back on, so every token is refused. Look for `cannot fetch the jwks` in the log: a `status` means the provider answered with an error, so check `jwks_url` in a browser; `timed out` or `transport error` means the Mac cannot reach the provider or does not trust its certificate. `no usable keys` means the key set has no `RSA` signing key with a `kid`. `body too large` means the key set is over 64 KiB, and `not a jwk set` means `jwks_url` did not return a `{"keys": [...]}` document, which usually means it points at a login or discovery page. The bridge retries every 30 seconds, and the check turns healthy with the first successful fetch.
 - **Every request with a token gets `401 invalid bearer token`, and the log says `token refused kind=invalid`.** Most often the token has no `aud`: some providers, Authelia among them, issue a token without one when the token request leaves out `audience`. Request the token with `audience` set to the `audience` in `[auth]`, and check that the client is allowed that audience in the provider. Decode the token's middle segment (base64url) to compare its `iss` and `aud` with the config; `iss` must match `issuer` exactly, including a trailing slash.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
 - **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars, Reminders and Full Disk Access permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.

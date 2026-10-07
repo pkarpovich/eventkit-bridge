@@ -793,7 +793,7 @@ mod tests {
             &claims(),
         );
 
-        assert!(check(&token).is_err());
+        assert_eq!(check(&token), Err(AuthError::Malformed));
     }
 
     #[test]
@@ -1147,6 +1147,10 @@ mod tests {
             bearer("not-a-jwt"),
             bearer(&KEY.sign(&no_kid, &claims())),
             bearer(&mint_hs256(&claims(), "key-9")),
+            bearer(&unsigned(
+                &json!({"alg": "none", "typ": "at+jwt", "kid": "key-9"}),
+                &claims(),
+            )),
         ];
         for headers in cases {
             assert!(harness.authenticator.authenticate(&headers).await.is_err());

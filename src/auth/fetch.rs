@@ -185,4 +185,13 @@ mod tests {
 
         assert_eq!(result, Err(FetchError::Transport));
     }
+
+    #[test]
+    fn fetch_ignores_the_environment_proxy() {
+        let url = Url::parse("https://auth.example.com/jwks.json").unwrap();
+
+        let source = HttpJwksSource::new(url);
+
+        assert!(source.agent.config().proxy().is_none());
+    }
 }
