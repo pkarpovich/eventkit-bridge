@@ -154,10 +154,10 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 **Files:**
 - Modify: `src/config.rs`, `src/main.rs`
 
-- [ ] `RawAuth` with `deny_unknown_fields`, `AuthConfig { issuer, audience, jwks_url: url::Url, required, scope_prefix }`, every rule from Design, new `ConfigError` variants naming the key
-- [ ] `--check-config` output from Design
-- [ ] tests: full table; defaults for `required` and `scope_prefix`; absent table is `None`; blank issuer; issuer with whitespace; blank audience; `jwks_url` relative, `ftp://`, blank; `scope_prefix` with a space, a quote, a backslash; empty `scope_prefix` accepted; unknown key; `describe` output with and without `[auth]`
-- [ ] run tests, `mise run check`
+- [x] `RawAuth` with `deny_unknown_fields`, `AuthConfig { issuer, audience, jwks_url: url::Url, required, scope_prefix }`, every rule from Design, new `ConfigError` variants naming the key
+- [x] `--check-config` output from Design
+- [x] tests: full table; defaults for `required` and `scope_prefix`; absent table is `None`; blank issuer; issuer with whitespace; blank audience; `jwks_url` relative, `ftp://`, blank; `scope_prefix` with a space, a quote, a backslash; empty `scope_prefix` accepted; unknown key; `describe` output with and without `[auth]`
+- [x] run tests, `mise run check`
 
 ### Task 2: Token validation
 
@@ -165,56 +165,78 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 - Create: `src/auth.rs` (the module is declared in `src/lib.rs` the moment it exists)
 - Modify: `Cargo.toml`, `src/lib.rs`
 
-- [ ] `cargo add` the crates from Design; confirm `cargo tree -i rsa` shows one copy
-- [ ] `Claims`, `OneOrMany`, `Principal`, the `Validate` steps 1-6 over a given key set, `AuthError` kinds without values
-- [ ] the scope table, `scope_for(method, route) -> Option<&'static str>`, and the required scope as `scope_prefix` + name
-- [ ] a test key module under `#[cfg(test)]`: the `LazyLock` key pair, `jwk(kid)`, `mint(claims, kid)` and `mint_hs256(claims)` helpers
-- [ ] tests: valid token with `scp` array; valid with `scope` string; both at once unioned; missing token; `basic` scheme; two headers; empty token; wrong signature (a second key pair); unknown `kid`; no `kid`; expired beyond leeway and expired within 60 s; `nbf` 120 s ahead refused, 30 s ahead accepted; wrong `iss`; `aud` missing; `aud` without the audience; `aud` as a plain matching string; `alg: none`; HS256 signed with the public key bytes; `typ` missing; `typ` `JWT`; `typ` `application/AT+JWT` accepted; neither `sub` nor `client_id`; `client_id` preferred over `sub` as the principal; the error `Display` and `Debug` of every kind contain no claim value
-- [ ] run tests, `mise run check`
+- [x] `cargo add` the crates from Design; confirm `cargo tree -i rsa` shows one copy
+- [x] `Claims`, `OneOrMany`, `Principal`, the `Validate` steps 1-6 over a given key set, `AuthError` kinds without values
+- [x] the scope table, `scope_for(method, route) -> Option<&'static str>`, and the required scope as `scope_prefix` + name
+- [x] a test key module under `#[cfg(test)]`: the `LazyLock` key pair, `jwk(kid)`, `mint(claims, kid)` and `mint_hs256(claims)` helpers
+- [x] tests: valid token with `scp` array; valid with `scope` string; both at once unioned; missing token; `basic` scheme; two headers; empty token; wrong signature (a second key pair); unknown `kid`; no `kid`; expired beyond leeway and expired within 60 s; `nbf` 120 s ahead refused, 30 s ahead accepted; wrong `iss`; `aud` missing; `aud` without the audience; `aud` as a plain matching string; `alg: none`; HS256 signed with the public key bytes; `typ` missing; `typ` `JWT`; `typ` `application/AT+JWT` accepted; neither `sub` nor `client_id`; `client_id` preferred over `sub` as the principal; the error `Display` and `Debug` of every kind contain no claim value
+- [x] run tests, `mise run check` (the three cargo commands run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ `Claims` leaves out `exp`, `nbf`, `iat` and `jti`: `jsonwebtoken` checks `exp` and `nbf` itself, and fields that are deserialised but never read are `dead_code` warnings. Serde ignores them, so a non-integer `iat` or `jti` cannot fail a token.
+- ⚠️ `KeySet::from_jwks` already does the JWK filtering from "Parsing" (RSA, `kid`, `alg` absent or `RS256`, `use` absent or `sig`), with a test. Task 3 adds the zero-keys-is-a-failure rule on top.
+- ⚠️ `scope_for` returns the scope name, and `Validator::required_scope(method, route)` adds `scope_prefix`.
+- ⚠️ `Cargo.toml` sets `[profile.dev.package.num-bigint-dig] opt-level = 3`: generating the two 2048-bit test keys drops from about 6 s to under 0.5 s.
 
 ### Task 3: JWKS cache
 
 **Files:**
 - Modify: `src/auth.rs` (or split into `src/auth/mod.rs`, `src/auth/jwks.rs`, `src/auth/fetch.rs` if it passes 1000 lines)
 
-- [ ] `JwksSource` trait, `Jwks` with the startup load, the 12 h / 5 min refresh loop as `run_refresh(self: Arc<Self>)`, the unknown-`kid` refetch with the 60 s gate and the shared `Mutex`
-- [ ] parsing and filtering of `JwkSet`; zero usable keys is a failed fetch
-- [ ] persistence: write through temp file and rename, load at startup, `fetched_at`, `age()`, `key_count()`
-- [ ] `HttpJwksSource` over `ureq` with the timeout, body cap, `http_status_as_error` and `RootCerts::PlatformVerifier`, on `spawn_blocking`
-- [ ] tests with paused time and a scripted source: unknown `kid` triggers exactly one fetch then succeeds; a second unknown `kid` 30 s later does not fetch and fails, one at 61 s fetches; a failed startup fetch retries after 30 s and succeeds; the 12 h refresh fires; a failed refresh keeps the old keys and retries in 5 min; a body with no RSA keys keeps the old keys; a body over the cap is a failure; the file is written after a good fetch and loaded by a fresh `Jwks` with the same count and an age computed from `fetched_at`; a corrupt file is ignored; a key with `use: enc` and one with `alg: ES256` are dropped
-- [ ] `HttpJwksSource` tests against a local listener: `200` body; `500`; a body over 64 KiB; a server that accepts and never answers, with the client timeout shortened for the test
-- [ ] run tests, `mise run check`
+- [x] `JwksSource` trait, `Jwks` with the startup load, the 12 h / 5 min refresh loop as `run_refresh(self: Arc<Self>)`, the unknown-`kid` refetch with the 60 s gate and the shared `Mutex`
+- [x] parsing and filtering of `JwkSet`; zero usable keys is a failed fetch
+- [x] persistence: write through temp file and rename, load at startup, `fetched_at`, `age()`, `key_count()`
+- [x] `HttpJwksSource` over `ureq` with the timeout, body cap, `http_status_as_error` and `RootCerts::PlatformVerifier`, on `spawn_blocking`
+- [x] tests with paused time and a scripted source: unknown `kid` triggers exactly one fetch then succeeds; a second unknown `kid` 30 s later does not fetch and fails, one at 61 s fetches; a failed startup fetch retries after 30 s and succeeds; the 12 h refresh fires; a failed refresh keeps the old keys and retries in 5 min; a body with no RSA keys keeps the old keys; a body over the cap is a failure; the file is written after a good fetch and loaded by a fresh `Jwks` with the same count and an age computed from `fetched_at`; a corrupt file is ignored; a key with `use: enc` and one with `alg: ES256` are dropped
+- [x] `HttpJwksSource` tests against a local listener: `200` body; `500`; a body over 64 KiB; a server that accepts and never answers, with the client timeout shortened for the test
+- [x] run tests, `mise run check` (the three cargo commands run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ Split into `src/auth/mod.rs` (validation, scope table, `Authenticator`), `src/auth/jwks.rs` (`JwksSource`, `FetchError`, `Jwks`) and `src/auth/fetch.rs` (`HttpJwksSource`): with the cache the single file would pass 1000 lines.
+- ⚠️ `JwksSource::fetch` is synchronous; `Jwks` runs every fetch on `spawn_blocking`, so a scripted source needs no runtime and `HttpJwksSource` blocks only a pool thread.
+- ⚠️ `Authenticator { validator, jwks }` lands here rather than in Task 4: `authenticate(headers)` validates, and on `UnknownKey` calls `Jwks::refetch_unknown_key` and looks up once more. The periodic refresh and the unknown-`kid` refetch share the one `tokio::sync::Mutex`, so two fetches never run (or write the cache file) at once.
+- ⚠️ The body is parsed as `{"keys": [..]}` with each key deserialised into a `Jwk` on its own, instead of one `JwkSet`: a single key that `jsonwebtoken` cannot parse is dropped instead of failing the whole set.
+- ⚠️ `Jwks` also refuses a body over 64 KiB from any source, so the cap is tested with the scripted source as well as over HTTP. ureq's `limit(n)` fails a body of exactly `n` bytes, so `HttpJwksSource` passes `BODY_CAP + 1`, and a 64 KiB body is accepted.
+- ⚠️ `HttpJwksSource` sets `proxy(None)`: the provider is on the private network, and an `HTTP_PROXY` in the environment must not reroute the fetch.
+- ⚠️ `kind(ureq::Error)` has one `_ => Transport` arm: `ureq::Error` is `#[non_exhaustive]`, so a wildcard is required.
+- ⚠️ `tokio` is also listed under dev-dependencies with `test-util`, for `start_paused` and `advance`.
 
 ### Task 4: Middleware, logging, health, wiring
 
 **Files:**
 - Modify: `src/server.rs`, `src/health.rs`, `src/main.rs`
 
-- [ ] `App::new(config, runners, auth: Option<Arc<Authenticator>>)`; `main.rs` builds the `Authenticator` from `config.auth` with `HttpJwksSource` and the cache path beside the config file, spawns `run_refresh` next to the announcers and aborts it on shutdown
-- [ ] `require_bearer` middleware in the position from Design, the three responses with their `WWW-Authenticate` values, the `/healthz` exemption, the `Principal` response extension
-- [ ] `log_request` logs `client`; startup and refusal log lines from Design
-- [ ] health: `auth` object in the `200` body, `DegradedReason::AuthJwksUnavailable` serialised as `auth jwks unavailable`, only when no keys are loaded
-- [ ] the route-coverage test over `router()`
-- [ ] HTTP tests through `oneshot`, with the scripted source preloaded: one valid request per scope name against a route in its group; a read token on a write route is `403` with the exact header; `required = true` without a token is `401 Bearer`; `required = false` without a token reaches the handler and logs `anonymous`; `required = false` with a bad token is still `401`; `/healthz` without a token is `200` in both modes and carries `auth`; `/healthz` with no keys loaded is `503 auth jwks unavailable`; an unknown path with a valid token is `404`, without one `401`; the `Host` check still answers `421` before the token is read; the body limit still answers `413` after a valid token; no `[auth]` table leaves every existing test untouched
-- [ ] extend the never-logged test as described under Logging
-- [ ] run tests, `mise run check`
+- [x] `App::new(config, runners, auth: Option<Arc<Authenticator>>)`; `main.rs` builds the `Authenticator` from `config.auth` with `HttpJwksSource` and the cache path beside the config file, spawns `run_refresh` next to the announcers and aborts it on shutdown
+- [x] `require_bearer` middleware in the position from Design, the three responses with their `WWW-Authenticate` values, the `/healthz` exemption, the `Principal` response extension
+- [x] `log_request` logs `client`; startup and refusal log lines from Design
+- [x] health: `auth` object in the `200` body, `DegradedReason::AuthJwksUnavailable` serialised as `auth jwks unavailable`, only when no keys are loaded
+- [x] the route-coverage test over `router()`
+- [x] HTTP tests through `oneshot`, with the scripted source preloaded: one valid request per scope name against a route in its group; a read token on a write route is `403` with the exact header; `required = true` without a token is `401 Bearer`; `required = false` without a token reaches the handler and logs `anonymous`; `required = false` with a bad token is still `401`; `/healthz` without a token is `200` in both modes and carries `auth`; `/healthz` with no keys loaded is `503 auth jwks unavailable`; an unknown path with a valid token is `404`, without one `401`; the `Host` check still answers `421` before the token is read; the body limit still answers `413` after a valid token; no `[auth]` table leaves every existing test untouched
+- [x] extend the never-logged test as described under Logging
+- [x] run tests, `mise run check` (the three cargo commands and `shellcheck` run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ `scope_for` maps `HEAD` to the `GET` row: axum answers `HEAD` with the `GET` handler, so without the mapping a token with no scope could run every read route's handler through `HEAD`. Tested in `auth` and through the router, and the route-coverage test probes `HEAD` too.
+- ⚠️ `router()` registers the routes from a `routes()` list, so the coverage test walks exactly what the router serves: with a scopeless token every method on every route other than `/healthz` is either `403` (has a row) or `405` (no handler), and with every scope a row never answers `405` or carries a challenge.
+- ⚠️ `Authenticator` holds `required` and exposes `required()`, `jwks()` and `required_scope()`; the middleware's one transition branch is `Err(AuthError::Missing) if !auth.required()`.
+- ⚠️ `Probe` carries an `AuthStatus` snapshot taken per request, and `HealthCheck::check` applies it after the cached probe, so the key count and age are never 10 s stale; a calendar, reminder or mail failure still wins over `auth jwks unavailable`.
+- ⚠️ `main.rs` passes a `Setup { config, runners, auth }` to `daemon` (no function with 4 parameters); the `Authenticator` is built in `run_daemon`, after the subscriber, so `auth on` precedes `jwks loaded`.
+- ⚠️ A `403` for a missing scope also carries `client=<id>` on the request line; a `401` carries no client.
+- ⚠️ The never-logged check is a new test next to the existing ones, `auth_request_log_carries_the_client_but_no_token`, because the existing tests run without `[auth]`, and they stay unchanged.
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] every row of the response table, the scope table and the JWKS cache rules has a test
-- [ ] every existing `server.rs` test still passes with `[auth]` absent
-- [ ] `mise run check` passes
+- [x] every row of the response table, the scope table and the JWKS cache rules has a test
+- [x] every existing `server.rs` test still passes with `[auth]` absent
+- [x] `mise run check` passes (the three cargo commands and `shellcheck` run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- ⚠️ The audit found one JWKS rule without a direct test: keys persisted from an earlier run must keep serving while the provider stays down at startup. Added `persisted_keys_serve_while_the_startup_fetch_keeps_failing` in `src/auth/jwks.rs`. It also checks that the startup retry stays at 30 s after a second failure.
 
 ### Task 6: Docs and version
 
 **Files:**
 - Modify: `README.md`, `CLAUDE.md`, `Cargo.toml`
 
-- [ ] README: the Security model bullets from Design; an "Authentication" section after "Config reference" with the `[auth]` example, how to request a token (`client_credentials` with `scope` and `audience`, with `auth.example.com` as the provider), the scope table and the `required = false` rollout; the config table rows; `401` and `403` rows in "Status codes"; `auth` and `auth jwks unavailable` in "Health check"; the `client` field in "Logs"; a troubleshooting entry for `auth jwks unavailable` and one for a token refused because `aud` is missing
-- [ ] CLAUDE.md: the rules under Security model changes; mention `src/auth.rs` in the first paragraph
-- [ ] version 0.7.0 in `Cargo.toml` and in the README health example
-- [ ] run `mise run check`, `shellcheck scripts/*.sh`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: the Security model bullets from Design; an "Authentication" section after "Config reference" with the `[auth]` example, how to request a token (`client_credentials` with `scope` and `audience`, with `auth.example.com` as the provider), the scope table and the `required = false` rollout; the config table rows; `401` and `403` rows in "Status codes"; `auth` and `auth jwks unavailable` in "Health check"; the `client` field in "Logs"; a troubleshooting entry for `auth jwks unavailable` and one for a token refused because `aud` is missing
+- [x] CLAUDE.md: the rules under Security model changes; mention `src/auth.rs` in the first paragraph
+- [x] version 0.7.0 in `Cargo.toml` and in the README health example
+- [x] run `mise run check`, `shellcheck scripts/*.sh` (the three cargo commands and `shellcheck` run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- [x] move this plan to `docs/plans/completed/`
+- ⚠️ CLAUDE.md names `src/auth/` (with `mod.rs`, `jwks.rs`, `fetch.rs`) rather than `src/auth.rs`, after the Task 3 split.
+- ⚠️ The README scope table leaves out the `/v1/events/` empty-id route: it only answers `400`, and it shares the `calendar.read`/`calendar.write` rows with `/v1/events/{id}`.
 
 ## Post-Completion
 

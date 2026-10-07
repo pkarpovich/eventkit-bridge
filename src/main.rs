@@ -11,7 +11,8 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
 
-use eventkit_bridge::config::{Config, MailAccount, MailConfig, Place};
+use eventkit_bridge::auth::{Authenticator, HttpJwksSource, Jwks};
+use eventkit_bridge::config::{AuthConfig, Config, MailAccount, MailConfig, Place};
 use eventkit_bridge::ekctl::{DEFAULT_TIMEOUT, Runner};
 use eventkit_bridge::executable::{self, Change, Identity, SWAP_POLL};
 use eventkit_bridge::mail::script;
@@ -22,6 +23,7 @@ use eventkit_bridge::service::{
 };
 
 const ANNOUNCE_RETRY: Duration = Duration::from_secs(30);
+const JWKS_CACHE_FILE: &str = "jwks-cache.json";
 
 /// Exposes the Mac's calendars over HTTP through ekctl.
 #[derive(FromArgs, Debug, PartialEq, Eq)]
@@ -123,7 +125,7 @@ fn check_config() -> Result<(), String> {
 }
 
 fn run_daemon() -> Result<(), String> {
-    let (_path, config) = load_config()?;
+    let (path, config) = load_config()?;
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_ansi(false)
@@ -143,28 +145,64 @@ fn run_daemon() -> Result<(), String> {
         reminders,
         mail: script::Runner::new(PathBuf::from(script::OSASCRIPT), script::DEADLINE),
     };
+    let auth = authenticator(&path, &config);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("cannot start the runtime: {err}"))?;
     let shutdown = shutdown(executable, identity);
-    runtime.block_on(daemon(config, runners, shutdown))
+    runtime.block_on(daemon(
+        Setup {
+            config,
+            runners,
+            auth,
+        },
+        shutdown,
+    ))
+}
+
+fn authenticator(config_path: &Path, config: &Config) -> Option<Arc<Authenticator>> {
+    let auth = config.auth.as_ref()?;
+    let AuthConfig {
+        issuer,
+        audience,
+        jwks_url,
+        required,
+        scope_prefix,
+    } = auth;
+    tracing::info!(issuer, audience, required, scope_prefix, "auth on");
+    let source = Arc::new(HttpJwksSource::new(jwks_url.clone()));
+    let jwks = Jwks::new(source, config_path.with_file_name(JWKS_CACHE_FILE));
+    Some(Arc::new(Authenticator::new(auth, Arc::new(jwks))))
 }
 
 fn resolve_executable() -> Result<PathBuf, String> {
     executable::canonical().map_err(|err| format!("cannot resolve the running executable: {err}"))
 }
 
-async fn daemon(
+struct Setup {
     config: Config,
     runners: Runners,
+    auth: Option<Arc<Authenticator>>,
+}
+
+async fn daemon(
+    setup: Setup,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
+    let Setup {
+        config,
+        runners,
+        auth,
+    } = setup;
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|err| format!("cannot listen on {}: {err}", config.listen))?;
     tracing::info!(listen = %config.listen, version = env!("CARGO_PKG_VERSION"), "listening");
-    let app = Arc::new(App::new(&config, runners));
+    let refresher = auth
+        .as_ref()
+        .map(|auth| tokio::spawn(Arc::clone(auth.jwks()).run_refresh()));
+    let app = Arc::new(App::new(&config, runners, auth));
     let announcer = {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
@@ -189,6 +227,9 @@ async fn daemon(
     .await;
     announcer.abort();
     mail_announcer.abort();
+    if let Some(refresher) = refresher {
+        refresher.abort();
+    }
     result.map_err(|err| format!("server failed: {err}"))?;
     tracing::info!("stopped");
     Ok(())
@@ -290,6 +331,7 @@ fn describe(path: &Path, config: &Config) -> String {
         places,
         remindctl: _,
         mail,
+        auth,
     } = config;
     let (ekctl, remindctl) = match executable::canonical() {
         Ok(executable) => (
@@ -340,7 +382,24 @@ fn describe(path: &Path, config: &Config) -> String {
         None => out.push_str("mail: off\n"),
         Some(mail) => out.push_str(&describe_mail(mail)),
     }
+    match auth {
+        None => out.push_str("auth: off\n"),
+        Some(auth) => out.push_str(&describe_auth(auth)),
+    }
     out
+}
+
+fn describe_auth(auth: &AuthConfig) -> String {
+    let AuthConfig {
+        issuer,
+        audience,
+        jwks_url,
+        required,
+        scope_prefix,
+    } = auth;
+    format!(
+        "auth: on\nauth issuer: {issuer}\nauth audience: {audience}\nauth jwks_url: {jwks_url}\nauth required: {required}\nauth scope_prefix: {scope_prefix:?}\n"
+    )
 }
 
 fn describe_mail(mail: &MailConfig) -> String {
@@ -372,6 +431,10 @@ fn describe_mail(mail: &MailConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use eventkit_bridge::auth::{FetchError, JwksSource};
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Cli, argh::EarlyExit> {
@@ -520,7 +583,98 @@ mod tests {
     fn describe_mail_off() {
         let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
-        assert!(text.ends_with("mail: off\n"), "{text}");
+        assert!(text.contains("mail: off\n"), "{text}");
+    }
+
+    #[test]
+    fn describe_auth_off() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(text.ends_with("mail: off\nauth: off\n"), "{text}");
+    }
+
+    #[test]
+    fn describe_auth_on() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+
+            [auth]
+            issuer = "https://auth.example.com"
+            audience = "https://eventkit-bridge"
+            jwks_url = "https://auth.example.com/jwks.json"
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(
+            text.ends_with(
+                "auth: on\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth required: true\nauth scope_prefix: \"bridge:\"\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("auth: off"), "{text}");
+    }
+
+    #[test]
+    fn describe_auth_transition() {
+        let config = Config::from_toml(
+            r#"
+            listen = "127.0.0.1:8790"
+
+            [auth]
+            issuer = "https://auth.example.com"
+            audience = "https://eventkit-bridge"
+            jwks_url = "https://auth.example.com/jwks.json"
+            required = false
+            scope_prefix = ""
+            "#,
+        )
+        .unwrap();
+        let text = describe(Path::new("/tmp/config.toml"), &config);
+        assert!(
+            text.ends_with("auth required: false\nauth scope_prefix: \"\"\n"),
+            "{text}"
+        );
+    }
+
+    fn auth_config(required: bool) -> Config {
+        Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\n[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\nrequired = {required}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn no_auth_table_builds_no_authenticator() {
+        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        assert!(authenticator(Path::new("/nonexistent/config.toml"), &config).is_none());
+    }
+
+    #[test]
+    fn authenticator_loads_the_cache_beside_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("jwks-cache.json"),
+            r#"{"fetched_at": 1, "jwks": {"keys": [{"kty": "RSA", "kid": "key-1", "n": "AQAB", "e": "AQAB"}]}}"#,
+        )
+        .unwrap();
+
+        let auth = authenticator(&dir.path().join("config.toml"), &auth_config(false)).unwrap();
+
+        assert_eq!(auth.jwks().key_count(), 1);
+        assert!(!auth.required());
+    }
+
+    #[test]
+    fn authenticator_without_a_cache_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let auth = authenticator(&dir.path().join("config.toml"), &auth_config(true)).unwrap();
+
+        assert_eq!(auth.jwks().key_count(), 0);
+        assert_eq!(auth.jwks().age(), None);
+        assert!(auth.required());
     }
 
     #[test]
@@ -542,7 +696,7 @@ mod tests {
         );
         assert!(
             text.ends_with(
-                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\n"
+                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\nauth: off\n"
             ),
             "{text}"
         );
@@ -584,24 +738,29 @@ mod tests {
         assert!(text.contains("mail excluded mailboxes: none\n"), "{text}");
     }
 
+    fn missing_runners(dir: &Path) -> Runners {
+        let calendars = Runner::new(dir.join("ekctl"), DEFAULT_TIMEOUT);
+        let reminders =
+            remindctl::Runner::new(dir.join("remindctl"), DEFAULT_TIMEOUT, calendars.lock());
+        Runners {
+            calendars,
+            reminders,
+            mail: script::Runner::new(dir.join("osascript"), script::DEADLINE),
+        }
+    }
+
     #[tokio::test]
     async fn daemon_fails_when_listen_cannot_be_bound() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = taken.local_addr().unwrap();
         let config = Config::from_toml(&format!("listen = \"{listen}\"")).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let calendars = Runner::new(dir.path().join("ekctl"), DEFAULT_TIMEOUT);
-        let reminders = remindctl::Runner::new(
-            dir.path().join("remindctl"),
-            DEFAULT_TIMEOUT,
-            calendars.lock(),
-        );
-        let runners = Runners {
-            calendars,
-            reminders,
-            mail: script::Runner::new(dir.path().join("osascript"), script::DEADLINE),
+        let setup = Setup {
+            config,
+            runners: missing_runners(dir.path()),
+            auth: None,
         };
-        let result = daemon(config, runners, std::future::pending()).await;
+        let result = daemon(setup, std::future::pending()).await;
         let Err(message) = result else {
             panic!("the daemon started on an address in use");
         };
@@ -609,6 +768,68 @@ mod tests {
             message.starts_with(&format!("cannot listen on {listen}: ")),
             "{message}"
         );
+    }
+
+    #[derive(Default)]
+    struct CountingSource(AtomicUsize);
+
+    impl JwksSource for CountingSource {
+        fn fetch(&self) -> Result<Vec<u8>, FetchError> {
+            let Self(calls) = self;
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(FetchError::Transport)
+        }
+    }
+
+    async fn until(done: impl Fn() -> bool) {
+        let deadline = Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("condition not reached within {deadline:?}");
+    }
+
+    #[tokio::test]
+    async fn daemon_runs_the_jwks_refresh_until_shutdown() {
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = free.local_addr().unwrap();
+        drop(free);
+        let config = Config::from_toml(&format!(
+            "listen = \"{listen}\"\n[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\n"
+        ))
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(CountingSource::default());
+        let jwks = Arc::new(Jwks::new(
+            Arc::clone(&source) as Arc<dyn JwksSource>,
+            dir.path().join(JWKS_CACHE_FILE),
+        ));
+        let table = config.auth.clone().unwrap();
+        let setup = Setup {
+            config,
+            runners: missing_runners(dir.path()),
+            auth: Some(Arc::new(Authenticator::new(&table, Arc::clone(&jwks)))),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let driver = async {
+            until(|| source.0.load(Ordering::SeqCst) == 1).await;
+            stop.send(()).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            daemon(setup, async move {
+                stopped.await.ok();
+            }),
+            driver
+        );
+
+        result.unwrap();
+        until(|| Arc::strong_count(&jwks) == 1).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

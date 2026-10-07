@@ -10,10 +10,10 @@ use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Path, RawQuery, Request, State};
 use axum::handler::Handler;
 use axum::http::uri::Authority;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use chrono::Local;
 use serde_json::json;
@@ -21,9 +21,10 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{self, Instant};
 
+use crate::auth::{AuthError, Authenticator, EXEMPT_ROUTE, Principal};
 use crate::config::{AccountName, Config, HostName, Place};
 use crate::ekctl::{self, EkctlError};
-use crate::health::{HEALTH_TTL, HealthCheck, Probe};
+use crate::health::{AuthStatus, HEALTH_TTL, HealthCheck, Probe};
 use crate::mail::MessageId;
 use crate::mail::emlx::EmlxError;
 use crate::mail::script::{self, JunkMove, JunkStatus, Moved, ScriptError};
@@ -42,6 +43,8 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 
 /// How long in-flight requests may run after shutdown starts.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
+
+const ANONYMOUS: &str = "anonymous";
 
 #[derive(Debug)]
 struct KnownHosts {
@@ -113,10 +116,14 @@ pub struct App {
     hosts: KnownHosts,
     mail: Option<Arc<MailStore>>,
     mail_script: script::Runner,
+    auth: Option<Arc<Authenticator>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Rows(usize);
+
+#[derive(Debug, Clone)]
+struct Client(String);
 
 #[derive(Debug)]
 struct JunkRequest {
@@ -132,8 +139,9 @@ struct JunkWrite {
 }
 
 impl App {
-    /// The bridge for `config`, running `ekctl` and `remindctl` through `runners`.
-    pub fn new(config: &Config, runners: Runners) -> Self {
+    /// The bridge for `config`, running `ekctl` and `remindctl` through `runners` and checking
+    /// bearer tokens with `auth` when `[auth]` is configured.
+    pub fn new(config: &Config, runners: Runners, auth: Option<Arc<Authenticator>>) -> Self {
         let Runners {
             calendars,
             reminders,
@@ -154,6 +162,7 @@ impl App {
                 .clone()
                 .map(|mail| Arc::new(MailStore::new(mail))),
             mail_script,
+            auth,
         }
     }
 
@@ -473,49 +482,63 @@ fn policy_status(err: &PolicyError) -> StatusCode {
 
 type Shared = State<Arc<App>>;
 
-/// The bridge's HTTP routes, with the body limit, the `Host` check and request logging.
-pub fn router(app: Arc<App>) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/calendars", get(list_calendars))
-        .route(
+fn routes() -> Vec<(&'static str, MethodRouter<Arc<App>>)> {
+    vec![
+        ("/healthz", get(healthz)),
+        ("/v1/calendars", get(list_calendars)),
+        (
             "/v1/events",
             get(list_events).post(create_event.layer(middleware::from_fn(require_json))),
-        )
-        .route(
+        ),
+        (
             "/v1/events/",
             get(empty_event_id)
                 .patch(empty_event_id)
                 .delete(empty_event_id),
-        )
-        .route(
+        ),
+        (
             "/v1/events/{id}",
             get(show_event)
                 .patch(update_event.layer(middleware::from_fn(require_json)))
                 .delete(delete_event),
-        )
-        .route("/v1/free", get(free))
-        .route("/v1/lists", get(list_lists))
-        .route("/v1/places", get(list_places))
-        .route(
+        ),
+        ("/v1/free", get(free)),
+        ("/v1/lists", get(list_lists)),
+        ("/v1/places", get(list_places)),
+        (
             "/v1/reminders",
             get(list_reminders).post(create_reminder.layer(middleware::from_fn(require_json))),
-        )
-        .route(
+        ),
+        (
             "/v1/reminders/{id}",
             get(show_reminder)
                 .patch(update_reminder.layer(middleware::from_fn(require_json)))
                 .delete(delete_reminder),
-        )
-        .route("/v1/mail/accounts", get(mail_accounts))
-        .route("/v1/mail/messages", get(mail_messages))
-        .route(
+        ),
+        ("/v1/mail/accounts", get(mail_accounts)),
+        ("/v1/mail/messages", get(mail_messages)),
+        (
             "/v1/mail/messages/{id}",
             get(mail_message).patch(mark_mail_junk.layer(middleware::from_fn(require_json))),
-        )
+        ),
+    ]
+}
+
+/// The bridge's HTTP routes, with request logging, the `Host` check, the bearer-token check
+/// and the body limit, in that order.
+pub fn router(app: Arc<App>) -> Router {
+    let mut router = Router::new();
+    for (path, route) in routes() {
+        router = router.route(path, route);
+    }
+    router
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            require_bearer,
+        ))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&app),
             require_known_host,
@@ -585,6 +608,10 @@ async fn log_request(request: Request, next: Next) -> Response {
         Some(JunkWrite { account, status }) => (Some(account.to_string()), Some(status.is_junk())),
         None => (None, None),
     };
+    let client = response
+        .extensions()
+        .get::<Client>()
+        .map(|Client(client)| client.clone());
     tracing::info!(
         %method,
         %route,
@@ -595,6 +622,7 @@ async fn log_request(request: Request, next: Next) -> Response {
         rows,
         account,
         junk,
+        client = client.as_ref().map(tracing::field::display),
         "request"
     );
     response
@@ -635,6 +663,7 @@ async fn healthz(State(app): Shared) -> Response {
             reminders: &app.reminders,
             policy: &app.policy,
             mail: app.mail.as_ref(),
+            auth: app.auth.as_deref().map(|auth| AuthStatus::of(auth.jwks())),
         })
         .await
         .into_response()
@@ -690,6 +719,77 @@ async fn require_known_host(State(app): Shared, request: Request, next: Next) ->
         .into_response();
     }
     next.run(request).await
+}
+
+async fn require_bearer(State(app): Shared, request: Request, next: Next) -> Response {
+    let Some(auth) = &app.auth else {
+        return next.run(request).await;
+    };
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned());
+    if route.as_deref() == Some(EXEMPT_ROUTE) {
+        return next.run(request).await;
+    }
+    let principal = match auth.authenticate(request.headers()).await {
+        Ok(principal) => principal,
+        Err(AuthError::Missing) if !auth.required() => {
+            return with_client(next.run(request).await, ANONYMOUS.to_owned());
+        }
+        Err(err) => return refuse_token(err),
+    };
+    let required = match &route {
+        Some(route) => auth.required_scope(request.method(), route),
+        None => None,
+    };
+    let Principal { client, scopes: _ } = &principal;
+    if let Some(scope) = required
+        && !principal.has_scope(&scope)
+    {
+        tracing::warn!(kind = "insufficient scope", "token refused");
+        return with_client(insufficient_scope(&scope), client.clone());
+    }
+    with_client(next.run(request).await, client.clone())
+}
+
+fn with_client(mut response: Response, client: String) -> Response {
+    response.extensions_mut().insert(Client(client));
+    response
+}
+
+fn refuse_token(err: AuthError) -> Response {
+    tracing::warn!(kind = %err, "token refused");
+    let (message, challenge) = match err {
+        AuthError::Missing => ("missing bearer token", "Bearer"),
+        AuthError::Malformed | AuthError::UnknownKey | AuthError::Invalid => {
+            ("invalid bearer token", r#"Bearer error="invalid_token""#)
+        }
+    };
+    challenged(
+        StatusCode::UNAUTHORIZED,
+        message.to_owned(),
+        HeaderValue::from_static(challenge),
+    )
+}
+
+fn insufficient_scope(scope: &str) -> Response {
+    let challenge = format!(r#"Bearer error="insufficient_scope", scope="{scope}""#);
+    let challenge = HeaderValue::from_str(&challenge)
+        .unwrap_or_else(|_| HeaderValue::from_static(r#"Bearer error="insufficient_scope""#));
+    challenged(
+        StatusCode::FORBIDDEN,
+        format!("insufficient scope: {scope} needed"),
+        challenge,
+    )
+}
+
+fn challenged(status: StatusCode, message: String, challenge: HeaderValue) -> Response {
+    let mut response = ApiError::Status(status, message).into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, challenge);
+    response
 }
 
 async fn require_json(request: Request, next: Next) -> Response {
@@ -1012,6 +1112,9 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::auth::test_keys;
+    use crate::auth::{scope_for, test_source};
+    use crate::config::AuthConfig;
     use crate::ekctl::Runner;
     use crate::fake_ekctl::{Fake, fixture, fixture_text};
     use crate::mail::fixture::{self as mail_fixture, Fixture as MailFixture};
@@ -1063,7 +1166,7 @@ mod tests {
     }
 
     fn app(config: &Config, runner: Runner) -> Router {
-        router(Arc::new(App::new(config, runners(runner))))
+        router(Arc::new(App::new(config, runners(runner), None)))
     }
 
     fn show_in(calendar: &str) -> String {
@@ -2383,7 +2486,7 @@ esac"#,
             "if [ -e \"$LOG\" ]; then cat '{}'; else touch \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
         ));
-        let app = App::new(&configured(), runners(fake.runner()));
+        let app = App::new(&configured(), runners(fake.runner()), None);
         app.announce_calendars(Duration::from_millis(10)).await;
         let log = captured.text();
         assert!(log.contains("cannot list calendars yet"), "{log}");
@@ -2404,7 +2507,7 @@ esac"#,
             "if [ -s \"$LOG\" ]; then cat '{}'; else echo failed >> \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
         ));
-        let app = Arc::new(App::new(&configured(), runners(fake.runner())));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner()), None));
         let announcer = tokio::spawn({
             let app = Arc::clone(&app);
             async move { app.announce_calendars(Duration::from_secs(30)).await }
@@ -2425,7 +2528,7 @@ esac"#,
         let fake = Fake::new("sleep 5");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Arc::new(App::new(&configured(), runners(fake.runner())));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner()), None));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve(
             listener,
@@ -2461,7 +2564,7 @@ esac"#,
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Arc::new(App::new(&configured(), runners(fake.runner())));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner()), None));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve(
             listener,
@@ -2518,6 +2621,7 @@ esac"#,
                 reminders,
                 mail: no_osascript(),
             },
+            None,
         )))
     }
 
@@ -3469,6 +3573,7 @@ esac"#,
                 reminders,
                 mail: no_osascript(),
             },
+            None,
         )));
         let (status, body) = get(&router, "/v1/lists").await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
@@ -3617,6 +3722,7 @@ esac"#,
                 reminders,
                 mail: no_osascript(),
             },
+            None,
         );
         app.announce_lists(Duration::from_millis(10)).await;
         let log = captured.text();
@@ -4352,7 +4458,7 @@ esac"#,
                 "me@gmail.example",
             ),
         ]);
-        let app = App::new(&mail_config(&fixture), runners(no_ekctl()));
+        let app = App::new(&mail_config(&fixture), runners(no_ekctl()), None);
         app.announce_mail(Duration::from_millis(10)).await;
         let log = captured.text();
         assert!(
@@ -4401,7 +4507,7 @@ esac"#,
         if let Some(mail) = &mut config.mail {
             mail.root = Some(fixture.root.join("missing"));
         }
-        let app = App::new(&config, runners(no_ekctl()));
+        let app = App::new(&config, runners(no_ekctl()), None);
         let finished = time::timeout(
             Duration::from_millis(200),
             app.announce_mail(Duration::from_millis(10)),
@@ -4416,7 +4522,7 @@ esac"#,
             "{log}"
         );
 
-        let app = App::new(&configured(), runners(no_ekctl()));
+        let app = App::new(&configured(), runners(no_ekctl()), None);
         app.announce_mail(Duration::from_millis(10)).await;
         assert!(!captured.text().contains("mail account"));
     }
@@ -4437,7 +4543,7 @@ esac"#,
     fn junk_app_with_timeout(config: &Config, fake: &Fake, timeout: Duration) -> Router {
         let mut runners = runners(no_ekctl());
         runners.mail = script::Runner::new(fake.program().to_owned(), timeout);
-        router(Arc::new(App::new(config, runners)))
+        router(Arc::new(App::new(config, runners, None)))
     }
 
     fn without_exclusions(fixture: &MailFixture) -> Config {
@@ -4766,7 +4872,7 @@ esac"#,
         let osascript = osascript_fake();
         let mut runners = runners(calendars.runner());
         runners.mail = script::Runner::new(osascript.program().to_owned(), Duration::from_secs(10));
-        let router = router(Arc::new(App::new(&mail_config(&fixture), runners)));
+        let router = router(Arc::new(App::new(&mail_config(&fixture), runners, None)));
         let held = tokio::spawn({
             let router = router.clone();
             async move { get(&router, "/v1/calendars").await }
@@ -4796,5 +4902,650 @@ esac"#,
         assert_eq!(first, StatusCode::OK);
         assert_eq!(second, StatusCode::OK);
         assert_eq!(fake.calls(), ["start", "end", "start", "end"]);
+    }
+
+    const KID: &str = "key-1";
+    const ISSUER: &str = "https://auth.example.com";
+    const AUDIENCE: &str = "https://eventkit-bridge";
+    const CLIENT: &str = "agent";
+    const ALL_SCOPES: [&str; 6] = [
+        "bridge:calendar.read",
+        "bridge:calendar.write",
+        "bridge:reminders.read",
+        "bridge:reminders.write",
+        "bridge:mail.read",
+        "bridge:mail.junk",
+    ];
+
+    fn auth_table(required: bool) -> AuthConfig {
+        AuthConfig {
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            jwks_url: url::Url::parse("https://auth.example.com/jwks.json").unwrap(),
+            required,
+            scope_prefix: "bridge:".to_owned(),
+        }
+    }
+
+    fn now() -> i64 {
+        i64::try_from(jsonwebtoken::get_current_timestamp()).unwrap()
+    }
+
+    fn token_claims(scopes: &[&str]) -> Value {
+        let now = now();
+        json!({
+            "iss": ISSUER,
+            "sub": "subject-7",
+            "client_id": CLIENT,
+            "aud": [AUDIENCE],
+            "exp": now + 900,
+            "iat": now,
+            "nbf": now,
+            "jti": "jti-value",
+            "scp": scopes,
+        })
+    }
+
+    fn token(scopes: &[&str]) -> String {
+        test_keys::mint(&token_claims(scopes), KID)
+    }
+
+    fn expired_token(scopes: &[&str]) -> String {
+        let mut claims = token_claims(scopes);
+        claims["exp"] = json!(now() - 3600);
+        test_keys::mint(&claims, KID)
+    }
+
+    fn all_scopes_but(name: &str) -> Vec<&'static str> {
+        let mut scopes = Vec::new();
+        for scope in ALL_SCOPES {
+            if scope != name {
+                scopes.push(scope);
+            }
+        }
+        scopes
+    }
+
+    struct AuthApp {
+        _dir: tempfile::TempDir,
+        _fixture: MailFixture,
+        _osascript: Fake,
+        router: Router,
+    }
+
+    fn auth_app(calendars: &Fake, required: bool, kids: &[&str]) -> AuthApp {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = MailFixture::standard();
+        let osascript = osascript_fake();
+        let mut config = without_exclusions(&fixture);
+        let table = auth_table(required);
+        let authenticator = Authenticator::new(&table, test_source::preloaded(dir.path(), kids));
+        config.auth = Some(table);
+        let mut runners = runners(calendars.runner());
+        runners.mail = script::Runner::new(osascript.program().to_owned(), Duration::from_secs(10));
+        let router = router(Arc::new(App::new(
+            &config,
+            runners,
+            Some(Arc::new(authenticator)),
+        )));
+        AuthApp {
+            _dir: dir,
+            _fixture: fixture,
+            _osascript: osascript,
+            router,
+        }
+    }
+
+    fn with_token(mut request: Request<Body>, token: &str) -> Request<Body> {
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        request
+    }
+
+    struct Answer {
+        status: StatusCode,
+        challenge: Option<String>,
+        body: Value,
+    }
+
+    async fn exchange(router: &Router, request: Request<Body>) -> Answer {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = match bytes.is_empty() {
+            true => Value::Null,
+            false => serde_json::from_slice(&bytes).unwrap(),
+        };
+        Answer {
+            status,
+            challenge,
+            body,
+        }
+    }
+
+    fn empty(method: Method, uri: &str) -> Request<Body> {
+        build_request(method, uri, Body::empty())
+    }
+
+    const INVALID_CHALLENGE: &str = r#"Bearer error="invalid_token""#;
+
+    struct ScopedCase {
+        scope: &'static str,
+        method: Method,
+        uri: String,
+        body: Option<Value>,
+        status: StatusCode,
+    }
+
+    fn scoped_cases() -> Vec<ScopedCase> {
+        vec![
+            ScopedCase {
+                scope: "bridge:calendar.read",
+                method: Method::GET,
+                uri: EVENT_PATH.to_owned(),
+                body: None,
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:calendar.write",
+                method: Method::POST,
+                uri: "/v1/events".to_owned(),
+                body: Some(create_body()),
+                status: StatusCode::CREATED,
+            },
+            ScopedCase {
+                scope: "bridge:reminders.read",
+                method: Method::GET,
+                uri: "/v1/places".to_owned(),
+                body: None,
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:reminders.write",
+                method: Method::DELETE,
+                uri: "/v1/reminders/42".to_owned(),
+                body: None,
+                status: StatusCode::BAD_REQUEST,
+            },
+            ScopedCase {
+                scope: "bridge:mail.read",
+                method: Method::GET,
+                uri: "/v1/mail/accounts".to_owned(),
+                body: None,
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:mail.junk",
+                method: Method::PATCH,
+                uri: format!("/v1/mail/messages/{}", mail_fixture::MULTIPART),
+                body: Some(json!({ "junk": true })),
+                status: StatusCode::OK,
+            },
+        ]
+    }
+
+    fn scoped_request(case: &ScopedCase) -> Request<Body> {
+        let ScopedCase {
+            scope: _,
+            method,
+            uri,
+            body,
+            status: _,
+        } = case;
+        match body {
+            Some(body) => json_request(method.clone(), uri, body),
+            None => empty(method.clone(), uri),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_scope_reaches_its_route_and_only_its_scope_does() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        for case in scoped_cases() {
+            let answer = exchange(
+                &app.router,
+                with_token(scoped_request(&case), &token(&[case.scope])),
+            )
+            .await;
+            assert_eq!(
+                answer.status, case.status,
+                "{}: {}",
+                case.scope, answer.body
+            );
+            assert_eq!(answer.challenge, None, "{}", case.scope);
+
+            let answer = exchange(
+                &app.router,
+                with_token(scoped_request(&case), &token(&all_scopes_but(case.scope))),
+            )
+            .await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", case.scope);
+            assert_eq!(
+                answer.challenge,
+                Some(format!(
+                    r#"Bearer error="insufficient_scope", scope="{}""#,
+                    case.scope
+                ))
+            );
+            assert_eq!(
+                answer.body,
+                error(&format!("insufficient scope: {} needed", case.scope))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_token_on_a_write_route_is_forbidden_before_ekctl() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let request = json_request(Method::POST, "/v1/events", &create_body());
+
+        let answer = exchange(
+            &app.router,
+            with_token(request, &token(&["bridge:calendar.read"])),
+        )
+        .await;
+
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            answer.challenge.as_deref(),
+            Some(r#"Bearer error="insufficient_scope", scope="bridge:calendar.write""#)
+        );
+        assert_eq!(
+            answer.body,
+            error("insufficient scope: bridge:calendar.write needed")
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_needs_the_read_scope() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+
+        let answer = exchange(
+            &app.router,
+            with_token(empty(Method::HEAD, EVENT_PATH), &token(&[])),
+        )
+        .await;
+
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            answer.challenge.as_deref(),
+            Some(r#"Bearer error="insufficient_scope", scope="bridge:calendar.read""#)
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_token_is_unauthorized_when_required() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+
+        let answer = exchange(&app.router, empty(Method::GET, EVENT_PATH)).await;
+
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(answer.challenge.as_deref(), Some("Bearer"));
+        assert_eq!(answer.body, error("missing bearer token"));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_tokens_are_unauthorized() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let mut no_audience = token_claims(&ALL_SCOPES);
+        no_audience.as_object_mut().unwrap().remove("aud");
+        let tokens = [
+            expired_token(&ALL_SCOPES),
+            test_keys::mint(&no_audience, KID),
+            test_keys::OTHER_KEY.sign(&test_keys::header(KID), &token_claims(&ALL_SCOPES)),
+            test_keys::mint(&token_claims(&ALL_SCOPES), "key-unknown"),
+            "not-a-jwt".to_owned(),
+        ];
+        for token in tokens {
+            let answer = exchange(
+                &app.router,
+                with_token(empty(Method::GET, EVENT_PATH), &token),
+            )
+            .await;
+
+            assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{token}");
+            assert_eq!(answer.challenge.as_deref(), Some(INVALID_CHALLENGE));
+            assert_eq!(answer.body, error("invalid bearer token"));
+        }
+        let mut request = empty(Method::GET, EVENT_PATH);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        let answer = exchange(&app.router, request).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(answer.challenge.as_deref(), Some(INVALID_CHALLENGE));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optional_auth_lets_a_request_without_a_token_through_as_anonymous() {
+        let (captured, _guard) = capture();
+        let fake = write_fake();
+        let app = auth_app(&fake, false, &[KID]);
+
+        let answer = exchange(&app.router, empty(Method::GET, EVENT_PATH)).await;
+
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+        assert_eq!(answer.challenge, None);
+        let log = captured.text();
+        assert!(log.contains("route=/v1/events/{id} status=200"), "{log}");
+        assert!(log.contains("client=anonymous"), "{log}");
+        assert!(!log.contains("token refused"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn optional_auth_still_refuses_a_bad_token_and_checks_scopes() {
+        let fake = write_fake();
+        let app = auth_app(&fake, false, &[KID]);
+
+        let answer = exchange(
+            &app.router,
+            with_token(empty(Method::GET, EVENT_PATH), &expired_token(&ALL_SCOPES)),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(answer.challenge.as_deref(), Some(INVALID_CHALLENGE));
+
+        let answer = exchange(
+            &app.router,
+            with_token(
+                empty(Method::GET, EVENT_PATH),
+                &token(&["bridge:mail.read"]),
+            ),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_token_and_reports_the_keys() {
+        let fake = Fake::printing("list_calendars.json");
+        for required in [true, false] {
+            let app = auth_app(&fake, required, &[KID, "key-2"]);
+            for request in [
+                empty(Method::GET, "/healthz"),
+                with_token(empty(Method::GET, "/healthz"), "not-a-jwt"),
+            ] {
+                let answer = exchange(&app.router, request).await;
+
+                assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+                assert_eq!(answer.challenge, None);
+                assert_eq!(answer.body["auth"]["jwks_keys"], json!(2));
+                assert!(answer.body["auth"]["jwks_age_s"].as_u64().unwrap() <= 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn healthz_without_keys_is_degraded() {
+        let fake = Fake::printing("list_calendars.json");
+        let app = auth_app(&fake, true, &[]);
+
+        let answer = exchange(&app.router, empty(Method::GET, "/healthz")).await;
+
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            answer.body,
+            json!({"status": "degraded", "reason": "auth jwks unavailable"})
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_without_auth_has_no_auth_field() {
+        let fake = Fake::printing("list_calendars.json");
+        let router = app(&configured(), fake.runner());
+
+        let (status, body) = get(&router, "/healthz").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.get("auth"), None);
+    }
+
+    #[tokio::test]
+    async fn unknown_paths_and_methods_need_a_token_but_no_scope() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let scopeless = token(&[]);
+
+        let answer = exchange(
+            &app.router,
+            with_token(empty(Method::GET, "/v1/tasks"), &scopeless),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND);
+        assert_eq!(answer.body, error("not found"));
+
+        let answer = exchange(&app.router, empty(Method::GET, "/v1/tasks")).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(answer.challenge.as_deref(), Some("Bearer"));
+
+        let answer = exchange(
+            &app.router,
+            with_token(empty(Method::DELETE, "/v1/calendars"), &scopeless),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        let answer = exchange(&app.router, empty(Method::DELETE, "/v1/calendars")).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn host_check_runs_before_the_token() {
+        let (captured, _guard) = capture();
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let request = Request::builder()
+            .uri("/v1/calendars")
+            .header("host", "rebound.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let answer = exchange(&app.router, request).await;
+
+        assert_eq!(answer.status, StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(answer.challenge, None);
+        assert!(!captured.text().contains("token refused"));
+    }
+
+    #[tokio::test]
+    async fn body_limit_applies_after_a_valid_token() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let request = build_request(
+            Method::POST,
+            "/v1/events",
+            Body::from(vec![b' '; BODY_LIMIT + 1]),
+        );
+
+        let answer = exchange(
+            &app.router,
+            with_token(request, &token(&["bridge:calendar.write"])),
+        )
+        .await;
+
+        assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_route_but_health_has_a_scope() {
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let scopeless = token(&[]);
+        let all = token(&ALL_SCOPES);
+        let methods = [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::TRACE,
+        ];
+        for (path, _) in routes() {
+            let uri = path.replace("{id}", "probe");
+            for method in &methods {
+                let scope = scope_for(method, path);
+                let answer = exchange(
+                    &app.router,
+                    with_token(empty(method.clone(), &uri), &scopeless),
+                )
+                .await;
+                if path == EXEMPT_ROUTE {
+                    assert_eq!(scope, None);
+                    assert_ne!(answer.status, StatusCode::UNAUTHORIZED, "{method} {path}");
+                    assert_ne!(answer.status, StatusCode::FORBIDDEN, "{method} {path}");
+                    continue;
+                }
+                let Some(scope) = scope else {
+                    assert_eq!(
+                        answer.status,
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path} has a handler but no row in the scope table"
+                    );
+                    continue;
+                };
+                assert_eq!(answer.status, StatusCode::FORBIDDEN, "{method} {path}");
+                let answer =
+                    exchange(&app.router, with_token(empty(method.clone(), &uri), &all)).await;
+                assert_ne!(
+                    answer.status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} has the scope {scope} but no handler"
+                );
+                assert_eq!(answer.challenge, None, "{method} {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_request_log_carries_the_client_but_no_token() {
+        let (captured, _guard) = capture();
+        let fake = write_fake();
+        let app = auth_app(&fake, true, &[KID]);
+        let valid = token(&["bridge:calendar.read"]);
+        let expired = expired_token(&["bridge:calendar.read"]);
+        let wrong_scope = token(&["bridge:mail.read"]);
+        let tokens = [&valid, &expired, &wrong_scope];
+        for token in tokens {
+            exchange(
+                &app.router,
+                with_token(empty(Method::GET, EVENT_PATH), token),
+            )
+            .await;
+        }
+        exchange(&app.router, empty(Method::GET, EVENT_PATH)).await;
+
+        let log = captured.text();
+        for token in tokens {
+            assert!(!log.contains(token.as_str()), "token leaked into:\n{log}");
+            for segment in token.split('.') {
+                assert!(!log.contains(segment), "{segment} leaked into:\n{log}");
+            }
+        }
+        for secret in [AUDIENCE, ISSUER, "scp", "subject-7", "jti-value", "Bearer"] {
+            assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
+        let mut requests = Vec::new();
+        for line in log.lines() {
+            if line.contains(" request method=") {
+                requests.push(line);
+            }
+        }
+        let client = format!(" client={CLIENT}");
+        assert_eq!(requests.len(), 4, "{log}");
+        assert!(requests[0].contains(" status=200 "), "{log}");
+        assert!(requests[0].ends_with(&client), "{log}");
+        assert!(requests[1].contains(" status=401 "), "{log}");
+        assert!(!requests[1].contains("client="), "{log}");
+        assert!(requests[2].contains(" status=403 "), "{log}");
+        assert!(requests[2].ends_with(&client), "{log}");
+        assert!(requests[3].contains(" status=401 "), "{log}");
+        assert!(!requests[3].contains("client="), "{log}");
+        assert!(log.contains("token refused kind=invalid"), "{log}");
+        assert!(
+            log.contains(r#"token refused kind="insufficient scope""#),
+            "{log}"
+        );
+        assert!(log.contains("token refused kind=missing"), "{log}");
+        assert!(log.contains("status=403"), "{log}");
+        assert!(log.contains("status=401"), "{log}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jwks_fetch_logs_only_the_failure_kind() {
+        let (captured, _guard) = capture();
+        let dir = tempfile::tempdir().unwrap();
+        let source = test_source::ScriptedSource::new(vec![
+            Ok(b"<html>jwks-body-marker</html>".to_vec()),
+            Err(crate::auth::FetchError::Status(503)),
+            Ok(test_source::body(&["kid-in-the-body"])),
+        ]);
+        let jwks = Arc::new(crate::auth::Jwks::new(
+            Arc::new(source),
+            dir.path().join("jwks-cache.json"),
+        ));
+
+        for _ in 0..3 {
+            jwks.refetch_unknown_key().await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+        }
+
+        assert_eq!(jwks.key_count(), 1);
+        let log = captured.text();
+        assert!(
+            log.contains("cannot fetch the jwks for an unknown key error=not a jwk set"),
+            "{log}"
+        );
+        assert!(
+            log.contains("cannot fetch the jwks for an unknown key error=status 503"),
+            "{log}"
+        );
+        assert!(
+            log.contains(r#"jwks loaded keys=1 from="provider""#),
+            "{log}"
+        );
+        let jwk = test_keys::KEY.jwk_json("kid-in-the-body");
+        let modulus = jwk["n"].as_str().unwrap();
+        for secret in [
+            "jwks-body-marker",
+            "<html>",
+            "kid-in-the-body",
+            "\"keys\"",
+            modulus,
+        ] {
+            assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_log_without_auth_has_no_client() {
+        let (captured, _guard) = capture();
+        let fake = write_fake();
+        let router = app(&configured(), fake.runner());
+
+        get(&router, EVENT_PATH).await;
+
+        let log = captured.text();
+        assert!(log.contains("status=200"), "{log}");
+        assert!(!log.contains("client="), "{log}");
     }
 }

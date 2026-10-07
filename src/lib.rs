@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod config;
 pub mod ekctl;
 pub mod executable;
