@@ -31,11 +31,11 @@ Without an `[auth]` table nothing changes, as before.
 **Files:**
 - Modify: `src/config.rs`, `src/auth/mod.rs`, `src/server.rs`, `src/main.rs`
 
-- [ ] remove `required` from `RawAuth` and `AuthConfig`; a config with `auth.required` is now an unknown-key error
-- [ ] remove `Authenticator::required` and the anonymous branch in the middleware; a missing token is always `401` with `WWW-Authenticate: Bearer`
-- [ ] remove `required` from `--check-config` and the startup `auth on` log line; the request log no longer produces `client=anonymous`
-- [ ] tests: `[auth]` with `required = true` and with `required = false` both fail to load naming the key; a request without a token is `401` on every route group; `/healthz` still needs no token; every remaining auth test passes unchanged
-- [ ] `mise run check`
+- [x] remove `required` from `RawAuth` and `AuthConfig`; a config with `auth.required` is now an unknown-key error
+- [x] remove `Authenticator::required` and the anonymous branch in the middleware; a missing token is always `401` with `WWW-Authenticate: Bearer`
+- [x] remove `required` from `--check-config` and the startup `auth on` log line; the request log no longer produces `client=anonymous`
+- [x] tests: `[auth]` with `required = true` and with `required = false` both fail to load naming the key; a request without a token is `401` on every route group; `/healthz` still needs no token; every remaining auth test passes unchanged
+- [x] `mise run check` (mise unavailable; ran cargo fmt --check, clippy -D warnings, cargo test directly)
 
 ### Task 2: Docs and version
 

@@ -167,10 +167,9 @@ fn authenticator(config_path: &Path, config: &Config) -> Option<Arc<Authenticato
         issuer,
         audience,
         jwks_url,
-        required,
         scope_prefix,
     } = auth;
-    tracing::info!(issuer, audience, required, scope_prefix, "auth on");
+    tracing::info!(issuer, audience, scope_prefix, "auth on");
     let source = Arc::new(HttpJwksSource::new(jwks_url.clone()));
     let jwks = Jwks::new(source, config_path.with_file_name(JWKS_CACHE_FILE));
     Some(Arc::new(Authenticator::new(auth, Arc::new(jwks))))
@@ -394,11 +393,10 @@ fn describe_auth(auth: &AuthConfig) -> String {
         issuer,
         audience,
         jwks_url,
-        required,
         scope_prefix,
     } = auth;
     format!(
-        "auth: on\nauth issuer: {issuer}\nauth audience: {audience}\nauth jwks_url: {jwks_url}\nauth required: {required}\nauth scope_prefix: {scope_prefix:?}\n"
+        "auth: on\nauth issuer: {issuer}\nauth audience: {audience}\nauth jwks_url: {jwks_url}\nauth scope_prefix: {scope_prefix:?}\n"
     )
 }
 
@@ -609,7 +607,7 @@ mod tests {
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(
             text.ends_with(
-                "auth: on\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth required: true\nauth scope_prefix: \"bridge:\"\n"
+                "auth: on\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth scope_prefix: \"bridge:\"\n"
             ),
             "{text}"
         );
@@ -617,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn describe_auth_transition() {
+    fn describe_auth_empty_scope_prefix() {
         let config = Config::from_toml(
             r#"
             listen = "127.0.0.1:8790"
@@ -626,22 +624,23 @@ mod tests {
             issuer = "https://auth.example.com"
             audience = "https://eventkit-bridge"
             jwks_url = "https://auth.example.com/jwks.json"
-            required = false
             scope_prefix = ""
             "#,
         )
         .unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(
-            text.ends_with("auth required: false\nauth scope_prefix: \"\"\n"),
+            text.ends_with(
+                "auth jwks_url: https://auth.example.com/jwks.json\nauth scope_prefix: \"\"\n"
+            ),
             "{text}"
         );
     }
 
-    fn auth_config(required: bool) -> Config {
-        Config::from_toml(&format!(
-            "listen = \"127.0.0.1:8790\"\n[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\nrequired = {required}\n"
-        ))
+    fn auth_config() -> Config {
+        Config::from_toml(
+            "listen = \"127.0.0.1:8790\"\n[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\n",
+        )
         .unwrap()
     }
 
@@ -660,21 +659,19 @@ mod tests {
         )
         .unwrap();
 
-        let auth = authenticator(&dir.path().join("config.toml"), &auth_config(false)).unwrap();
+        let auth = authenticator(&dir.path().join("config.toml"), &auth_config()).unwrap();
 
         assert_eq!(auth.jwks().key_count(), 1);
-        assert!(!auth.required());
     }
 
     #[test]
     fn authenticator_without_a_cache_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
 
-        let auth = authenticator(&dir.path().join("config.toml"), &auth_config(true)).unwrap();
+        let auth = authenticator(&dir.path().join("config.toml"), &auth_config()).unwrap();
 
         assert_eq!(auth.jwks().key_count(), 0);
         assert_eq!(auth.jwks().age(), None);
-        assert!(auth.required());
     }
 
     #[test]
