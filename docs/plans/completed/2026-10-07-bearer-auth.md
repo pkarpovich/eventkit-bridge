@@ -230,11 +230,13 @@ Added with `cargo add`; the versions are the current releases checked with `carg
 **Files:**
 - Modify: `README.md`, `CLAUDE.md`, `Cargo.toml`
 
-- [ ] README: the Security model bullets from Design; an "Authentication" section after "Config reference" with the `[auth]` example, how to request a token (`client_credentials` with `scope` and `audience`, with `auth.example.com` as the provider), the scope table and the `required = false` rollout; the config table rows; `401` and `403` rows in "Status codes"; `auth` and `auth jwks unavailable` in "Health check"; the `client` field in "Logs"; a troubleshooting entry for `auth jwks unavailable` and one for a token refused because `aud` is missing
-- [ ] CLAUDE.md: the rules under Security model changes; mention `src/auth.rs` in the first paragraph
-- [ ] version 0.7.0 in `Cargo.toml` and in the README health example
-- [ ] run `mise run check`, `shellcheck scripts/*.sh`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: the Security model bullets from Design; an "Authentication" section after "Config reference" with the `[auth]` example, how to request a token (`client_credentials` with `scope` and `audience`, with `auth.example.com` as the provider), the scope table and the `required = false` rollout; the config table rows; `401` and `403` rows in "Status codes"; `auth` and `auth jwks unavailable` in "Health check"; the `client` field in "Logs"; a troubleshooting entry for `auth jwks unavailable` and one for a token refused because `aud` is missing
+- [x] CLAUDE.md: the rules under Security model changes; mention `src/auth.rs` in the first paragraph
+- [x] version 0.7.0 in `Cargo.toml` and in the README health example
+- [x] run `mise run check`, `shellcheck scripts/*.sh` (the three cargo commands and `shellcheck` run directly; `mise run check` fails in the sandbox with `bash: command not found`)
+- [x] move this plan to `docs/plans/completed/`
+- ⚠️ CLAUDE.md names `src/auth/` (with `mod.rs`, `jwks.rs`, `fetch.rs`) rather than `src/auth.rs`, after the Task 3 split.
+- ⚠️ The README scope table leaves out the `/v1/events/` empty-id route: it only answers `400`, and it shares the `calendar.read`/`calendar.write` rows with `/v1/events/{id}`.
 
 ## Post-Completion
 
