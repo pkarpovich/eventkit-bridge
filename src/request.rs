@@ -4,9 +4,9 @@ use url::Url;
 
 use crate::config::{AccountName, CalendarId, ListId, Place};
 use crate::ekctl::{EventChanges, EventRange, FreeQuery, NewEvent, Weekdays, WorkingHours};
-use crate::mail::MessageId;
 use crate::mail::script::JunkStatus;
 use crate::mail::store::{Cursor, CursorError, DEFAULT_LIMIT, MAX_LIMIT, MessageQuery, ReadFilter};
+use crate::mail::{FlagColor, MessageId};
 use crate::model::Event;
 use crate::remindctl::{Change, Completion, NewReminder, ReminderChanges, ShowFilter, Trigger};
 use crate::reminders_model::{Due, Interval, Priority, Proximity, RcReminder, Repeat, Unit};
@@ -608,7 +608,7 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         params.insert(
             (key.into_owned(), value.into_owned()),
             &[
-                "mailbox", "since", "until", "q", "unread", "limit", "cursor",
+                "mailbox", "since", "until", "q", "unread", "flag", "limit", "cursor",
             ],
         )?;
     }
@@ -637,6 +637,17 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         Some("true") => ReadFilter::Unread,
         Some(_) => return Err(Invalid::new("`unread` must be true or false")),
     };
+    let flag = match params.get("flag") {
+        Some(name) => {
+            let Some(color) = FlagColor::from_name(name) else {
+                return Err(Invalid::new(
+                    "`flag` must be one of red, orange, yellow, green, blue, purple, gray",
+                ));
+            };
+            Some(color)
+        }
+        None => None,
+    };
     let limit = params.number("limit", MAIL_LIMIT_BOUNDS)?;
     let cursor = match params.get("cursor") {
         Some(cursor) => match Cursor::decode(cursor) {
@@ -656,7 +667,7 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         until,
         q,
         read,
-        flag: None,
+        flag,
         limit,
         cursor,
     })
@@ -1788,6 +1799,16 @@ mod tests {
         assert_eq!(query.until, None);
     }
 
+    const FLAG_TEXT: &str = "`flag` must be one of red, orange, yellow, green, blue, purple, gray";
+
+    #[test]
+    fn mail_messages_query_flag_accepts_each_colour() {
+        for color in FlagColor::ALL {
+            let query = mail_messages_query(Some(&format!("flag={}", color.name()))).unwrap();
+            assert_eq!(query.flag, Some(color));
+        }
+    }
+
     #[test]
     fn mail_messages_query_rejects_bad_values() {
         let cases = [
@@ -1808,6 +1829,10 @@ mod tests {
                 "since=2026-10-05T00:00:00Z&until=2026-10-04T00:00:00Z",
                 "`until` must be after `since`",
             ),
+            ("flag=pink", FLAG_TEXT),
+            ("flag=", FLAG_TEXT),
+            ("flag=Orange", FLAG_TEXT),
+            ("flag=red&flag=blue", "`flag` is given more than once"),
             ("unread=yes", "`unread` must be true or false"),
             ("unread=", "`unread` must be true or false"),
             ("limit=0", "`limit` must be an integer from 1 to 100"),

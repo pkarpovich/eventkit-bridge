@@ -4032,6 +4032,67 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn mail_messages_filter_by_flag() {
+        let fixture = MailFixture::labelled();
+        let router = mail_app(&fixture);
+        let cases = [
+            ("flag=orange", vec![mail_fixture::GMAIL_LABELLED]),
+            ("flag=blue", Vec::new()),
+            (
+                "flag=orange&mailbox=INBOX",
+                vec![mail_fixture::GMAIL_LABELLED],
+            ),
+            ("flag=orange&account=main", Vec::new()),
+        ];
+        for (query, expected) in cases {
+            let (status, body) = get(&router, &format!("/v1/mail/messages?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(message_ids(&body), expected, "{query}");
+        }
+        let (status, body) = get(&router, "/v1/mail/messages?flag=pink").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            error("`flag` must be one of red, orange, yellow, green, blue, purple, gray")
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_flag_and_labels_are_in_the_json() {
+        let fixture = MailFixture::labelled();
+        let router = mail_app(&fixture);
+        let (status, body) = get(&router, "/v1/mail/messages?mailbox=INBOX&account=gmail").await;
+        assert_eq!(status, StatusCode::OK);
+        let labelled = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["id"] == mail_fixture::GMAIL_LABELLED)
+            .unwrap();
+        assert_eq!(labelled["flag"], "orange");
+        assert_eq!(labelled["labels"], json!(["INBOX", "Receipts"]));
+
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::GMAIL_LABELLED),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["flag"], "orange");
+        assert_eq!(body["flagged"], true);
+        assert_eq!(body["labels"], json!(["INBOX", "Receipts"]));
+
+        let (status, body) = get(
+            &router,
+            &format!("/v1/mail/messages/{}", mail_fixture::STALE_COLOR),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["flag"], Value::Null);
+        assert_eq!(body["labels"], json!([]));
+    }
+
+    #[tokio::test]
     async fn invisible_mail_messages_are_not_found() {
         let fixture = MailFixture::standard();
         let router = mail_app(&fixture);

@@ -206,10 +206,10 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/request.rs`
 - Modify: `src/server.rs`
 
-- [ ] `flag` in the `mail_messages_query` allow-list, parsed into `FlagColor`, `400` text from Technical Details
-- [ ] write tests in `src/request.rs`: each colour, unknown colour, repeated, empty
-- [ ] write `oneshot` tests in `src/server.rs`: the filter, and `flag` / `labels` in list and single-message JSON
-- [ ] run `mise run check` - must pass before task 3
+- [x] `flag` in the `mail_messages_query` allow-list, parsed into `FlagColor`, `400` text from Technical Details
+- [x] write tests in `src/request.rs`: each colour, unknown colour, repeated, empty
+- [x] write `oneshot` tests in `src/server.rs`: the filter, and `flag` / `labels` in list and single-message JSON
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: `no_move_mailboxes`
 
