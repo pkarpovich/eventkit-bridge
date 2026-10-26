@@ -1188,37 +1188,33 @@ async fn move_mail_message(
     let (account, from, to) = match resolution {
         MoveResolution::Move { account, from, to } => (account, from, to),
         MoveResolution::AlreadyThere { account, to } => {
-            let logged = MailWrite {
-                account: account.name.clone(),
-                kind: WriteKind::Move,
-            };
             let mut response = moved_response(Some(id), &account.name, &to);
-            response.extensions_mut().insert(logged);
+            response.extensions_mut().insert(move_logged(&account));
             return Ok(response);
         }
-        MoveResolution::Closed => {
-            return Err(ApiError::Status(
+        MoveResolution::Closed { account } => {
+            return Ok(move_refusal(
+                &account,
                 StatusCode::FORBIDDEN,
-                "mailbox is closed to moves".to_owned(),
+                "mailbox is closed to moves",
             ));
         }
-        MoveResolution::NotInFrom => {
-            return Err(ApiError::Status(
+        MoveResolution::NotInFrom { account } => {
+            return Ok(move_refusal(
+                &account,
                 StatusCode::CONFLICT,
-                "message is not in the from mailbox".to_owned(),
+                "message is not in the from mailbox",
             ));
         }
-        MoveResolution::NoTarget => {
-            return Err(ApiError::Status(
+        MoveResolution::NoTarget { account } => {
+            return Ok(move_refusal(
+                &account,
                 StatusCode::CONFLICT,
-                "account has no to mailbox".to_owned(),
+                "account has no to mailbox",
             ));
         }
     };
-    let logged = MailWrite {
-        account: account.name.clone(),
-        kind: WriteKind::Move,
-    };
+    let logged = move_logged(&account);
     let request = MailMove {
         account: account.id,
         from,
@@ -1231,6 +1227,23 @@ async fn move_mail_message(
     };
     response.extensions_mut().insert(logged);
     Ok(response)
+}
+
+fn move_logged(account: &crate::config::MailAccount) -> MailWrite {
+    MailWrite {
+        account: account.name.clone(),
+        kind: WriteKind::Move,
+    }
+}
+
+fn move_refusal(
+    account: &crate::config::MailAccount,
+    status: StatusCode,
+    message: &str,
+) -> Response {
+    let mut response = ApiError::Status(status, message.to_owned()).into_response();
+    response.extensions_mut().insert(move_logged(account));
+    response
 }
 
 fn moved_response(id: Option<MessageId>, account: &AccountName, mailbox: &str) -> Response {
@@ -4670,6 +4683,14 @@ esac"#,
             "method=PUT route=/v1/mail/messages/{id}/flag status=502",
         ] {
             assert!(log.contains(expected), "{expected} missing from:\n{log}");
+        }
+        for status in ["409", "403"] {
+            let prefix = format!("method=POST route=/v1/mail/messages/{{id}}/move status={status}");
+            let line = log.lines().find(|line| line.contains(&prefix));
+            assert!(
+                line.is_some_and(|line| line.contains(r#"account=""#)),
+                "{prefix} lacks the account in:\n{log}"
+            );
         }
         assert!(
             log.contains("method=GET route=/v1/mail/accounts status=200"),

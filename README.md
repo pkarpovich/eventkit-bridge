@@ -739,7 +739,7 @@ curl -X POST -H 'content-type: application/json' -d '{"from": "INBOX", "to": "[G
 - `from` must be the message's own mailbox or one of its Gmail labels, otherwise `409 message is not in the from mailbox`. A `to` that does not exist in the account is `409 account has no to mailbox`.
 - Gmail has no archive mailbox. Archiving is a move from `INBOX` to `[Gmail]/All Mail`, which removes the `INBOX` label. A move from `[Gmail]/All Mail` to `INBOX` adds the label back. A move between two labels is not verified.
 - A message that is already in `to` is `200` with the same id and no call to Mail.
-- Mail may give a moved message a new id. `id` is the new id, or `null` when the moved copy did not show up within about 5 seconds, when the message has no Message-ID to find it by, or when the target mailbox is excluded. Search for the message if the id is `null`.
+- Mail may give a moved message a new id. `id` is the new id, or `null` when the moved copy did not show up within about 5 seconds or when the message has no Message-ID to find it by. Search for the message if the id is `null`.
 - A move into or out of a junk mailbox does not mark the message as junk and does not train the provider. Use `PATCH` for that.
 - One message per request. Mail writes run one at a time.
 

@@ -510,11 +510,20 @@ pub enum MoveResolution {
         to: String,
     },
     /// `from` or `to` is in `no_move_mailboxes` or `exclude_mailboxes`.
-    Closed,
+    Closed {
+        /// The configured account holding the message.
+        account: MailAccount,
+    },
     /// The message is neither in nor labelled with `from`, or the account has no such mailbox.
-    NotInFrom,
+    NotInFrom {
+        /// The configured account holding the message.
+        account: MailAccount,
+    },
     /// The account has no `to` mailbox.
-    NoTarget,
+    NoTarget {
+        /// The configured account holding the message.
+        account: MailAccount,
+    },
 }
 
 /// What `/healthz` reports about the mail store.
@@ -971,7 +980,7 @@ impl MailReader<'_> {
             || self.config.is_no_move(to)
             || self.config.is_excluded(to)
         {
-            return Ok(Some(MoveResolution::Closed));
+            return Ok(Some(MoveResolution::Closed { account }));
         }
         let from_wanted = from.to_lowercase();
         let to_wanted = to.to_lowercase();
@@ -991,13 +1000,13 @@ impl MailReader<'_> {
         }
         let carried = self.labels(&[*id], &ids)?.remove(id).unwrap_or_default();
         let Some((from_id, from_path)) = from_found else {
-            return Ok(Some(MoveResolution::NotInFrom));
+            return Ok(Some(MoveResolution::NotInFrom { account }));
         };
         if from_id != source.id && !carried.contains(&from_id) {
-            return Ok(Some(MoveResolution::NotInFrom));
+            return Ok(Some(MoveResolution::NotInFrom { account }));
         }
         let Some((to_id, to_path)) = to_found else {
-            return Ok(Some(MoveResolution::NoTarget));
+            return Ok(Some(MoveResolution::NoTarget { account }));
         };
         if from_id == to_id || (from_id == source.id && carried.contains(&to_id)) {
             return Ok(Some(MoveResolution::AlreadyThere {
@@ -2897,7 +2906,9 @@ mod tests {
                     fixture::MULTIPART_ALL_MAIL,
                     (from, "INBOX")
                 ),
-                Some(MoveResolution::NotInFrom),
+                Some(MoveResolution::NotInFrom {
+                    account: account(fixture::GMAIL, "gmail")
+                }),
                 "{from}"
             );
         }
@@ -2912,7 +2923,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("INBOX", "Nowhere")
             ),
-            Some(MoveResolution::NoTarget)
+            Some(MoveResolution::NoTarget {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
     }
 
@@ -2927,7 +2940,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("INBOX", "Receipts")
             ),
-            Some(MoveResolution::Closed)
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
         assert_eq!(
             resolve(
@@ -2935,7 +2950,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("RECEIPTS", "INBOX")
             ),
-            Some(MoveResolution::Closed)
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
         assert_eq!(
             resolve(
@@ -2943,7 +2960,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("INBOX", "[Gmail]/Spam")
             ),
-            Some(MoveResolution::Closed)
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
     }
 
@@ -2958,11 +2977,15 @@ mod tests {
                 fixture::MULTIPART_ALL_MAIL,
                 ("Receipts", "INBOX")
             ),
-            Some(MoveResolution::Closed)
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
         assert_eq!(
             resolve(config, fixture::MULTIPART_ALL_MAIL, ("INBOX", "Ghost")),
-            Some(MoveResolution::Closed)
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
     }
 
@@ -2975,7 +2998,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("[Gmail]/Spam", "INBOX")
             ),
-            Some(MoveResolution::Closed)
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
     }
 
@@ -2989,7 +3014,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("INBOX", "Archive")
             ),
-            Some(MoveResolution::NoTarget)
+            Some(MoveResolution::NoTarget {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
         assert_eq!(
             resolve(
@@ -2997,7 +3024,9 @@ mod tests {
                 fixture::GMAIL_LABELLED,
                 ("Archive", "INBOX")
             ),
-            Some(MoveResolution::NotInFrom)
+            Some(MoveResolution::NotInFrom {
+                account: account(fixture::GMAIL, "gmail")
+            })
         );
     }
 
