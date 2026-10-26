@@ -228,13 +228,13 @@ The request line carries the route template, status, duration, the account name,
 **Files:**
 - Modify: `src/mail/script.rs`
 
-- [ ] flag script and `Runner::flag(FlagWrite)` per Technical Details
-- [ ] move script and `Runner::move_message(MailMove)` per Technical Details, output through `parse_moved`
-- [ ] both take the existing Mail write lock and deadline, and map errors through the existing classifier
-- [ ] the `///` doc comments on `Runner` and `ScriptError` describe every Mail write, not junk only
-- [ ] write tests: exact argv for both (values after the script, a path with spaces, brackets and quotes verbatim, `off`), each error code, empty and garbage stdout, deadline kill through the fake
-- [ ] write tests: a flag, a move and a junk call on clones of one `Runner` never overlap
-- [ ] run `mise run check` - must pass before task 5
+- [x] flag script and `Runner::flag(FlagWrite)` per Technical Details
+- [x] move script and `Runner::move_message(MailMove)` per Technical Details, output through `parse_moved`
+- [x] both take the existing Mail write lock and deadline, and map errors through the existing classifier
+- [x] the `///` doc comments on `Runner` and `ScriptError` describe every Mail write, not junk only
+- [x] write tests: exact argv for both (values after the script, a path with spaces, brackets and quotes verbatim, `off`), each error code, empty and garbage stdout, deadline kill through the fake
+- [x] write tests: a flag, a move and a junk call on clones of one `Runner` never overlap
+- [x] run `mise run check` - must pass before task 5
 
 ### Task 5: Move resolution in the store
 
