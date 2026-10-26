@@ -241,11 +241,11 @@ The request line carries the route template, status, duration, the account name,
 **Files:**
 - Modify: `src/mail/store.rs`
 
-- [ ] the resolution function next to `place()`, steps 1-6 of Technical Details, returning `Move`, `AlreadyThere`, `Closed`, `NotInFrom` or `NoTarget`
-- [ ] write tests: Gmail `INBOX` -> `[Gmail]/All Mail` for the labelled message, `[Gmail]/All Mail` -> `INBOX` for an unlabelled one, Exchange `Inbox` -> another mailbox, case-insensitive input returning stored case
-- [ ] write tests: `AlreadyThere` for `[Gmail]/All Mail` -> `INBOX` on a message labelled `INBOX`, and for `from` equal to `to`; `Move` (never `AlreadyThere`) for `INBOX` -> `[Gmail]/All Mail` on the labelled message, whose `to` is its source, and for `INBOX` -> `Receipts` when it already carries `Receipts`
-- [ ] write tests: `from` the message is not in, `to` that does not exist, `to` and `from` in `no_move_mailboxes`, `to` excluded, closed checked before membership, invisible message
-- [ ] run `mise run check` - must pass before task 6
+- [x] the resolution function next to `place()`, steps 1-6 of Technical Details, returning `Move`, `AlreadyThere`, `Closed`, `NotInFrom` or `NoTarget`
+- [x] write tests: Gmail `INBOX` -> `[Gmail]/All Mail` for the labelled message, `[Gmail]/All Mail` -> `INBOX` for an unlabelled one, Exchange `Inbox` -> another mailbox, case-insensitive input returning stored case
+- [x] write tests: `AlreadyThere` for `[Gmail]/All Mail` -> `INBOX` on a message labelled `INBOX`, and for `from` equal to `to`; `Move` (never `AlreadyThere`) for `INBOX` -> `[Gmail]/All Mail` on the labelled message, whose `to` is its source, and for `INBOX` -> `Receipts` when it already carries `Receipts`
+- [x] write tests: `from` the message is not in, `to` that does not exist, `to` and `from` in `no_move_mailboxes`, `to` excluded, closed checked before membership, invisible message
+- [x] run `mise run check` - must pass before task 6
 
 ### Task 6: Flag and move routes
 
