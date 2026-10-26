@@ -279,11 +279,11 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
-- [ ] README: intro and security model, `[mail]` example with `no_move_mailboxes` and the note that a trash mailbox left visible by `exclude_mailboxes` must be listed there, or moves into it are allowed, scope table rows, types (`flag`, `labels`), `GET /v1/mail/messages` (`flag`, label-aware `mailbox`, the corrected Gmail note: one row per message with its labels listed, and excluding `[Gmail]/All Mail` hides every Gmail message because labels never grant visibility), the three routes with bodies, answers and status codes, "Not available", logs
-- [ ] CLAUDE.md rules and `Info.plist.template` text from Technical Details; the cask caveats in `release.yml` name flag and move next to junk
-- [ ] version 0.9.0 in `Cargo.toml` and `Cargo.lock`
-- [ ] run `mise run check`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: intro and security model, `[mail]` example with `no_move_mailboxes` and the note that a trash mailbox left visible by `exclude_mailboxes` must be listed there, or moves into it are allowed, scope table rows, types (`flag`, `labels`), `GET /v1/mail/messages` (`flag`, label-aware `mailbox`, the corrected Gmail note: one row per message with its labels listed, and excluding `[Gmail]/All Mail` hides every Gmail message because labels never grant visibility), the three routes with bodies, answers and status codes, "Not available", logs
+- [x] CLAUDE.md rules and `Info.plist.template` text from Technical Details; the cask caveats in `release.yml` name flag and move next to junk
+- [x] version 0.9.0 in `Cargo.toml` and `Cargo.lock`
+- [x] run `mise run check`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
