@@ -350,6 +350,7 @@ impl Fixture {
                 },
             ],
             exclude_mailboxes,
+            no_move_mailboxes: Vec::new(),
             root: Some(self.root.clone()),
         }
     }

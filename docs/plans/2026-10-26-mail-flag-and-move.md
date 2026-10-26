@@ -218,10 +218,10 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/main.rs` (`describe_mail` destructures `MailConfig` without `..`)
 - Modify: `src/mail/fixture.rs` (`Fixture::config()` builds `MailConfig` as a literal; the new list is empty there)
 
-- [ ] `RawMail` field, default empty; `MailConfig` list and `is_no_move(path)`, case-insensitive, whole path
-- [ ] `describe_mail` (`--check-config` and the startup listing) prints `no_move_mailboxes` next to `exclude_mailboxes`
-- [ ] write tests: absent key is empty, listed paths match in any case, a partial path does not match, a wrong type is a config error, `describe_mail` output carries the list
-- [ ] run `mise run check` - must pass before task 4
+- [x] `RawMail` field, default empty; `MailConfig` list and `is_no_move(path)`, case-insensitive, whole path
+- [x] `describe_mail` (`--check-config` and the startup listing) prints `no_move_mailboxes` next to `exclude_mailboxes`
+- [x] write tests: absent key is empty, listed paths match in any case, a partial path does not match, a wrong type is a config error, `describe_mail` output carries the list
+- [x] run `mise run check` - must pass before task 4
 
 ### Task 4: Flag and move scripts in the runner
 
