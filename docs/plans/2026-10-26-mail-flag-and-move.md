@@ -265,9 +265,9 @@ The request line carries the route template, status, duration, the account name,
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] every field, parameter, route and status in Technical Details is implemented and covered by a test
-- [ ] `mise run check` and `shellcheck scripts/*.sh` pass
-- [ ] the Code-Quality Rules gate holds for the whole diff
+- [x] every field, parameter, route and status in Technical Details is implemented and covered by a test
+- [x] `mise run check` and `shellcheck scripts/*.sh` pass (shellcheck not installed here and scripts/ is unchanged, so skipped)
+- [x] the Code-Quality Rules gate holds for the whole diff
 
 ### Task 8: [Final] Update documentation
 
