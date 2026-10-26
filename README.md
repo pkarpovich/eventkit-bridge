@@ -29,7 +29,7 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **Mail is off unless you turn it on, and then read from disk read-only.** Without a `[mail]` table no mail code runs. With it, the Envelope Index is opened read-only, no message data is ever written by the bridge (the only files the bridge can create under `~/Library/Mail` are SQLite's own `-shm` and `-wal` files next to the Envelope Index, when Mail is not running), and only the accounts you name in `[mail.accounts]` are visible.
 - **Mail writes are junk or not junk, flag or unflag, and a move between two mailboxes of one account, done by Mail.app.** `PATCH /v1/mail/messages/{id}` moves one visible message to its account's junk mailbox or back to its inbox. `PUT` and `DELETE /v1/mail/messages/{id}/flag` set and clear its flag. `POST /v1/mail/messages/{id}/move` moves it between two mailboxes. A move is refused for any mailbox in `no_move_mailboxes` or `exclude_mailboxes`. The bridge has no built-in list of trash mailboxes, so keeping trash out of moves is the config's job. The bridge runs `/usr/bin/osascript` directly with a fixed script and passes the account, mailboxes, message id and flag colour as separate arguments, never as script text. Sending, replying, deleting and marking read are not possible. macOS asks once before EventKitBridge may control Mail.
 - **Reading mail needs Full Disk Access, for the whole bridge.** macOS has no narrower permission for `~/Library/Mail`. Granting it to EventKitBridge lets the bridge process read every file your user can, not just mail. The bridge itself only opens the Envelope Index, the `.emlx` files under the mail folder and `~/Library/Accounts/Accounts4.sqlite`, and refuses any message path that leads outside the mail folder. Leave mail off if you do not want to grant it.
-- **Contents are never logged.** Request logs carry the method, route, status and timing, the client id of a bearer token, plus a row count for mail reads, the account name and junk value for junk requests, and the account name and flag colour for flag requests, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths. Tokens and their claims, other than the client id, are never logged either.
+- **Contents are never logged.** Request logs carry the method, route, status and timing, the client id of a bearer token, plus a row count for mail reads, the account name and junk value for junk requests, the account name and flag colour for flag requests, and the account name for move requests, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths. Tokens and their claims, other than the client id, are never logged either.
 
 ## Install
 
@@ -177,8 +177,8 @@ jwks_url = "https://auth.example.com/jwks.json"
 | `remindctl` | no | The `remindctl` binary to run. Defaults to the `remindctl` next to the `eventkit-bridge` binary. Only useful for development. |
 | `mail` | no | The `[mail]` table. Its presence turns mail on; without it the mail routes answer `404` and the mail store is never opened. |
 | `mail.accounts` | no | Maps a Mail account uuid, a full UUID in either case, to the name clients see. A name follows the same rule as a place name. Two entries may not share a uuid or a name. Accounts not listed are invisible. Empty by default, which hides every account. |
-| `mail.exclude_mailboxes` | no | Mailbox paths never shown, compared case-insensitively, such as `[Gmail]/Spam`. Defaults to the list in the example above; `[]` excludes nothing. An entry must not be blank. |
-| `mail.no_move_mailboxes` | no | Mailbox paths a move may not take a message from or into, compared case-insensitively on the whole path, in every account. A listed mailbox stays readable. Empty by default. A trash or junk mailbox that `exclude_mailboxes` leaves visible must be listed here, or moves into it are allowed. An entry must not be blank. |
+| `mail.exclude_mailboxes` | no | Mailbox paths never shown, compared case-insensitively, such as `[Gmail]/Spam`. Defaults to the list in the example above; `[]` excludes nothing. |
+| `mail.no_move_mailboxes` | no | Mailbox paths a move may not take a message from or into, compared case-insensitively on the whole path, in every account. A listed mailbox stays readable. Empty by default. A trash or junk mailbox that `exclude_mailboxes` leaves visible must be listed here, or moves into it are allowed. |
 | `mail.root` | no | The Mail data directory to read. Defaults to the highest `~/Library/Mail/V<n>` that contains `MailData/Envelope Index`. Only useful for development. |
 | `auth` | no | The `[auth]` table. Its presence turns the bearer-token gate on (see Authentication); without it no token is read. |
 | `auth.issuer` | yes, in `[auth]` | The provider URL, compared exactly with the token's `iss`. Must not be blank or contain whitespace. |
@@ -188,7 +188,7 @@ jwks_url = "https://auth.example.com/jwks.json"
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
 
-`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url` and `scope_prefix`; it never fetches the keys.
+`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes, the no-move mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url` and `scope_prefix`; it never fetches the keys.
 
 #### Why places are named
 
@@ -422,7 +422,7 @@ A write is `400` when:
 - any string contains a control character other than newline and tab;
 - the body is not valid JSON or has an unknown field.
 
-A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events or changing mail with a cross-site form or `fetch` request.
+A body larger than 64 KiB is `413`. `POST`, `PUT` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events or changing mail with a cross-site form or `fetch` request.
 
 ### Status codes
 
@@ -750,13 +750,13 @@ curl -X POST -H 'content-type: application/json' -d '{"from": "INBOX", "to": "[G
 | `400` | The request is invalid; the message names the parameter. |
 | `401` | With `[auth]`: the bearer token is missing or invalid. |
 | `403` | A move names a mailbox in `no_move_mailboxes` or `exclude_mailboxes`. With `[auth]`: the token lacks `mail.read`, or the scope of the write: `mail.junk` for a `PATCH`, `mail.flag` for a flag route, `mail.move` for a move. |
-| `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to mark (it moved or was deleted in the meantime). |
+| `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to change (it moved or was deleted in the meantime). |
 | `405` | A method other than `GET`, or a method a route does not list above. |
 | `409` | The account has no junk mailbox or no inbox, or a move names a mailbox the message is not in or the account does not have. |
 | `413` | A `PATCH`, `PUT` or `POST` body larger than 64 KiB. |
 | `415` | A `PATCH`, `PUT` or `POST` body that is not `application/json`. |
 | `500` | A query against the Envelope Index failed, or a message file could not be read. The error names only the kind of failure, never the file path. |
-| `502` | `Mail failed`: `osascript` could not start, Mail returned an error while marking the message, or `osascript` printed output the bridge does not understand. |
+| `502` | `Mail failed`: `osascript` could not start, Mail returned an error while changing the message, or `osascript` printed output the bridge does not understand. |
 | `503` | The mail store could not be opened, which is how a missing Full Disk Access grant shows up; or `Mail automation not permitted`, when EventKitBridge may not control Mail. |
 | `504` | `Mail did not answer` within 30 seconds. |
 
@@ -807,11 +807,13 @@ A calendar, reminder or mail problem is reported before `auth jwks unavailable`.
 
 There is usually nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
 
+Upgrading to 0.9.0 with `[mail]`: a Gmail message is now listed once, in `[Gmail]/All Mail`, with its labels in `labels`, instead of once per mailbox. `mailbox=INBOX` still finds it through its label. With `[Gmail]/All Mail` in `exclude_mailboxes`, every Gmail message is hidden. To use the new routes, grant clients the `mail.flag` and `mail.move` scopes. Add `no_move_mailboxes` for every trash or junk mailbox that `exclude_mailboxes` leaves visible, or moves into it are allowed.
+
 Upgrading to 0.8.0 with an `[auth]` table: delete the `required` line from `[auth]` first and run `eventkit-bridge install`. 0.8.0 no longer knows the key, so a config that still has it fails to load with an unknown-key error naming `required`. On 0.7.0 a missing `required` means `true`, so deleting the line changes nothing there; if it was `required = false`, make sure every client sends a token before deleting it, because 0.8.0 refuses a request without one with `401`.
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, a junk request for a visible message logs the account name and the requested junk value, and a flag request logs the account name and the colour or `off`, whatever the outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, a junk request for a visible message logs the account name and the requested junk value, a flag request logs the account name and the colour or `off`, and a move request logs the account name, whatever the outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"

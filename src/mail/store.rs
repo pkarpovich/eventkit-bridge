@@ -977,23 +977,16 @@ impl MailReader<'_> {
         let to_wanted = to.to_lowercase();
         let mut from_found = None;
         let mut to_found = None;
-        for MailboxRecord {
-            id: record,
-            url,
-            total: _,
-            unread: _,
-        } in self.mailbox_records()?
-        {
-            if url.account != account.id {
+        for mailbox in &mailboxes {
+            if mailbox.account.id != account.id {
                 continue;
             }
-            let path = url.path.to_string();
-            let lowered = path.to_lowercase();
+            let lowered = mailbox.display.to_lowercase();
             if lowered == from_wanted {
-                from_found = Some((record, path.clone()));
+                from_found = Some((mailbox.id, mailbox.display.clone()));
             }
             if lowered == to_wanted {
-                to_found = Some((record, path));
+                to_found = Some((mailbox.id, mailbox.display.clone()));
             }
         }
         let carried = self.labels(&[*id], &ids)?.remove(id).unwrap_or_default();
@@ -2970,6 +2963,41 @@ mod tests {
         assert_eq!(
             resolve(config, fixture::MULTIPART_ALL_MAIL, ("INBOX", "Ghost")),
             Some(MoveResolution::Closed)
+        );
+    }
+
+    #[test]
+    fn resolve_move_refuses_an_excluded_from_mailbox() {
+        let fixture = Fixture::labelled();
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("[Gmail]/Spam", "INBOX")
+            ),
+            Some(MoveResolution::Closed)
+        );
+    }
+
+    #[test]
+    fn resolve_move_stays_inside_the_message_account() {
+        let fixture = Fixture::labelled();
+        add_mailbox(&fixture, 40, format!("imap://{}/Archive", fixture::MAIN));
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "Archive")
+            ),
+            Some(MoveResolution::NoTarget)
+        );
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("Archive", "INBOX")
+            ),
+            Some(MoveResolution::NotInFrom)
         );
     }
 

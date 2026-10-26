@@ -8,7 +8,7 @@ pub(crate) mod fixture;
 use std::fmt;
 
 use percent_encoding::percent_decode_str;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::config::is_decimal;
 
@@ -50,7 +50,7 @@ impl fmt::Display for MessageId {
 }
 
 /// One of Mail's seven flag colours, in the order of its flag menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlagColor {
     /// Index 0.
