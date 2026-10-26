@@ -3824,6 +3824,8 @@ esac"#,
                 "summary": "Numbers attached",
                 "read": true,
                 "flagged": false,
+                "flag": null,
+                "labels": [],
                 "has_body": true
             })
         );

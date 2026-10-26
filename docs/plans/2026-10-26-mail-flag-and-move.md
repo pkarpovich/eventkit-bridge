@@ -191,14 +191,14 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/mail/store.rs`
 - Modify: `src/request.rs` (the `MessageQuery` literal in `mail_messages_query` and in its test get `flag: None`; Task 2 fills it)
 
-- [ ] `fixtures/mail_schema.sql` and `SCHEMA` changes from Technical Details
-- [ ] fixture: `Row` gains `flags` and the insert lists it; a labels insert; the orange-flagged labelled Gmail message and the stale-colour message
-- [ ] `FlagColor` in `src/mail/mod.rs`; `MessageSummary` gains `flag: Option<FlagColor>` and `labels: Vec<String>`
-- [ ] SQL from Technical Details: colour column, the label-aware `mailbox` filter with `:visible` in `MESSAGES_SQL` only, `:flag` filter, `LABELS_SQL`; `MessageQuery` gains `flag: Option<FlagColor>` and its test `Default`
-- [ ] write tests: orange and blue colour read, `null` for `flagged = 0` with colour bits set, `labels` for the Gmail message and `[]` elsewhere, `mailbox=INBOX` finds the labelled message and lists both its labels (the same `labels` as without a filter and by id), an excluded label is neither listed nor matched, the labelled message appears once without `mailbox`
-- [ ] write tests: with `[Gmail]/All Mail` excluded, the labelled message is absent from the list (also with `mailbox=INBOX`, and a full page is not cut short by rows dropped after `LIMIT`) and its `GET` by id is `404`
-- [ ] write tests: `flag` filter, cursor paging under the filter, a schema without `labels` or `flags` fails the schema check
-- [ ] run `mise run check` - must pass before task 2
+- [x] `fixtures/mail_schema.sql` and `SCHEMA` changes from Technical Details
+- [x] fixture: `Row` gains `flags` and the insert lists it; a labels insert; the orange-flagged labelled Gmail message and the stale-colour message
+- [x] `FlagColor` in `src/mail/mod.rs`; `MessageSummary` gains `flag: Option<FlagColor>` and `labels: Vec<String>`
+- [x] SQL from Technical Details: colour column, the label-aware `mailbox` filter with `:visible` in `MESSAGES_SQL` only, `:flag` filter, `LABELS_SQL`; `MessageQuery` gains `flag: Option<FlagColor>` and its test `Default`
+- [x] write tests: orange and blue colour read, `null` for `flagged = 0` with colour bits set, `labels` for the Gmail message and `[]` elsewhere, `mailbox=INBOX` finds the labelled message and lists both its labels (the same `labels` as without a filter and by id), an excluded label is neither listed nor matched, the labelled message appears once without `mailbox`
+- [x] write tests: with `[Gmail]/All Mail` excluded, the labelled message is absent from the list (also with `mailbox=INBOX`, and a full page is not cut short by rows dropped after `LIMIT`) and its `GET` by id is `404`
+- [x] write tests: `flag` filter, cursor paging under the filter, a schema without `labels` or `flags` fails the schema check
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: `flag` query parameter
 

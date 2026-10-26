@@ -656,6 +656,7 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         until,
         q,
         read,
+        flag: None,
         limit,
         cursor,
     })
@@ -1775,6 +1776,7 @@ mod tests {
                 until: Some(at("2026-10-05T00:00:00Z")),
                 q: Some("Привет".to_owned()),
                 read: ReadFilter::Unread,
+                flag: None,
                 limit: 100,
                 cursor: Some(cursor),
             }

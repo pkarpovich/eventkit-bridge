@@ -27,6 +27,7 @@ pub const GMAIL_ALL: i64 = 4;
 pub const OTHER_INBOX: i64 = 5;
 pub const GMAIL_SPAM: i64 = 6;
 pub const GMAIL_CRAFTED: i64 = 7;
+pub const GMAIL_RECEIPTS: i64 = 8;
 
 pub const PLAIN: i64 = 830;
 pub const HTML: i64 = 12_345;
@@ -39,6 +40,12 @@ pub const DELETED_ROW: i64 = 2_001;
 pub const UNCONFIGURED: i64 = 2_002;
 pub const IN_SPAM: i64 = 2_003;
 pub const IN_CRAFTED: i64 = 2_004;
+pub const GMAIL_LABELLED: i64 = 3_000;
+pub const STALE_COLOR: i64 = 3_001;
+
+pub const ORANGE_FLAG: i64 = (1 << 39) | (1 << 4);
+pub const BLUE_FLAG: i64 = (4 << 39) | (1 << 4);
+pub const STALE_ORANGE: i64 = 1 << 39;
 
 pub const CYRILLIC_SUBJECT: &str = "Привет из Минска";
 pub const CYRILLIC_BODY: &str = "Встреча в пятницу в 10:00";
@@ -74,6 +81,7 @@ pub struct Row<'a> {
     pub summary: Option<&'a str>,
     pub read: bool,
     pub flagged: bool,
+    pub flags: i64,
     pub deleted: bool,
     pub to: &'a [(&'a str, &'a str)],
     pub cc: &'a [(&'a str, &'a str)],
@@ -90,6 +98,7 @@ impl Row<'_> {
             summary: None,
             read: true,
             flagged: false,
+            flags: 0,
             deleted: false,
             to: &[],
             cc: &[],
@@ -257,6 +266,48 @@ impl Fixture {
         fixture
     }
 
+    pub fn labelled() -> Self {
+        let fixture = Self::standard();
+        fixture.mailbox(&MailboxRow {
+            id: GMAIL_RECEIPTS,
+            url: format!("imap://{GMAIL}/Receipts"),
+            total: 1,
+            unread: 0,
+        });
+        fixture.insert(&Row {
+            subject: "Your receipt",
+            flagged: true,
+            flags: ORANGE_FLAG,
+            ..Row::new(GMAIL_LABELLED, GMAIL_ALL, T + 900)
+        });
+        fixture.label(GMAIL_LABELLED, GMAIL_INBOX);
+        fixture.label(GMAIL_LABELLED, GMAIL_RECEIPTS);
+        fixture.write_emlx(
+            FileSpec {
+                account: GMAIL,
+                mailbox: &["[Gmail]", "All Mail"],
+                id: MessageId::new(GMAIL_LABELLED).unwrap(),
+                completeness: Completeness::Full,
+            },
+            &plain_message(),
+        );
+        fixture.insert(&Row {
+            subject: "Unflagged again",
+            flags: STALE_ORANGE,
+            ..Row::new(STALE_COLOR, MAIN_INBOX, T + 1_000)
+        });
+        fixture
+    }
+
+    pub fn label(&self, message: i64, mailbox: i64) {
+        self.writer()
+            .execute(
+                "INSERT INTO labels (message_id, mailbox_id) VALUES (?1, ?2)",
+                params![message, mailbox],
+            )
+            .unwrap();
+    }
+
     pub fn register_accounts(&self, accounts: &[(&str, &str, &str)]) {
         let path = self.root.join("../../Accounts/Accounts4.sqlite");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -328,6 +379,7 @@ impl Fixture {
             summary,
             read,
             flagged,
+            flags,
             deleted,
             to,
             cc,
@@ -346,8 +398,8 @@ impl Fixture {
             None => None,
         };
         conn.execute(
-            "INSERT INTO messages (ROWID, sender, subject, summary, date_sent, date_received, mailbox, read, flagged, deleted, size, conversation_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1000, ?1)",
-            params![id, sender, subject, summary, date - 5, date, mailbox, read, flagged, deleted],
+            "INSERT INTO messages (ROWID, sender, subject, summary, date_sent, date_received, mailbox, read, flagged, flags, deleted, size, conversation_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1000, ?1)",
+            params![id, sender, subject, summary, date - 5, date, mailbox, read, flagged, flags, deleted],
         )
         .unwrap();
         for (kind, recipients) in [(0, to), (1, cc)] {
