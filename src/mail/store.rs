@@ -18,7 +18,7 @@ use crate::config::{
     is_decimal,
 };
 use crate::mail::emlx::{self, Attachment, Completeness, EmlxError, EmlxFile, MailRoot};
-use crate::mail::{MailboxPath, MailboxPathError, MessageId};
+use crate::mail::{FlagColor, MailboxPath, MailboxPathError, MessageId};
 use crate::reminders_model::LocalTime;
 
 /// How long a query waits on a lock Mail holds before it fails.
@@ -39,13 +39,18 @@ const MAILBOXES_SQL: &str =
     "SELECT ROWID, url, total_count, unread_count FROM mailboxes ORDER BY ROWID";
 
 const MESSAGES_SQL: &str = "
-SELECT m.ROWID, m.mailbox, m.date_received, s.subject, su.summary, a.address, a.comment, m.read, m.flagged
+SELECT m.ROWID, m.mailbox, m.date_received, s.subject, su.summary, a.address, a.comment, m.read, m.flagged,
+       CASE WHEN m.flagged = 1 THEN (m.flags >> 39) & 7 END
 FROM messages m
 LEFT JOIN subjects s ON s.ROWID = m.subject
 LEFT JOIN summaries su ON su.ROWID = m.summary
 LEFT JOIN addresses a ON a.ROWID = m.sender
 WHERE m.deleted IS NOT 1
-  AND m.mailbox IN rarray(:mailboxes)
+  AND m.mailbox IN rarray(:visible)
+  AND (m.mailbox IN rarray(:mailboxes)
+       OR EXISTS (SELECT 1 FROM labels l
+                  WHERE l.message_id = m.ROWID AND l.mailbox_id IN rarray(:mailboxes)))
+  AND (:flag IS NULL OR (m.flagged = 1 AND (m.flags >> 39) & 7 = :flag))
   AND (:since IS NULL OR m.date_received >= :since)
   AND (:until IS NULL OR m.date_received < :until)
   AND (:unread = 0 OR coalesce(m.read, 0) = 0)
@@ -64,7 +69,8 @@ ORDER BY coalesce(m.date_received, 0) DESC, m.ROWID DESC
 LIMIT :limit";
 
 const MESSAGE_SQL: &str = "
-SELECT m.ROWID, m.mailbox, m.date_received, s.subject, su.summary, a.address, a.comment, m.read, m.flagged
+SELECT m.ROWID, m.mailbox, m.date_received, s.subject, su.summary, a.address, a.comment, m.read, m.flagged,
+       CASE WHEN m.flagged = 1 THEN (m.flags >> 39) & 7 END
 FROM messages m
 LEFT JOIN subjects s ON s.ROWID = m.subject
 LEFT JOIN summaries su ON su.ROWID = m.summary
@@ -86,6 +92,11 @@ JOIN addresses a ON a.ROWID = r.address
 WHERE r.message IN rarray(:messages) AND r.type IN (0, 1)
 ORDER BY r.message, r.type, r.position";
 
+const LABELS_SQL: &str = "
+SELECT message_id, mailbox_id FROM labels
+WHERE message_id IN rarray(:messages) AND mailbox_id IN rarray(:visible)
+ORDER BY message_id";
+
 const PROBE_SQL: &str = "SELECT count(*) FROM sqlite_master";
 
 const COLUMN_SQL: &str = "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2";
@@ -106,7 +117,7 @@ LEFT JOIN ZACCOUNTTYPE t ON t.Z_PK = a.ZACCOUNTTYPE";
 
 const ACCOUNTS_DATABASE: &str = "Accounts/Accounts4.sqlite";
 
-const SCHEMA: [(&str, &[&str]); 6] = [
+const SCHEMA: [(&str, &[&str]); 7] = [
     (
         "messages",
         &[
@@ -118,6 +129,7 @@ const SCHEMA: [(&str, &[&str]); 6] = [
             "mailbox",
             "read",
             "flagged",
+            "flags",
             "deleted",
             "size",
             "conversation_id",
@@ -128,6 +140,7 @@ const SCHEMA: [(&str, &[&str]); 6] = [
     ("summaries", &["summary"]),
     ("recipients", &["message", "address", "type", "position"]),
     ("mailboxes", &["url", "total_count", "unread_count"]),
+    ("labels", &["message_id", "mailbox_id"]),
 ];
 
 /// The kind of account a mailbox belongs to, from its URL scheme.
@@ -320,6 +333,8 @@ pub struct MessageQuery {
     pub q: Option<String>,
     /// Which read states to list.
     pub read: ReadFilter,
+    /// Only messages flagged with this colour.
+    pub flag: Option<FlagColor>,
     /// The page size, clamped to 1 to [`MAX_LIMIT`].
     pub limit: u32,
     /// Where the previous page ended.
@@ -336,6 +351,7 @@ impl Default for MessageQuery {
             until: None,
             q: None,
             read: ReadFilter::Any,
+            flag: None,
             limit: DEFAULT_LIMIT,
             cursor: None,
         }
@@ -397,6 +413,10 @@ pub struct MessageSummary {
     pub read: bool,
     /// Whether the message is flagged.
     pub flagged: bool,
+    /// The flag colour; `None` when the message is not flagged.
+    pub flag: Option<FlagColor>,
+    /// The visible label mailboxes the message carries, sorted; empty outside Gmail.
+    pub labels: Vec<String>,
     /// Whether an `.emlx` or `.partial.emlx` file exists.
     pub has_body: bool,
 }
@@ -457,6 +477,53 @@ pub struct MessagePlace {
     pub junk: Option<MoveTarget>,
     /// The account's inbox: [`INBOX_MAILBOX`] in whatever case it is stored.
     pub inbox: Option<MoveTarget>,
+}
+
+/// A move a client asked for, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveRequest {
+    /// The message to move.
+    pub id: MessageId,
+    /// The mailbox it is in, matched ignoring case.
+    pub from: String,
+    /// The mailbox it goes to, matched ignoring case.
+    pub to: String,
+}
+
+/// What the Envelope Index says about a [`MoveRequest`] for a visible message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveResolution {
+    /// Mail has to move the message; both paths are in the case Mail stores them.
+    Move {
+        /// The configured account holding the message.
+        account: MailAccount,
+        /// The mailbox the message leaves.
+        from: String,
+        /// The mailbox the message goes to.
+        to: String,
+    },
+    /// The message is already in `to`, so Mail is not called.
+    AlreadyThere {
+        /// The configured account holding the message.
+        account: MailAccount,
+        /// The mailbox, in the case Mail stores it.
+        to: String,
+    },
+    /// `from` or `to` is in `no_move_mailboxes` or `exclude_mailboxes`.
+    Closed {
+        /// The configured account holding the message.
+        account: MailAccount,
+    },
+    /// The message is neither in nor labelled with `from`, or the account has no such mailbox.
+    NotInFrom {
+        /// The configured account holding the message.
+        account: MailAccount,
+    },
+    /// The account has no `to` mailbox.
+    NoTarget {
+        /// The configured account holding the message.
+        account: MailAccount,
+    },
 }
 
 /// What `/healthz` reports about the mail store.
@@ -551,6 +618,7 @@ struct SummaryRow {
     sender: Option<Address>,
     read: bool,
     flagged: bool,
+    flag: Option<FlagColor>,
 }
 
 #[derive(Default)]
@@ -563,6 +631,7 @@ struct SummaryParts<'m> {
     row: SummaryRow,
     mailbox: &'m VisibleMailbox,
     to: Vec<Address>,
+    labels: Vec<String>,
     has_body: bool,
 }
 
@@ -669,6 +738,7 @@ impl MailReader<'_> {
             until,
             q,
             read,
+            flag,
             limit,
             cursor,
         } = query;
@@ -678,6 +748,11 @@ impl MailReader<'_> {
         for mailbox in &selected {
             ids.push(Value::from(mailbox.id));
         }
+        let mut visible = Vec::new();
+        for mailbox in &mailboxes {
+            visible.push(Value::from(mailbox.id));
+        }
+        let visible = Rc::new(visible);
         let limit = (*limit).clamp(1, MAX_LIMIT);
         let q = match q {
             Some(q) if !q.is_empty() => Some(q.to_lowercase()),
@@ -694,7 +769,9 @@ impl MailReader<'_> {
 
         let mut stmt = self.conn.prepare_cached(MESSAGES_SQL)?;
         let mut rows = stmt.query(named_params! {
+            ":visible": Rc::clone(&visible),
             ":mailboxes": Rc::new(ids),
+            ":flag": flag.map(FlagColor::index),
             ":since": since.map(|at| at.timestamp()),
             ":until": until.map(|at| at.timestamp()),
             ":unread": unread,
@@ -728,6 +805,7 @@ impl MailReader<'_> {
             message_ids.push(row.id);
         }
         let mut recipients = self.recipients(&message_ids)?;
+        let mut labels = self.labels(&message_ids, &visible)?;
         let mut messages = Vec::new();
         for row in found {
             let Some(mailbox) = find_mailbox(&mailboxes, row.mailbox) else {
@@ -741,11 +819,13 @@ impl MailReader<'_> {
                 }
             };
             let Recipients { to, cc: _ } = recipients.remove(&row.id).unwrap_or_default();
+            let labels = label_paths(&labels.remove(&row.id).unwrap_or_default(), &mailboxes);
             messages.push(
                 SummaryParts {
                     row,
                     mailbox,
                     to,
+                    labels,
                     has_body,
                 }
                 .into_summary(),
@@ -764,10 +844,11 @@ impl MailReader<'_> {
         for mailbox in &mailboxes {
             ids.push(Value::from(mailbox.id));
         }
+        let ids = Rc::new(ids);
         let mut stmt = self.conn.prepare_cached(MESSAGE_SQL)?;
         let row = stmt
             .query_row(
-                named_params! { ":id": id.get(), ":mailboxes": Rc::new(ids) },
+                named_params! { ":id": id.get(), ":mailboxes": Rc::clone(&ids) },
                 summary_row,
             )
             .optional()?;
@@ -778,11 +859,14 @@ impl MailReader<'_> {
             return Ok(None);
         };
         let Recipients { to, cc } = self.recipients(&[id])?.remove(&id).unwrap_or_default();
+        let labels = self.labels(&[id], &ids)?.remove(&id).unwrap_or_default();
+        let labels = label_paths(&labels, &mailboxes);
         let file = self.locate(mailbox, id)?;
         let summary = SummaryParts {
             row,
             mailbox,
             to,
+            labels,
             has_body: file.is_some(),
         }
         .into_summary();
@@ -861,6 +945,79 @@ impl MailReader<'_> {
             mailbox: mailbox.display.clone(),
             junk,
             inbox: self.target(&paths, INBOX_MAILBOX),
+        }))
+    }
+
+    /// Resolves `request` for the visible message; `None` when it is deleted, excluded, in an
+    /// unconfigured account or unknown.
+    pub fn resolve_move(
+        &self,
+        request: &MoveRequest,
+    ) -> Result<Option<MoveResolution>, StoreError> {
+        let MoveRequest { id, from, to } = request;
+        let mailboxes = self.visible_mailboxes()?;
+        let mut ids = Vec::new();
+        for mailbox in &mailboxes {
+            ids.push(Value::from(mailbox.id));
+        }
+        let ids = Rc::new(ids);
+        let mut stmt = self.conn.prepare_cached(MESSAGE_MAILBOX_SQL)?;
+        let source: Option<i64> = stmt
+            .query_row(
+                named_params! { ":id": id.get(), ":mailboxes": Rc::clone(&ids) },
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let Some(source) = find_mailbox(&mailboxes, source) else {
+            return Ok(None);
+        };
+        let account = source.account.clone();
+        if self.config.is_no_move(from)
+            || self.config.is_excluded(from)
+            || self.config.is_no_move(to)
+            || self.config.is_excluded(to)
+        {
+            return Ok(Some(MoveResolution::Closed { account }));
+        }
+        let from_wanted = from.to_lowercase();
+        let to_wanted = to.to_lowercase();
+        let mut from_found = None;
+        let mut to_found = None;
+        for mailbox in &mailboxes {
+            if mailbox.account.id != account.id {
+                continue;
+            }
+            let lowered = mailbox.display.to_lowercase();
+            if lowered == from_wanted {
+                from_found = Some((mailbox.id, mailbox.display.clone()));
+            }
+            if lowered == to_wanted {
+                to_found = Some((mailbox.id, mailbox.display.clone()));
+            }
+        }
+        let carried = self.labels(&[*id], &ids)?.remove(id).unwrap_or_default();
+        let Some((from_id, from_path)) = from_found else {
+            return Ok(Some(MoveResolution::NotInFrom { account }));
+        };
+        if from_id != source.id && !carried.contains(&from_id) {
+            return Ok(Some(MoveResolution::NotInFrom { account }));
+        }
+        let Some((to_id, to_path)) = to_found else {
+            return Ok(Some(MoveResolution::NoTarget { account }));
+        };
+        if from_id == to_id || (from_id == source.id && carried.contains(&to_id)) {
+            return Ok(Some(MoveResolution::AlreadyThere {
+                account,
+                to: to_path,
+            }));
+        }
+        Ok(Some(MoveResolution::Move {
+            account,
+            from: from_path,
+            to: to_path,
         }))
     }
 
@@ -1153,6 +1310,32 @@ impl MailReader<'_> {
         Ok(recipients)
     }
 
+    fn labels(
+        &self,
+        messages: &[MessageId],
+        visible: &Rc<Vec<Value>>,
+    ) -> rusqlite::Result<HashMap<MessageId, Vec<i64>>> {
+        let mut ids = Vec::new();
+        for id in messages {
+            ids.push(Value::from(id.get()));
+        }
+        let mut stmt = self.conn.prepare_cached(LABELS_SQL)?;
+        let mut rows = stmt.query(named_params! {
+            ":messages": Rc::new(ids),
+            ":visible": Rc::clone(visible),
+        })?;
+        let mut labels: HashMap<MessageId, Vec<i64>> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let message: i64 = row.get(0)?;
+            let mailbox: i64 = row.get(1)?;
+            let Some(message) = MessageId::new(message) else {
+                continue;
+            };
+            labels.entry(message).or_default().push(mailbox);
+        }
+        Ok(labels)
+    }
+
     fn locate(
         &self,
         mailbox: &VisibleMailbox,
@@ -1176,9 +1359,11 @@ impl SummaryParts<'_> {
                     sender,
                     read,
                     flagged,
+                    flag,
                 },
             mailbox,
             to,
+            labels,
             has_body,
         } = self;
         MessageSummary {
@@ -1192,6 +1377,8 @@ impl SummaryParts<'_> {
             summary,
             read,
             flagged,
+            flag,
+            labels,
             has_body,
         }
     }
@@ -1231,6 +1418,7 @@ fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<SummaryRow>> 
     };
     let read: Option<i64> = row.get(7)?;
     let flagged: Option<i64> = row.get(8)?;
+    let flag: Option<i64> = row.get(9)?;
     let date_received: Option<i64> = row.get(2)?;
     Ok(Some(SummaryRow {
         id,
@@ -1241,6 +1429,7 @@ fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<SummaryRow>> 
         sender: address(row.get(5)?, row.get(6)?),
         read: read.unwrap_or(0) != 0,
         flagged: flagged.unwrap_or(0) != 0,
+        flag: flag.and_then(FlagColor::from_index),
     }))
 }
 
@@ -1255,6 +1444,18 @@ fn address(address: Option<String>, comment: Option<String>) -> Option<Address> 
 
 fn find_mailbox(mailboxes: &[VisibleMailbox], id: i64) -> Option<&VisibleMailbox> {
     mailboxes.iter().find(|mailbox| mailbox.id == id)
+}
+
+fn label_paths(ids: &[i64], mailboxes: &[VisibleMailbox]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for id in ids {
+        let Some(mailbox) = find_mailbox(mailboxes, *id) else {
+            continue;
+        };
+        paths.push(mailbox.display.clone());
+    }
+    paths.sort();
+    paths
 }
 
 fn local_time(seconds: i64) -> LocalTime {
@@ -1485,6 +1686,8 @@ mod tests {
                     summary: Some("Numbers attached".to_owned()),
                     read: true,
                     flagged: false,
+                    flag: None,
+                    labels: Vec::new(),
                     has_body: true,
                 }],
                 next_cursor: None,
@@ -2262,6 +2465,8 @@ mod tests {
     fn status_reports_a_missing_table_or_column() {
         for change in [
             "ALTER TABLE messages DROP COLUMN flagged",
+            "ALTER TABLE messages DROP COLUMN flags",
+            "DROP TABLE labels",
             "DROP TABLE summaries",
             "ALTER TABLE mailboxes RENAME COLUMN url TO address",
         ] {
@@ -2551,5 +2756,490 @@ mod tests {
         let mut config = fixture.config();
         config.accounts = Vec::new();
         assert_eq!(place(config, fixture::PLAIN), None);
+    }
+
+    fn resolve(config: MailConfig, id: i64, (from, to): (&str, &str)) -> Option<MoveResolution> {
+        let store = MailStore::new(config);
+        let request = MoveRequest {
+            id: message_id(id),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+        store.open().unwrap().resolve_move(&request).unwrap()
+    }
+
+    fn moved(account: MailAccount, from: &str, to: &str) -> Option<MoveResolution> {
+        Some(MoveResolution::Move {
+            account,
+            from: from.to_owned(),
+            to: to.to_owned(),
+        })
+    }
+
+    fn already(account: MailAccount, to: &str) -> Option<MoveResolution> {
+        Some(MoveResolution::AlreadyThere {
+            account,
+            to: to.to_owned(),
+        })
+    }
+
+    #[test]
+    fn resolve_move_archives_a_labelled_gmail_message() {
+        let fixture = Fixture::labelled();
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "[Gmail]/All Mail")
+            ),
+            moved(
+                account(fixture::GMAIL, "gmail"),
+                "INBOX",
+                "[Gmail]/All Mail"
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_move_labels_an_unlabelled_gmail_message_from_all_mail() {
+        let fixture = Fixture::labelled();
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::MULTIPART_ALL_MAIL,
+                ("[Gmail]/All Mail", "INBOX")
+            ),
+            moved(
+                account(fixture::GMAIL, "gmail"),
+                "[Gmail]/All Mail",
+                "INBOX"
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_move_between_exchange_mailboxes() {
+        let fixture = Fixture::standard();
+        add_mailbox(&fixture, 20, format!("ews://{}/Archive", fixture::MAIN));
+        assert_eq!(
+            resolve(fixture.config(), fixture::PLAIN, ("Inbox", "Archive")),
+            moved(account(fixture::MAIN, "main"), "Inbox", "Archive")
+        );
+    }
+
+    #[test]
+    fn resolve_move_matches_ignoring_case_and_returns_the_stored_case() {
+        let fixture = Fixture::labelled();
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("inbox", "[gmail]/all mail")
+            ),
+            moved(
+                account(fixture::GMAIL, "gmail"),
+                "INBOX",
+                "[Gmail]/All Mail"
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_move_is_already_there_without_a_mail_call() {
+        let fixture = Fixture::labelled();
+        let gmail = account(fixture::GMAIL, "gmail");
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("[Gmail]/All Mail", "INBOX")
+            ),
+            already(gmail.clone(), "INBOX")
+        );
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("inbox", "INBOX")
+            ),
+            already(gmail.clone(), "INBOX")
+        );
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("[Gmail]/All Mail", "[Gmail]/All Mail")
+            ),
+            already(gmail, "[Gmail]/All Mail")
+        );
+    }
+
+    #[test]
+    fn resolve_move_into_a_carried_label_from_a_label_still_moves() {
+        let fixture = Fixture::labelled();
+        let gmail = account(fixture::GMAIL, "gmail");
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "Receipts")
+            ),
+            moved(gmail.clone(), "INBOX", "Receipts")
+        );
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "[Gmail]/All Mail")
+            ),
+            moved(gmail, "INBOX", "[Gmail]/All Mail")
+        );
+    }
+
+    #[test]
+    fn resolve_move_refuses_a_from_the_message_is_not_in() {
+        let fixture = Fixture::labelled();
+        for from in ["Receipts", "Nowhere"] {
+            assert_eq!(
+                resolve(
+                    fixture.config(),
+                    fixture::MULTIPART_ALL_MAIL,
+                    (from, "INBOX")
+                ),
+                Some(MoveResolution::NotInFrom {
+                    account: account(fixture::GMAIL, "gmail")
+                }),
+                "{from}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_move_refuses_a_missing_target() {
+        let fixture = Fixture::labelled();
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "Nowhere")
+            ),
+            Some(MoveResolution::NoTarget {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_move_refuses_closed_mailboxes() {
+        let fixture = Fixture::labelled();
+        let mut config = fixture.config();
+        config.no_move_mailboxes = vec!["receipts".to_owned()];
+        assert_eq!(
+            resolve(
+                config.clone(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "Receipts")
+            ),
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+        assert_eq!(
+            resolve(
+                config.clone(),
+                fixture::GMAIL_LABELLED,
+                ("RECEIPTS", "INBOX")
+            ),
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "[Gmail]/Spam")
+            ),
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_move_checks_closed_before_membership_and_existence() {
+        let fixture = Fixture::labelled();
+        let mut config = fixture.config();
+        config.no_move_mailboxes = vec!["Receipts".to_owned(), "Ghost".to_owned()];
+        assert_eq!(
+            resolve(
+                config.clone(),
+                fixture::MULTIPART_ALL_MAIL,
+                ("Receipts", "INBOX")
+            ),
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+        assert_eq!(
+            resolve(config, fixture::MULTIPART_ALL_MAIL, ("INBOX", "Ghost")),
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_move_refuses_an_excluded_from_mailbox() {
+        let fixture = Fixture::labelled();
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("[Gmail]/Spam", "INBOX")
+            ),
+            Some(MoveResolution::Closed {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_move_stays_inside_the_message_account() {
+        let fixture = Fixture::labelled();
+        add_mailbox(&fixture, 40, format!("imap://{}/Archive", fixture::MAIN));
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("INBOX", "Archive")
+            ),
+            Some(MoveResolution::NoTarget {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+        assert_eq!(
+            resolve(
+                fixture.config(),
+                fixture::GMAIL_LABELLED,
+                ("Archive", "INBOX")
+            ),
+            Some(MoveResolution::NotInFrom {
+                account: account(fixture::GMAIL, "gmail")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_move_hides_every_invisible_row() {
+        let fixture = Fixture::standard();
+        for id in [
+            fixture::IN_DELETED_ITEMS,
+            fixture::DELETED_ROW,
+            fixture::UNCONFIGURED,
+            fixture::IN_SPAM,
+            fixture::IN_CRAFTED,
+            999_999,
+        ] {
+            assert_eq!(
+                resolve(fixture.config(), id, ("INBOX", "Inbox")),
+                None,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_move_hides_a_message_whose_source_is_excluded() {
+        let fixture = Fixture::labelled();
+        let mut config = fixture.config();
+        config.exclude_mailboxes.push("[Gmail]/All Mail".to_owned());
+        assert_eq!(
+            resolve(config, fixture::GMAIL_LABELLED, ("INBOX", "Receipts")),
+            None
+        );
+    }
+
+    fn labelled_page(fixture: &Fixture, query: &MessageQuery) -> MessagePage {
+        MailStore::new(fixture.config())
+            .open()
+            .unwrap()
+            .messages(query)
+            .unwrap()
+    }
+
+    fn summary(page: &MessagePage, id: i64) -> &MessageSummary {
+        for message in &page.messages {
+            if message.id.get() == id {
+                return message;
+            }
+        }
+        panic!("message {id} not listed");
+    }
+
+    #[test]
+    fn messages_read_the_flag_colour() {
+        let fixture = Fixture::labelled();
+        fixture
+            .writer()
+            .execute(
+                "UPDATE messages SET flagged = 1, flags = ?1 WHERE ROWID = ?2",
+                rusqlite::params![fixture::BLUE_FLAG, fixture::PLAIN],
+            )
+            .unwrap();
+        let page = labelled_page(&fixture, &MessageQuery::default());
+        assert_eq!(
+            summary(&page, fixture::GMAIL_LABELLED).flag,
+            Some(FlagColor::Orange)
+        );
+        assert_eq!(summary(&page, fixture::PLAIN).flag, Some(FlagColor::Blue));
+        assert_eq!(summary(&page, fixture::HTML).flag, Some(FlagColor::Red));
+        let stale = summary(&page, fixture::STALE_COLOR);
+        assert!(!stale.flagged);
+        assert_eq!(stale.flag, None);
+        let message = get(&fixture, fixture::GMAIL_LABELLED).unwrap();
+        assert_eq!(message.summary.flag, Some(FlagColor::Orange));
+        assert_eq!(
+            get(&fixture, fixture::STALE_COLOR).unwrap().summary.flag,
+            None
+        );
+    }
+
+    #[test]
+    fn messages_list_gmail_labels_once() {
+        let fixture = Fixture::labelled();
+        let page = labelled_page(&fixture, &MessageQuery::default());
+        let mut count = 0;
+        for message in &page.messages {
+            if message.id.get() == fixture::GMAIL_LABELLED {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+        let labelled = summary(&page, fixture::GMAIL_LABELLED);
+        assert_eq!(labelled.mailbox, "[Gmail]/All Mail");
+        assert_eq!(labelled.labels, ["INBOX", "Receipts"]);
+        assert!(summary(&page, fixture::PLAIN).labels.is_empty());
+    }
+
+    #[test]
+    fn mailbox_filter_matches_labels_and_keeps_every_label() {
+        let fixture = Fixture::labelled();
+        let query = MessageQuery {
+            mailbox: Some("inbox".to_owned()),
+            accounts: vec![name("gmail")],
+            ..MessageQuery::default()
+        };
+        let page = labelled_page(&fixture, &query);
+        assert_eq!(ids(&page), [fixture::GMAIL_LABELLED, fixture::MULTIPART]);
+        assert_eq!(
+            summary(&page, fixture::GMAIL_LABELLED).labels,
+            ["INBOX", "Receipts"]
+        );
+        let query = MessageQuery {
+            mailbox: Some("Receipts".to_owned()),
+            ..MessageQuery::default()
+        };
+        assert_eq!(
+            ids(&labelled_page(&fixture, &query)),
+            [fixture::GMAIL_LABELLED]
+        );
+        let message = get(&fixture, fixture::GMAIL_LABELLED).unwrap();
+        assert_eq!(message.summary.labels, ["INBOX", "Receipts"]);
+    }
+
+    #[test]
+    fn an_excluded_label_is_neither_listed_nor_matched() {
+        let fixture = Fixture::labelled();
+        let mut config = fixture.config();
+        config.exclude_mailboxes.push("Receipts".to_owned());
+        let store = MailStore::new(config);
+        let reader = store.open().unwrap();
+        let page = reader.messages(&MessageQuery::default()).unwrap();
+        assert_eq!(summary(&page, fixture::GMAIL_LABELLED).labels, ["INBOX"]);
+        let err = reader
+            .messages(&MessageQuery {
+                mailbox: Some("Receipts".to_owned()),
+                ..MessageQuery::default()
+            })
+            .unwrap_err();
+        match err {
+            StoreError::UnknownMailbox(path) => assert_eq!(path, "Receipts"),
+            other => panic!("unexpected error: {other}"),
+        }
+        let message = reader.message(message_id(fixture::GMAIL_LABELLED)).unwrap();
+        assert_eq!(message.unwrap().summary.labels, ["INBOX"]);
+    }
+
+    #[test]
+    fn excluding_all_mail_hides_every_labelled_message() {
+        let fixture = Fixture::labelled();
+        let mut config = fixture.config();
+        config.exclude_mailboxes.push("[Gmail]/All Mail".to_owned());
+        let store = MailStore::new(config);
+        let reader = store.open().unwrap();
+        let page = reader.messages(&MessageQuery::default()).unwrap();
+        assert!(!ids(&page).contains(&fixture::GMAIL_LABELLED));
+        let page = reader
+            .messages(&MessageQuery {
+                mailbox: Some("INBOX".to_owned()),
+                accounts: vec![name("gmail")],
+                ..MessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(&page), [fixture::MULTIPART]);
+        let page = reader
+            .messages(&MessageQuery {
+                mailbox: Some("INBOX".to_owned()),
+                accounts: vec![name("gmail")],
+                limit: 1,
+                ..MessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(&page), [fixture::MULTIPART]);
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(
+            reader.message(message_id(fixture::GMAIL_LABELLED)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn messages_filter_by_flag_colour() {
+        let fixture = Fixture::labelled();
+        for (color, expected) in [
+            (FlagColor::Orange, vec![fixture::GMAIL_LABELLED]),
+            (FlagColor::Red, vec![fixture::HTML]),
+            (FlagColor::Blue, Vec::new()),
+        ] {
+            let query = MessageQuery {
+                flag: Some(color),
+                ..MessageQuery::default()
+            };
+            assert_eq!(ids(&labelled_page(&fixture, &query)), expected, "{color:?}");
+        }
+    }
+
+    #[test]
+    fn the_flag_filter_pages_by_cursor() {
+        let fixture = Fixture::labelled();
+        fixture
+            .writer()
+            .execute(
+                "UPDATE messages SET flagged = 1, flags = ?1 WHERE ROWID IN (?2, ?3)",
+                rusqlite::params![fixture::ORANGE_FLAG, fixture::PLAIN, fixture::PARTIAL],
+            )
+            .unwrap();
+        let mut query = MessageQuery {
+            flag: Some(FlagColor::Orange),
+            limit: 2,
+            ..MessageQuery::default()
+        };
+        let first = labelled_page(&fixture, &query);
+        assert_eq!(ids(&first), [fixture::GMAIL_LABELLED, fixture::PLAIN]);
+        query.cursor = first.next_cursor;
+        let second = labelled_page(&fixture, &query);
+        assert_eq!(ids(&second), [fixture::PARTIAL]);
+        assert_eq!(second.next_cursor, None);
     }
 }

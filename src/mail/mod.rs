@@ -49,6 +49,77 @@ impl fmt::Display for MessageId {
     }
 }
 
+/// One of Mail's seven flag colours, in the order of its flag menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlagColor {
+    /// Index 0.
+    Red,
+    /// Index 1.
+    Orange,
+    /// Index 2.
+    Yellow,
+    /// Index 3.
+    Green,
+    /// Index 4.
+    Blue,
+    /// Index 5.
+    Purple,
+    /// Index 6.
+    Gray,
+}
+
+impl FlagColor {
+    /// Every colour, by index.
+    pub const ALL: [FlagColor; 7] = [
+        FlagColor::Red,
+        FlagColor::Orange,
+        FlagColor::Yellow,
+        FlagColor::Green,
+        FlagColor::Blue,
+        FlagColor::Purple,
+        FlagColor::Gray,
+    ];
+
+    /// The colour at Mail's flag index 0 to 6.
+    pub fn from_index(index: i64) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|color| i64::from(color.index()) == index)
+    }
+
+    /// The colour called `name`, in lowercase.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.name() == name)
+    }
+
+    /// Mail's flag index.
+    pub fn index(self) -> u8 {
+        match self {
+            FlagColor::Red => 0,
+            FlagColor::Orange => 1,
+            FlagColor::Yellow => 2,
+            FlagColor::Green => 3,
+            FlagColor::Blue => 4,
+            FlagColor::Purple => 5,
+            FlagColor::Gray => 6,
+        }
+    }
+
+    /// The lowercase name used in the API.
+    pub fn name(self) -> &'static str {
+        match self {
+            FlagColor::Red => "red",
+            FlagColor::Orange => "orange",
+            FlagColor::Yellow => "yellow",
+            FlagColor::Green => "green",
+            FlagColor::Blue => "blue",
+            FlagColor::Purple => "purple",
+            FlagColor::Gray => "gray",
+        }
+    }
+}
+
 /// A decoded mailbox path such as `[Gmail]/All Mail`, kept as its segments.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MailboxPath(Vec<String>);
@@ -138,6 +209,37 @@ mod tests {
         }
         assert_eq!(MessageId::new(0), None);
         assert_eq!(MessageId::new(-1), None);
+    }
+
+    #[test]
+    fn flag_color_maps_index_and_name() {
+        for (index, name) in [
+            (0, "red"),
+            (1, "orange"),
+            (2, "yellow"),
+            (3, "green"),
+            (4, "blue"),
+            (5, "purple"),
+            (6, "gray"),
+        ] {
+            let color = FlagColor::from_index(index).unwrap();
+            assert_eq!(color.name(), name);
+            assert_eq!(i64::from(color.index()), index);
+            assert_eq!(FlagColor::from_name(name), Some(color));
+            assert_eq!(
+                serde_json::to_string(&color).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn flag_color_refuses_everything_else() {
+        assert_eq!(FlagColor::from_index(-1), None);
+        assert_eq!(FlagColor::from_index(7), None);
+        for name in ["", "Red", "pink", " red"] {
+            assert_eq!(FlagColor::from_name(name), None, "{name:?}");
+        }
     }
 
     #[test]

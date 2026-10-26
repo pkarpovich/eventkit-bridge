@@ -191,14 +191,14 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/mail/store.rs`
 - Modify: `src/request.rs` (the `MessageQuery` literal in `mail_messages_query` and in its test get `flag: None`; Task 2 fills it)
 
-- [ ] `fixtures/mail_schema.sql` and `SCHEMA` changes from Technical Details
-- [ ] fixture: `Row` gains `flags` and the insert lists it; a labels insert; the orange-flagged labelled Gmail message and the stale-colour message
-- [ ] `FlagColor` in `src/mail/mod.rs`; `MessageSummary` gains `flag: Option<FlagColor>` and `labels: Vec<String>`
-- [ ] SQL from Technical Details: colour column, the label-aware `mailbox` filter with `:visible` in `MESSAGES_SQL` only, `:flag` filter, `LABELS_SQL`; `MessageQuery` gains `flag: Option<FlagColor>` and its test `Default`
-- [ ] write tests: orange and blue colour read, `null` for `flagged = 0` with colour bits set, `labels` for the Gmail message and `[]` elsewhere, `mailbox=INBOX` finds the labelled message and lists both its labels (the same `labels` as without a filter and by id), an excluded label is neither listed nor matched, the labelled message appears once without `mailbox`
-- [ ] write tests: with `[Gmail]/All Mail` excluded, the labelled message is absent from the list (also with `mailbox=INBOX`, and a full page is not cut short by rows dropped after `LIMIT`) and its `GET` by id is `404`
-- [ ] write tests: `flag` filter, cursor paging under the filter, a schema without `labels` or `flags` fails the schema check
-- [ ] run `mise run check` - must pass before task 2
+- [x] `fixtures/mail_schema.sql` and `SCHEMA` changes from Technical Details
+- [x] fixture: `Row` gains `flags` and the insert lists it; a labels insert; the orange-flagged labelled Gmail message and the stale-colour message
+- [x] `FlagColor` in `src/mail/mod.rs`; `MessageSummary` gains `flag: Option<FlagColor>` and `labels: Vec<String>`
+- [x] SQL from Technical Details: colour column, the label-aware `mailbox` filter with `:visible` in `MESSAGES_SQL` only, `:flag` filter, `LABELS_SQL`; `MessageQuery` gains `flag: Option<FlagColor>` and its test `Default`
+- [x] write tests: orange and blue colour read, `null` for `flagged = 0` with colour bits set, `labels` for the Gmail message and `[]` elsewhere, `mailbox=INBOX` finds the labelled message and lists both its labels (the same `labels` as without a filter and by id), an excluded label is neither listed nor matched, the labelled message appears once without `mailbox`
+- [x] write tests: with `[Gmail]/All Mail` excluded, the labelled message is absent from the list (also with `mailbox=INBOX`, and a full page is not cut short by rows dropped after `LIMIT`) and its `GET` by id is `404`
+- [x] write tests: `flag` filter, cursor paging under the filter, a schema without `labels` or `flags` fails the schema check
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: `flag` query parameter
 
@@ -206,10 +206,10 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/request.rs`
 - Modify: `src/server.rs`
 
-- [ ] `flag` in the `mail_messages_query` allow-list, parsed into `FlagColor`, `400` text from Technical Details
-- [ ] write tests in `src/request.rs`: each colour, unknown colour, repeated, empty
-- [ ] write `oneshot` tests in `src/server.rs`: the filter, and `flag` / `labels` in list and single-message JSON
-- [ ] run `mise run check` - must pass before task 3
+- [x] `flag` in the `mail_messages_query` allow-list, parsed into `FlagColor`, `400` text from Technical Details
+- [x] write tests in `src/request.rs`: each colour, unknown colour, repeated, empty
+- [x] write `oneshot` tests in `src/server.rs`: the filter, and `flag` / `labels` in list and single-message JSON
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: `no_move_mailboxes`
 
@@ -218,34 +218,34 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/main.rs` (`describe_mail` destructures `MailConfig` without `..`)
 - Modify: `src/mail/fixture.rs` (`Fixture::config()` builds `MailConfig` as a literal; the new list is empty there)
 
-- [ ] `RawMail` field, default empty; `MailConfig` list and `is_no_move(path)`, case-insensitive, whole path
-- [ ] `describe_mail` (`--check-config` and the startup listing) prints `no_move_mailboxes` next to `exclude_mailboxes`
-- [ ] write tests: absent key is empty, listed paths match in any case, a partial path does not match, a wrong type is a config error, `describe_mail` output carries the list
-- [ ] run `mise run check` - must pass before task 4
+- [x] `RawMail` field, default empty; `MailConfig` list and `is_no_move(path)`, case-insensitive, whole path
+- [x] `describe_mail` (`--check-config` and the startup listing) prints `no_move_mailboxes` next to `exclude_mailboxes`
+- [x] write tests: absent key is empty, listed paths match in any case, a partial path does not match, a wrong type is a config error, `describe_mail` output carries the list
+- [x] run `mise run check` - must pass before task 4
 
 ### Task 4: Flag and move scripts in the runner
 
 **Files:**
 - Modify: `src/mail/script.rs`
 
-- [ ] flag script and `Runner::flag(FlagWrite)` per Technical Details
-- [ ] move script and `Runner::move_message(MailMove)` per Technical Details, output through `parse_moved`
-- [ ] both take the existing Mail write lock and deadline, and map errors through the existing classifier
-- [ ] the `///` doc comments on `Runner` and `ScriptError` describe every Mail write, not junk only
-- [ ] write tests: exact argv for both (values after the script, a path with spaces, brackets and quotes verbatim, `off`), each error code, empty and garbage stdout, deadline kill through the fake
-- [ ] write tests: a flag, a move and a junk call on clones of one `Runner` never overlap
-- [ ] run `mise run check` - must pass before task 5
+- [x] flag script and `Runner::flag(FlagWrite)` per Technical Details
+- [x] move script and `Runner::move_message(MailMove)` per Technical Details, output through `parse_moved`
+- [x] both take the existing Mail write lock and deadline, and map errors through the existing classifier
+- [x] the `///` doc comments on `Runner` and `ScriptError` describe every Mail write, not junk only
+- [x] write tests: exact argv for both (values after the script, a path with spaces, brackets and quotes verbatim, `off`), each error code, empty and garbage stdout, deadline kill through the fake
+- [x] write tests: a flag, a move and a junk call on clones of one `Runner` never overlap
+- [x] run `mise run check` - must pass before task 5
 
 ### Task 5: Move resolution in the store
 
 **Files:**
 - Modify: `src/mail/store.rs`
 
-- [ ] the resolution function next to `place()`, steps 1-6 of Technical Details, returning `Move`, `AlreadyThere`, `Closed`, `NotInFrom` or `NoTarget`
-- [ ] write tests: Gmail `INBOX` -> `[Gmail]/All Mail` for the labelled message, `[Gmail]/All Mail` -> `INBOX` for an unlabelled one, Exchange `Inbox` -> another mailbox, case-insensitive input returning stored case
-- [ ] write tests: `AlreadyThere` for `[Gmail]/All Mail` -> `INBOX` on a message labelled `INBOX`, and for `from` equal to `to`; `Move` (never `AlreadyThere`) for `INBOX` -> `[Gmail]/All Mail` on the labelled message, whose `to` is its source, and for `INBOX` -> `Receipts` when it already carries `Receipts`
-- [ ] write tests: `from` the message is not in, `to` that does not exist, `to` and `from` in `no_move_mailboxes`, `to` excluded, closed checked before membership, invisible message
-- [ ] run `mise run check` - must pass before task 6
+- [x] the resolution function next to `place()`, steps 1-6 of Technical Details, returning `Move`, `AlreadyThere`, `Closed`, `NotInFrom` or `NoTarget`
+- [x] write tests: Gmail `INBOX` -> `[Gmail]/All Mail` for the labelled message, `[Gmail]/All Mail` -> `INBOX` for an unlabelled one, Exchange `Inbox` -> another mailbox, case-insensitive input returning stored case
+- [x] write tests: `AlreadyThere` for `[Gmail]/All Mail` -> `INBOX` on a message labelled `INBOX`, and for `from` equal to `to`; `Move` (never `AlreadyThere`) for `INBOX` -> `[Gmail]/All Mail` on the labelled message, whose `to` is its source, and for `INBOX` -> `Receipts` when it already carries `Receipts`
+- [x] write tests: `from` the message is not in, `to` that does not exist, `to` and `from` in `no_move_mailboxes`, `to` excluded, closed checked before membership, invisible message
+- [x] run `mise run check` - must pass before task 6
 
 ### Task 6: Flag and move routes
 
@@ -254,20 +254,20 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/server.rs`
 - Modify: `src/auth/mod.rs`
 
-- [ ] `mail_flag_body` (`color`) and `mail_move_body` (`from`, `to`) with `deny_unknown_fields` and the existing `400` texts
-- [ ] routes `PUT` / `DELETE` `/v1/mail/messages/{id}/flag` and `POST /v1/mail/messages/{id}/move`, `require_json` on `PUT` and `POST`; handlers per Technical Details, `AlreadyThere` answered without the runner, status mapping shared with junk; the `///` doc comment on `Runners.mail` describes every Mail write
-- [ ] `SCOPE_TABLE` rows (`mail.flag` twice, `mail.move`), `ALL_SCOPES`, `scoped_cases()` and the auth table tests
-- [ ] request-line log extension with the account name and the colour or `off`
-- [ ] write `oneshot` tests: set and clear a flag, invisible message, bad colour, bad body, wrong content type, mail off
-- [ ] write `oneshot` tests: Gmail inbox to All Mail (an `osascript` call with `from` `INBOX`) and back, All Mail into a label the message already carries and `from == to`, both `200` with the same id and no `osascript` call, each `403` and `409`, copy not found gives `id: null`, each runner error, scope refusals for the new scopes
-- [ ] extend `mail_request_log_carries_rows_but_no_content` to the three routes; `every_route_but_health_has_a_scope` passes
-- [ ] run `mise run check` - must pass before task 7
+- [x] `mail_flag_body` (`color`) and `mail_move_body` (`from`, `to`) with `deny_unknown_fields` and the existing `400` texts
+- [x] routes `PUT` / `DELETE` `/v1/mail/messages/{id}/flag` and `POST /v1/mail/messages/{id}/move`, `require_json` on `PUT` and `POST`; handlers per Technical Details, `AlreadyThere` answered without the runner, status mapping shared with junk; the `///` doc comment on `Runners.mail` describes every Mail write
+- [x] `SCOPE_TABLE` rows (`mail.flag` twice, `mail.move`), `ALL_SCOPES`, `scoped_cases()` and the auth table tests
+- [x] request-line log extension with the account name and the colour or `off`
+- [x] write `oneshot` tests: set and clear a flag, invisible message, bad colour, bad body, wrong content type, mail off
+- [x] write `oneshot` tests: Gmail inbox to All Mail (an `osascript` call with `from` `INBOX`) and back, All Mail into a label the message already carries and `from == to`, both `200` with the same id and no `osascript` call, each `403` and `409`, copy not found gives `id: null`, each runner error, scope refusals for the new scopes
+- [x] extend `mail_request_log_carries_rows_but_no_content` to the three routes; `every_route_but_health_has_a_scope` passes
+- [x] run `mise run check` - must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] every field, parameter, route and status in Technical Details is implemented and covered by a test
-- [ ] `mise run check` and `shellcheck scripts/*.sh` pass
-- [ ] the Code-Quality Rules gate holds for the whole diff
+- [x] every field, parameter, route and status in Technical Details is implemented and covered by a test
+- [x] `mise run check` and `shellcheck scripts/*.sh` pass (shellcheck not installed here and scripts/ is unchanged, so skipped)
+- [x] the Code-Quality Rules gate holds for the whole diff
 
 ### Task 8: [Final] Update documentation
 
@@ -279,11 +279,11 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
-- [ ] README: intro and security model, `[mail]` example with `no_move_mailboxes` and the note that a trash mailbox left visible by `exclude_mailboxes` must be listed there, or moves into it are allowed, scope table rows, types (`flag`, `labels`), `GET /v1/mail/messages` (`flag`, label-aware `mailbox`, the corrected Gmail note: one row per message with its labels listed, and excluding `[Gmail]/All Mail` hides every Gmail message because labels never grant visibility), the three routes with bodies, answers and status codes, "Not available", logs
-- [ ] CLAUDE.md rules and `Info.plist.template` text from Technical Details; the cask caveats in `release.yml` name flag and move next to junk
-- [ ] version 0.9.0 in `Cargo.toml` and `Cargo.lock`
-- [ ] run `mise run check`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: intro and security model, `[mail]` example with `no_move_mailboxes` and the note that a trash mailbox left visible by `exclude_mailboxes` must be listed there, or moves into it are allowed, scope table rows, types (`flag`, `labels`), `GET /v1/mail/messages` (`flag`, label-aware `mailbox`, the corrected Gmail note: one row per message with its labels listed, and excluding `[Gmail]/All Mail` hides every Gmail message because labels never grant visibility), the three routes with bodies, answers and status codes, "Not available", logs
+- [x] CLAUDE.md rules and `Info.plist.template` text from Technical Details; the cask caveats in `release.yml` name flag and move next to junk
+- [x] version 0.9.0 in `Cargo.toml` and `Cargo.lock`
+- [x] run `mise run check`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

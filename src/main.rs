@@ -404,6 +404,7 @@ fn describe_mail(mail: &MailConfig) -> String {
     let MailConfig {
         accounts,
         exclude_mailboxes,
+        no_move_mailboxes,
         root,
     } = mail;
     let mut out = String::from("mail: on\n");
@@ -418,6 +419,12 @@ fn describe_mail(mail: &MailConfig) -> String {
     }
     for path in exclude_mailboxes {
         out.push_str(&format!("mail excluded mailbox: {path}\n"));
+    }
+    if no_move_mailboxes.is_empty() {
+        out.push_str("mail no-move mailboxes: none\n");
+    }
+    for path in no_move_mailboxes {
+        out.push_str(&format!("mail no-move mailbox: {path}\n"));
     }
     match root {
         Some(root) => out.push_str(&format!("mail root: {}\n", root.display())),
@@ -707,6 +714,7 @@ mod tests {
 
             [mail]
             exclude_mailboxes = ["Archive"]
+            no_move_mailboxes = ["Junk"]
             root = "/tmp/Mail/V10"
 
             [mail.accounts]
@@ -718,7 +726,7 @@ mod tests {
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(
             text.contains(
-                "mail: on\nmail account: gmail (4F7D9489-A78F-4369-A951-213207DCFEE3)\nmail account: main (8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10)\nmail excluded mailbox: Archive\nmail root: /tmp/Mail/V10\n"
+                "mail: on\nmail account: gmail (4F7D9489-A78F-4369-A951-213207DCFEE3)\nmail account: main (8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10)\nmail excluded mailbox: Archive\nmail no-move mailbox: Junk\nmail root: /tmp/Mail/V10\n"
             ),
             "{text}"
         );
@@ -733,6 +741,7 @@ mod tests {
                 .unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.contains("mail excluded mailboxes: none\n"), "{text}");
+        assert!(text.contains("mail no-move mailboxes: none\n"), "{text}");
     }
 
     fn missing_runners(dir: &Path) -> Runners {

@@ -25,7 +25,7 @@ const ACCEPTED_TYPES: [&str; 2] = ["at+jwt", "application/at+jwt"];
 /// The one route that needs no token.
 pub const EXEMPT_ROUTE: &str = "/healthz";
 
-const SCOPE_TABLE: [(&str, &str, &str); 21] = [
+const SCOPE_TABLE: [(&str, &str, &str); 24] = [
     ("GET", "/v1/calendars", "calendar.read"),
     ("GET", "/v1/events", "calendar.read"),
     ("GET", "/v1/events/", "calendar.read"),
@@ -47,6 +47,9 @@ const SCOPE_TABLE: [(&str, &str, &str); 21] = [
     ("GET", "/v1/mail/messages", "mail.read"),
     ("GET", "/v1/mail/messages/{id}", "mail.read"),
     ("PATCH", "/v1/mail/messages/{id}", "mail.junk"),
+    ("PUT", "/v1/mail/messages/{id}/flag", "mail.flag"),
+    ("DELETE", "/v1/mail/messages/{id}/flag", "mail.flag"),
+    ("POST", "/v1/mail/messages/{id}/move", "mail.move"),
 ];
 
 /// Why a request's bearer token was refused; carries only the kind, never a claim value or the token.
@@ -960,6 +963,9 @@ mod tests {
             (Method::GET, "/v1/mail/messages", "mail.read"),
             (Method::GET, "/v1/mail/messages/{id}", "mail.read"),
             (Method::PATCH, "/v1/mail/messages/{id}", "mail.junk"),
+            (Method::PUT, "/v1/mail/messages/{id}/flag", "mail.flag"),
+            (Method::DELETE, "/v1/mail/messages/{id}/flag", "mail.flag"),
+            (Method::POST, "/v1/mail/messages/{id}/move", "mail.move"),
         ];
         for (method, route, name) in rows {
             assert_eq!(scope_for(&method, route), Some(name), "{method} {route}");

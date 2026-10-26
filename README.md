@@ -1,17 +1,17 @@
 # eventkit-bridge
 
-`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger. Optionally, it also reads the mail Apple Mail has already downloaded, for every account configured in Mail, and asks Mail to move a message to junk or back to the inbox; it never writes Mail's files.
+`eventkit-bridge` is a small macOS daemon that exposes your Mac's calendars and reminders over an HTTP API on a private network address, such as your tailscale IP. It reads the calendars the Mac already syncs (iCloud, Google, Exchange), and it creates, updates and deletes events in the calendars you choose. It reads the reminder lists you allow, and it adds, changes, completes and deletes reminders in the lists you choose, with a due date, a repeat rule, a priority and an optional location trigger. Optionally, it also reads the mail Apple Mail has already downloaded, for every account configured in Mail, and asks Mail to mark a message as junk or not junk, to flag or unflag it, or to move it between two mailboxes of its account; it never writes Mail's files.
 
 ```
 HTTP client (on the tailnet) --HTTP--> eventkit-bridge (LaunchAgent, EventKitBridge.app) --exec--> ekctl     --EventKit--> calendars
                                                                                           --exec--> remindctl --EventKit--> reminders
                                                                                           --read-only-------------------> ~/Library/Mail
-                                                                                          --exec--> osascript --Apple Events--> Mail.app (junk / not junk)
+                                                                                          --exec--> osascript --Apple Events--> Mail.app (junk, flag, move)
 ```
 
 The bridge does not call EventKit itself. It ships pinned copies of two native Swift command-line tools over EventKit inside its app bundle: [`ekctl`](https://github.com/schappim/ekctl) v1.8.0 for calendars and [`remindctl`](https://github.com/openclaw/remindctl) v0.3.8 for reminders. Each API request is turned into an `ekctl` or `remindctl` invocation, and the tool's JSON output is turned into the bridge's own JSON. Clients never see either tool and never pass it arguments.
 
-Mail is read straight from the files Mail keeps on disk: the Envelope Index, a SQLite database with one row per message, and the `.emlx` files that hold each message. The one mail write, marking a message as junk or not junk, goes through Mail.app over Apple Events, so Mail moves the message and syncs the move to the server as if you had clicked Junk in Mail. The bridge never talks to a mail server itself and needs no account credentials.
+Mail is read straight from the files Mail keeps on disk: the Envelope Index, a SQLite database with one row per message, and the `.emlx` files that hold each message. The mail writes, marking a message as junk or not junk, setting or clearing its flag, and moving it between two mailboxes of its account, go through Mail.app over Apple Events, so Mail syncs each one to the server as if you had done it in Mail. The bridge never talks to a mail server itself and needs no account credentials.
 
 It requires macOS 14 Sonoma or later on Apple Silicon.
 
@@ -27,9 +27,9 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 - **Location triggers name a place from the config.** A client picks a place such as `shop` by name; street addresses and coordinates never cross the API in either direction.
 - **The bridge builds every `ekctl` and `remindctl` command itself.** There is no generic passthrough, so a client cannot inject options into either tool. Reminder and list ids must be full UUIDs, because `remindctl` reads a short number as a row index from its last listing.
 - **Mail is off unless you turn it on, and then read from disk read-only.** Without a `[mail]` table no mail code runs. With it, the Envelope Index is opened read-only, no message data is ever written by the bridge (the only files the bridge can create under `~/Library/Mail` are SQLite's own `-shm` and `-wal` files next to the Envelope Index, when Mail is not running), and only the accounts you name in `[mail.accounts]` are visible.
-- **The single mail write is junk or not junk, done by Mail.app.** `PATCH /v1/mail/messages/{id}` asks Mail over Apple Events to move one visible message to its account's junk mailbox or back to its inbox. The bridge runs `/usr/bin/osascript` directly with a fixed script and passes the account, mailboxes and message id as separate arguments, never as script text. Sending, replying, deleting, flagging, marking read and moving to any other mailbox are not possible. macOS asks once before EventKitBridge may control Mail.
+- **Mail writes are junk or not junk, flag or unflag, and a move between two mailboxes of one account, done by Mail.app.** `PATCH /v1/mail/messages/{id}` moves one visible message to its account's junk mailbox or back to its inbox. `PUT` and `DELETE /v1/mail/messages/{id}/flag` set and clear its flag. `POST /v1/mail/messages/{id}/move` moves it between two mailboxes. A move is refused for any mailbox in `no_move_mailboxes` or `exclude_mailboxes`. The bridge has no built-in list of trash mailboxes, so keeping trash out of moves is the config's job. The bridge runs `/usr/bin/osascript` directly with a fixed script and passes the account, mailboxes, message id and flag colour as separate arguments, never as script text. Sending, replying, deleting and marking read are not possible. macOS asks once before EventKitBridge may control Mail.
 - **Reading mail needs Full Disk Access, for the whole bridge.** macOS has no narrower permission for `~/Library/Mail`. Granting it to EventKitBridge lets the bridge process read every file your user can, not just mail. The bridge itself only opens the Envelope Index, the `.emlx` files under the mail folder and `~/Library/Accounts/Accounts4.sqlite`, and refuses any message path that leads outside the mail folder. Leave mail off if you do not want to grant it.
-- **Contents are never logged.** Request logs carry the method, route, status and timing, the client id of a bearer token, plus a row count for mail reads and the account name and junk value for junk requests, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths. Tokens and their claims, other than the client id, are never logged either.
+- **Contents are never logged.** Request logs carry the method, route, status and timing, the client id of a bearer token, plus a row count for mail reads, the account name and junk value for junk requests, the account name and flag colour for flag requests, and the account name for move requests, but never event titles, notes, locations, URLs or attendees, reminder titles or notes, place addresses and coordinates, or mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths. Tokens and their claims, other than the client id, are never logged either.
 
 ## Install
 
@@ -128,7 +128,7 @@ Mail is optional. Skip this section to keep it off.
 
    Accounts not listed stay invisible to clients.
 
-5. The first `PATCH /v1/mail/messages/{id}` (junk or not junk) shows the prompt "EventKitBridge wants to control Mail". Allow it. Mail is launched if it is not running. If you deny it, every junk request fails with `503` until you switch EventKitBridge on under System Settings, Privacy & Security, Automation, Mail. Reading mail does not need this permission.
+5. The first mail write (junk or not junk, flag, or move) shows the prompt "EventKitBridge wants to control Mail". Allow it. Mail is launched if it is not running. If you deny it, every mail write fails with `503` until you switch EventKitBridge on under System Settings, Privacy & Security, Automation, Mail. Reading mail does not need this permission.
 
 The Envelope Index is an undocumented Apple format. The bridge was built against Mail data version `V10` on macOS 27, and a macOS release may change it; `/healthz` reports `mail schema changed` when a table or column the bridge reads disappears.
 
@@ -150,6 +150,7 @@ home = { address = "2 Example Road, Exampletown" }
 
 [mail]
 exclude_mailboxes = ["Trash", "Deleted Items", "Deleted Messages", "Junk", "Junk Email", "Spam", "[Gmail]/Trash", "[Gmail]/Spam"]
+no_move_mailboxes = ["Junk E-mail"]
 # root = "/path/to/Mail/V10"
 
 [mail.accounts]
@@ -176,7 +177,8 @@ jwks_url = "https://auth.example.com/jwks.json"
 | `remindctl` | no | The `remindctl` binary to run. Defaults to the `remindctl` next to the `eventkit-bridge` binary. Only useful for development. |
 | `mail` | no | The `[mail]` table. Its presence turns mail on; without it the mail routes answer `404` and the mail store is never opened. |
 | `mail.accounts` | no | Maps a Mail account uuid, a full UUID in either case, to the name clients see. A name follows the same rule as a place name. Two entries may not share a uuid or a name. Accounts not listed are invisible. Empty by default, which hides every account. |
-| `mail.exclude_mailboxes` | no | Mailbox paths never shown, compared case-insensitively, such as `[Gmail]/Spam`. Defaults to the list in the example above; `[]` excludes nothing. An entry must not be blank. |
+| `mail.exclude_mailboxes` | no | Mailbox paths never shown, compared case-insensitively, such as `[Gmail]/Spam`. Defaults to the list in the example above; `[]` excludes nothing. |
+| `mail.no_move_mailboxes` | no | Mailbox paths a move may not take a message from or into, compared case-insensitively on the whole path, in every account. A listed mailbox stays readable. Empty by default. A trash or junk mailbox that `exclude_mailboxes` leaves visible must be listed here, or moves into it are allowed. |
 | `mail.root` | no | The Mail data directory to read. Defaults to the highest `~/Library/Mail/V<n>` that contains `MailData/Envelope Index`. Only useful for development. |
 | `auth` | no | The `[auth]` table. Its presence turns the bearer-token gate on (see Authentication); without it no token is read. |
 | `auth.issuer` | yes, in `[auth]` | The provider URL, compared exactly with the token's `iss`. Must not be blank or contain whitespace. |
@@ -186,7 +188,7 @@ jwks_url = "https://auth.example.com/jwks.json"
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
 
-`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url` and `scope_prefix`; it never fetches the keys.
+`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes, the no-move mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url` and `scope_prefix`; it never fetches the keys.
 
 #### Why places are named
 
@@ -234,6 +236,8 @@ Each route needs one scope, `scope_prefix` followed by the name below:
 | `reminders.write` | `POST /v1/reminders`, `PATCH` and `DELETE /v1/reminders/{id}` |
 | `mail.read` | `GET /v1/mail/accounts`, `GET /v1/mail/messages`, `GET /v1/mail/messages/{id}` |
 | `mail.junk` | `PATCH /v1/mail/messages/{id}` |
+| `mail.flag` | `PUT` and `DELETE /v1/mail/messages/{id}/flag` |
+| `mail.move` | `POST /v1/mail/messages/{id}/move` |
 | none | `GET /healthz`, which needs no token at all |
 
 A write scope does not include the read scope: a client that creates events and reads them asks for both `bridge:calendar.write` and `bridge:calendar.read`. `HEAD` needs the scope of `GET`. A path that does not exist, or a method a route does not accept, still needs a valid token, but no scope, before it answers `404` or `405`. The scopes decide which routes a client may call; which calendars, lists and mail accounts it may touch is still decided by the rest of the config.
@@ -418,7 +422,7 @@ A write is `400` when:
 - any string contains a control character other than newline and tab;
 - the body is not valid JSON or has an unknown field.
 
-A body larger than 64 KiB is `413`. `POST` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events or marking mail as junk with a cross-site form or `fetch` request.
+A body larger than 64 KiB is `413`. `POST`, `PUT` and `PATCH` must send `Content-Type: application/json`; any other content type, or none, is `415`. This stops a web page open in a browser on the tailnet from creating events or changing mail with a cross-site form or `fetch` request.
 
 ### Status codes
 
@@ -571,9 +575,9 @@ Reminder sections, tags, subtasks, smart lists, the Groceries list type and the 
 
 ## Mail API
 
-The mail routes follow the same rules as the other routes: the `Host` check, with `[auth]` a bearer token with the route's scope, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
+The mail routes follow the same rules as the other routes: the `Host` check, with `[auth]` a bearer token with the route's scope, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`, `PUT` and `DELETE` on `/v1/mail/messages/{id}/flag` and `POST` on `/v1/mail/messages/{id}/move`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
 
-Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request. Junk requests do not wait for them either; they wait only for each other, one Mail call at a time.
+Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request. Mail writes do not wait for them either; they wait only for each other, one Mail call at a time.
 
 ### Types
 
@@ -599,6 +603,8 @@ A message summary:
   "summary": "The numbers for the third quarter",
   "read": false,
   "flagged": false,
+  "flag": null,
+  "labels": [],
   "has_body": true
 }
 ```
@@ -618,6 +624,8 @@ A message is a summary plus:
 - `id` is Mail's row id for the message.
 - `date` is when the message was received, RFC 3339 in the Mac's time zone.
 - `from`, `subject` and `summary` are `null` when Mail stored none, and a name is `null` when the address has no display name. Mail keeps a `summary` for only some messages.
+- `flag` is `red`, `orange`, `yellow`, `green`, `blue`, `purple` or `gray` when the message is flagged, otherwise `null`. A colour means something only on a flagged message.
+- `labels` lists the visible label mailboxes of a Gmail message, such as `INBOX`, sorted. It is `[]` for every other message.
 - `has_body` is false when Mail has no file for the message; `body` is then `null`.
 - `body` is the first `text/plain` part, or else the first `text/html` part converted to plain text. It is cut at 100 000 characters, with `body_truncated: true`.
 - `partial` is true when Mail holds only part of the message, such as the headers and the start of the body. `body` is then whatever could be recovered.
@@ -642,7 +650,8 @@ Lists message summaries, newest first by the time they were received.
 | Parameter | Meaning |
 | --- | --- |
 | `account` | Optional and repeatable. A configured account name. Without it, every configured account is read. |
-| `mailbox` | Optional, at most 1 000 characters. A mailbox path within those accounts, such as `Inbox` or `[Gmail]/All Mail`, compared case-insensitively. |
+| `mailbox` | Optional, at most 1 000 characters. A mailbox path within those accounts, such as `Inbox` or `[Gmail]/All Mail`, compared case-insensitively. A Gmail message matches its source mailbox and each of its labels, so `INBOX` lists the Gmail inbox. |
+| `flag` | Optional. `red`, `orange`, `yellow`, `green`, `blue`, `purple` or `gray`: only messages flagged in that colour. Anything else is `400`. |
 | `since`, `until` | Optional RFC 3339 timestamps. Messages received at or after `since` and before `until`. `until` must be after `since`. |
 | `q` | Optional, at most 500 characters. A case-insensitive substring of the subject, the sender's name or address, a recipient's address, or Mail's summary. Case folding covers every script, not only ASCII. |
 | `unread` | `true` lists unread messages only; `false`, the default, lists both. |
@@ -654,12 +663,12 @@ curl 'http://100.64.0.1:8790/v1/mail/messages?account=work&mailbox=Inbox&since=2
 ```
 
 ```json
-{"messages":[{"id":383621,"account":"work","mailbox":"Inbox","date":"2026-10-05T15:35:13+02:00","from":{"name":"A Person","address":"a@example.com"},"to":[{"name":null,"address":"me@example.com"}],"subject":"Quarterly report","summary":"The numbers for the third quarter","read":false,"flagged":false,"has_body":true}],"next_cursor":null}
+{"messages":[{"id":383621,"account":"work","mailbox":"Inbox","date":"2026-10-05T15:35:13+02:00","from":{"name":"A Person","address":"a@example.com"},"to":[{"name":null,"address":"me@example.com"}],"subject":"Quarterly report","summary":"The numbers for the third quarter","read":false,"flagged":false,"flag":null,"labels":[],"has_body":true}],"next_cursor":null}
 ```
 
 - `next_cursor` is `null` on the last page. Pass it back as `cursor` with the same filters to get the next page. A cursor that is not one the bridge returned is `400`; a cursor reused with different filters is not detected and simply continues from that position.
 - Deleted messages, messages in excluded mailboxes and messages in accounts not in `[mail.accounts]` never appear.
-- A message in several mailboxes, such as a Gmail message with labels, appears once per mailbox, `[Gmail]/All Mail` included.
+- A Gmail message is one row in `[Gmail]/All Mail` with its labels listed in `labels`, and appears once whatever its labels. Labels never grant visibility: with `[Gmail]/All Mail` in `exclude_mailboxes`, every Gmail message is hidden. A label that is excluded is not listed in `labels` and does not match `mailbox`.
 - `q` does not search message bodies. It matches Mail's stored summary, which is empty for many messages.
 - An account name that is not configured is `400 unknown mail account "<name>"`, and a mailbox that is not a visible mailbox of the chosen accounts is `400 unknown mailbox "<path>"`.
 - The bounds are `since` and `until`, not `from` and `to`; `from` is `400`.
@@ -690,7 +699,49 @@ curl -X PATCH -H 'content-type: application/json' -d '{"junk": false}' http://10
 - The junk mailbox is the first of the account's mailboxes named `[Gmail]/Spam`, `Junk Email`, `Junk E-mail`, `Junk` or `Spam`, in that order, compared case-insensitively. The inbox is the mailbox named `INBOX`, in any case. An account without one is `409 account has no junk mailbox` or `409 account has no inbox`.
 - Mail gives a moved message a new id. `id` is that new id, or the same id when the message was already in the target mailbox. It is `null` when the moved copy did not show up within about 5 seconds, when the message has no Message-ID to find the copy by, or when the target mailbox is in `mail.exclude_mailboxes`. The default `exclude_mailboxes` hides every junk mailbox except `Junk E-mail`, so with it a message marked as junk usually gets `id: null`, and a message in junk is not visible and cannot be marked as not junk; remove the junk mailbox from `exclude_mailboxes` to rescue mail from it.
 - `account` is the configured account name, `mailbox` the target mailbox path and `junk` the requested value.
-- One message per request. Junk requests run one at a time.
+- One message per request. Mail writes run one at a time.
+
+### `PUT /v1/mail/messages/{id}/flag`
+
+Sets a message's flag to one colour. Mail.app sets it and syncs it. The body is `{"color": "orange"}`, sent as `application/json`; `color` is required, is the only field and is one of `red`, `orange`, `yellow`, `green`, `blue`, `purple` or `gray`.
+
+```sh
+curl -X PUT -H 'content-type: application/json' -d '{"color": "orange"}' http://100.64.0.1:8790/v1/mail/messages/383622/flag
+```
+
+```json
+{"id":383622,"flag":"orange"}
+```
+
+- The message must be visible; otherwise it is `404 message not found`.
+- The id does not change. Setting the colour the message already has is `200`.
+- The bridge gives a colour no meaning. A client decides what orange stands for.
+
+### `DELETE /v1/mail/messages/{id}/flag`
+
+Clears a message's flag. No body. The answer is `{"id":383622,"flag":null}`. Clearing an unflagged message is `200`.
+
+### `POST /v1/mail/messages/{id}/move`
+
+Moves a message from one mailbox to another in its account. Mail.app does the move and syncs it. The body is `{"from": "INBOX", "to": "[Gmail]/All Mail"}`, sent as `application/json`; both are required, are the only fields, and are non-empty paths of at most 1 000 characters.
+
+```sh
+curl -X POST -H 'content-type: application/json' -d '{"from": "INBOX", "to": "[Gmail]/All Mail"}' http://100.64.0.1:8790/v1/mail/messages/383622/move
+```
+
+```json
+{"id":383622,"account":"gmail","mailbox":"[Gmail]/All Mail"}
+```
+
+- The message must be visible; otherwise it is `404 message not found`.
+- `from` and `to` are paths of mailboxes of the message's account, compared case-insensitively. The answer carries the stored `to` path.
+- `from` or `to` listed in `no_move_mailboxes` or `exclude_mailboxes` is `403 mailbox is closed to moves`. This is checked before anything else, so the answer does not depend on where the message is.
+- `from` must be the message's own mailbox or one of its Gmail labels, otherwise `409 message is not in the from mailbox`. A `to` that does not exist in the account is `409 account has no to mailbox`.
+- Gmail has no archive mailbox. Archiving is a move from `INBOX` to `[Gmail]/All Mail`, which removes the `INBOX` label. A move from `[Gmail]/All Mail` to `INBOX` adds the label back. A move between two labels is not verified.
+- A message that is already in `to` is `200` with the same id and no call to Mail.
+- Mail may give a moved message a new id. `id` is the new id, or `null` when the moved copy did not show up within about 5 seconds or when the message has no Message-ID to find it by. Search for the message if the id is `null`.
+- A move into or out of a junk mailbox does not mark the message as junk and does not train the provider. Use `PATCH` for that.
+- One message per request. Mail writes run one at a time.
 
 ### Mail status codes
 
@@ -698,20 +749,20 @@ curl -X PATCH -H 'content-type: application/json' -d '{"junk": false}' http://10
 | --- | --- |
 | `400` | The request is invalid; the message names the parameter. |
 | `401` | With `[auth]`: the bearer token is missing or invalid. |
-| `403` | With `[auth]`: the token lacks `mail.read`, or `mail.junk` for a `PATCH`. |
-| `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to mark (it moved or was deleted in the meantime). |
-| `405` | A method other than `GET`, or other than `GET` and `PATCH` on `/v1/mail/messages/{id}`. |
-| `409` | The account has no junk mailbox, or no inbox. |
-| `413` | A `PATCH` body larger than 64 KiB. |
-| `415` | A `PATCH` body that is not `application/json`. |
+| `403` | A move names a mailbox in `no_move_mailboxes` or `exclude_mailboxes`. With `[auth]`: the token lacks `mail.read`, or the scope of the write: `mail.junk` for a `PATCH`, `mail.flag` for a flag route, `mail.move` for a move. |
+| `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to change (it moved or was deleted in the meantime). |
+| `405` | A method other than `GET`, or a method a route does not list above. |
+| `409` | The account has no junk mailbox or no inbox, or a move names a mailbox the message is not in or the account does not have. |
+| `413` | A `PATCH`, `PUT` or `POST` body larger than 64 KiB. |
+| `415` | A `PATCH`, `PUT` or `POST` body that is not `application/json`. |
 | `500` | A query against the Envelope Index failed, or a message file could not be read. The error names only the kind of failure, never the file path. |
-| `502` | `Mail failed`: `osascript` could not start, Mail returned an error while marking the message, or `osascript` printed output the bridge does not understand. |
+| `502` | `Mail failed`: `osascript` could not start, Mail returned an error while changing the message, or `osascript` printed output the bridge does not understand. |
 | `503` | The mail store could not be opened, which is how a missing Full Disk Access grant shows up; or `Mail automation not permitted`, when EventKitBridge may not control Mail. |
 | `504` | `Mail did not answer` within 30 seconds. |
 
 ### Not available
 
-Sending, replying, flagging, marking read, deleting mail, and moving it anywhere but junk and the inbox; marking several messages in one request; attachment contents; full-text search over message bodies; and de-duplicating a message that appears in several mailboxes.
+Sending, replying, marking read, deleting mail, and moving a message to another account; changing several messages in one request; attachment contents; full-text search over message bodies; and de-duplicating a message that appears in several mailboxes.
 
 ## Health check
 
@@ -722,7 +773,7 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.8.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95,"auth":{"jwks_keys":2,"jwks_age_s":3120}}
+{"status":"ok","version":"0.9.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95,"auth":{"jwks_keys":2,"jwks_age_s":3120}}
 ```
 
 `calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config.
@@ -756,11 +807,13 @@ A calendar, reminder or mail problem is reported before `auth jwks unavailable`.
 
 There is usually nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
 
+Upgrading to 0.9.0 with `[mail]`: a Gmail message is now listed once, in `[Gmail]/All Mail`, with its labels in `labels`, instead of once per mailbox. `mailbox=INBOX` still finds it through its label. With `[Gmail]/All Mail` in `exclude_mailboxes`, every Gmail message is hidden. To use the new routes, grant clients the `mail.flag` and `mail.move` scopes. Add `no_move_mailboxes` for every trash or junk mailbox that `exclude_mailboxes` leaves visible, or moves into it are allowed.
+
 Upgrading to 0.8.0 with an `[auth]` table: delete the `required` line from `[auth]` first and run `eventkit-bridge install`. 0.8.0 no longer knows the key, so a config that still has it fails to load with an unknown-key error naming `required`. On 0.7.0 a missing `required` means `true`, so deleting the line changes nothing there; if it was `required = false`, make sure every client sends a token before deleting it, because 0.8.0 refuses a request without one with `401`.
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, and a junk request for a visible message logs the account name and the requested junk value, whatever its outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, a junk request for a visible message logs the account name and the requested junk value, a flag request logs the account name and the colour or `off`, and a move request logs the account name, whatever the outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
 
 ```
 2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
@@ -772,7 +825,7 @@ The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces o
 
 A refused token also logs `token refused` with its kind (`missing`, `malformed`, `unknown key`, `invalid` or `insufficient scope`) and nothing else. At startup, `auth on` logs the issuer, audience and `scope_prefix`, and `jwks loaded` the number of keys and whether they came from the `file` or the `provider`; a failed fetch logs `cannot fetch the jwks` with the HTTP status or the kind of error, never the body.
 
-Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths of junk requests are never logged; of a failed Mail call, only its error code is logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. Bearer tokens, the `Authorization` header and every token claim other than the client id are never logged. The description of an IMAP account is often its email address; it appears once, in the startup listing.
+Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths of mail writes are never logged; of a failed Mail call, only its error code is logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. Bearer tokens, the `Authorization` header and every token claim other than the client id are never logged. The description of an IMAP account is often its email address; it appears once, in the startup listing.
 
 The log is not rotated. To truncate it:
 
@@ -800,7 +853,7 @@ The log is not rotated. To truncate it:
 - **A reminder request fails with `502 remindctl: List not found`.** A list in `read_lists` or `write_lists` was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **`/healthz` says `calendar missing`.** A calendar in the config was deleted or its id changed. Look up the current ids in the startup listing in the log and update the config.
 - **`/healthz` says `mail no access`, or mail requests fail with `503`.** The bridge has no Full Disk Access. Check System Settings, Privacy & Security, Full Disk Access, and make sure `EventKitBridge` is listed and switched on, then run `eventkit-bridge install` to restart the daemon.
-- **Junk requests fail with `503 Mail automation not permitted`.** Mail answered with error `-1743`: EventKitBridge is not allowed to control Mail. Open System Settings, Privacy & Security, Automation, expand EventKitBridge, and switch on Mail. If EventKitBridge is not listed or the prompt never appeared, reset the permission to get a fresh prompt on the next junk request:
+- **Mail writes fail with `503 Mail automation not permitted`.** Mail answered with error `-1743`: EventKitBridge is not allowed to control Mail. Open System Settings, Privacy & Security, Automation, expand EventKitBridge, and switch on Mail. If EventKitBridge is not listed or the prompt never appeared, reset the permission to get a fresh prompt on the next mail write:
 
   ```sh
   tccutil reset AppleEvents dev.pkarpovich.eventkit-bridge

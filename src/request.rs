@@ -4,9 +4,9 @@ use url::Url;
 
 use crate::config::{AccountName, CalendarId, ListId, Place};
 use crate::ekctl::{EventChanges, EventRange, FreeQuery, NewEvent, Weekdays, WorkingHours};
-use crate::mail::MessageId;
 use crate::mail::script::JunkStatus;
 use crate::mail::store::{Cursor, CursorError, DEFAULT_LIMIT, MAX_LIMIT, MessageQuery, ReadFilter};
+use crate::mail::{FlagColor, MessageId};
 use crate::model::Event;
 use crate::remindctl::{Change, Completion, NewReminder, ReminderChanges, ShowFilter, Trigger};
 use crate::reminders_model::{Due, Interval, Priority, Proximity, RcReminder, Repeat, Unit};
@@ -608,7 +608,7 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         params.insert(
             (key.into_owned(), value.into_owned()),
             &[
-                "mailbox", "since", "until", "q", "unread", "limit", "cursor",
+                "mailbox", "since", "until", "q", "unread", "flag", "limit", "cursor",
             ],
         )?;
     }
@@ -637,6 +637,17 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         Some("true") => ReadFilter::Unread,
         Some(_) => return Err(Invalid::new("`unread` must be true or false")),
     };
+    let flag = match params.get("flag") {
+        Some(name) => {
+            let Some(color) = FlagColor::from_name(name) else {
+                return Err(Invalid::new(
+                    "`flag` must be one of red, orange, yellow, green, blue, purple, gray",
+                ));
+            };
+            Some(color)
+        }
+        None => None,
+    };
     let limit = params.number("limit", MAIL_LIMIT_BOUNDS)?;
     let cursor = match params.get("cursor") {
         Some(cursor) => match Cursor::decode(cursor) {
@@ -656,6 +667,7 @@ pub fn mail_messages_query(raw: Option<&str>) -> Result<MessageQuery, Invalid> {
         until,
         q,
         read,
+        flag,
         limit,
         cursor,
     })
@@ -688,6 +700,66 @@ pub fn mail_junk_body(body: &[u8]) -> Result<JunkStatus, Invalid> {
         Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
     };
     Ok(JunkStatus::from(junk))
+}
+
+/// The body of `PUT /v1/mail/messages/{id}/flag`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailFlagBody {
+    /// The colour name.
+    pub color: String,
+}
+
+/// Parses a `PUT /v1/mail/messages/{id}/flag` body, whose only and required field is `color`.
+pub fn mail_flag_body(body: &[u8]) -> Result<FlagColor, Invalid> {
+    let body: serde_json::Value = parse_json(body)?;
+    if !body.is_object() {
+        return Err(Invalid::new("invalid JSON body: expected an object"));
+    }
+    let MailFlagBody { color } = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
+    };
+    let Some(color) = FlagColor::from_name(&color) else {
+        return Err(Invalid::new(
+            "`color` must be one of red, orange, yellow, green, blue, purple, gray",
+        ));
+    };
+    Ok(color)
+}
+
+/// The body of `POST /v1/mail/messages/{id}/move`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailMoveBody {
+    /// The mailbox path the message is in.
+    pub from: String,
+    /// The mailbox path it goes to.
+    pub to: String,
+}
+
+fn mailbox_text(key: &str, value: &str) -> Result<(), Invalid> {
+    if value.is_empty() {
+        return Err(Invalid::new(format!("`{key}` must not be empty")));
+    }
+    check_text(key, value, MAX_MAILBOX)
+}
+
+/// Parses a `POST /v1/mail/messages/{id}/move` body, whose only and required fields are `from`
+/// and `to`.
+pub fn mail_move_body(body: &[u8]) -> Result<MailMoveBody, Invalid> {
+    let body: serde_json::Value = parse_json(body)?;
+    if !body.is_object() {
+        return Err(Invalid::new("invalid JSON body: expected an object"));
+    }
+    let body: MailMoveBody = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
+    };
+    let MailMoveBody { from, to } = &body;
+    mailbox_text("from", from)?;
+    mailbox_text("to", to)?;
+    Ok(body)
 }
 
 /// The body of `POST /v1/reminders`.
@@ -1775,6 +1847,7 @@ mod tests {
                 until: Some(at("2026-10-05T00:00:00Z")),
                 q: Some("Привет".to_owned()),
                 read: ReadFilter::Unread,
+                flag: None,
                 limit: 100,
                 cursor: Some(cursor),
             }
@@ -1784,6 +1857,16 @@ mod tests {
         assert_eq!(query.read, ReadFilter::Any);
         assert_eq!(query.limit, 1);
         assert_eq!(query.until, None);
+    }
+
+    const FLAG_TEXT: &str = "`flag` must be one of red, orange, yellow, green, blue, purple, gray";
+
+    #[test]
+    fn mail_messages_query_flag_accepts_each_colour() {
+        for color in FlagColor::ALL {
+            let query = mail_messages_query(Some(&format!("flag={}", color.name()))).unwrap();
+            assert_eq!(query.flag, Some(color));
+        }
     }
 
     #[test]
@@ -1806,6 +1889,10 @@ mod tests {
                 "since=2026-10-05T00:00:00Z&until=2026-10-04T00:00:00Z",
                 "`until` must be after `since`",
             ),
+            ("flag=pink", FLAG_TEXT),
+            ("flag=", FLAG_TEXT),
+            ("flag=Orange", FLAG_TEXT),
+            ("flag=red&flag=blue", "`flag` is given more than once"),
             ("unread=yes", "`unread` must be true or false"),
             ("unread=", "`unread` must be true or false"),
             ("limit=0", "`limit` must be an integer from 1 to 100"),
@@ -1893,6 +1980,108 @@ mod tests {
         ];
         for (input, expected) in cases {
             let message = message(mail_junk_body(&input));
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn mail_flag_body_takes_one_colour() {
+        for color in FlagColor::ALL {
+            assert_eq!(
+                mail_flag_body(&body(json!({"color": color.name()}))),
+                Ok(color)
+            );
+        }
+    }
+
+    #[test]
+    fn mail_flag_body_refuses_everything_else() {
+        let colors = "`color` must be one of red, orange, yellow, green, blue, purple, gray";
+        let cases = [
+            (b"".to_vec(), "invalid JSON body: EOF while parsing"),
+            (body(json!({})), "invalid JSON body: missing field `color`"),
+            (body(json!({"color": "pink"})), colors),
+            (body(json!({"color": "Orange"})), colors),
+            (body(json!({"color": ""})), colors),
+            (
+                body(json!({"color": 1})),
+                "invalid JSON body: invalid type: integer `1`, expected a string",
+            ),
+            (
+                body(json!({"color": null})),
+                "invalid JSON body: invalid type: null, expected a string",
+            ),
+            (
+                body(json!({"color": "red", "flag": true})),
+                "invalid JSON body: unknown field `flag`",
+            ),
+            (
+                body(json!(["red"])),
+                "invalid JSON body: expected an object",
+            ),
+        ];
+        for (input, expected) in cases {
+            let message = message(mail_flag_body(&input));
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn mail_move_body_takes_from_and_to() {
+        let parsed = mail_move_body(&body(json!({"from": "INBOX", "to": "[Gmail]/All Mail"})));
+        assert_eq!(
+            parsed,
+            Ok(MailMoveBody {
+                from: "INBOX".to_owned(),
+                to: "[Gmail]/All Mail".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn mail_move_body_refuses_everything_else() {
+        let long = "x".repeat(1001);
+        let cases = [
+            (b"".to_vec(), "invalid JSON body: EOF while parsing"),
+            (
+                body(json!({"to": "Archive"})),
+                "invalid JSON body: missing field `from`",
+            ),
+            (
+                body(json!({"from": "INBOX"})),
+                "invalid JSON body: missing field `to`",
+            ),
+            (
+                body(json!({"from": "INBOX", "to": "Archive", "copy": true})),
+                "invalid JSON body: unknown field `copy`",
+            ),
+            (
+                body(json!({"from": 1, "to": "Archive"})),
+                "invalid JSON body: invalid type: integer `1`, expected a string",
+            ),
+            (
+                body(json!({"from": "", "to": "Archive"})),
+                "`from` must not be empty",
+            ),
+            (
+                body(json!({"from": "INBOX", "to": ""})),
+                "`to` must not be empty",
+            ),
+            (
+                body(json!({"from": "INBOX", "to": long})),
+                "`to` must be at most 1000 characters",
+            ),
+            (
+                body(json!({"from": "IN\u{0}BOX", "to": "Archive"})),
+                "`from` must not contain control characters",
+            ),
+            (
+                body(json!("INBOX")),
+                "invalid JSON body: expected an object",
+            ),
+        ];
+        for (input, expected) in cases {
+            let message = message(mail_move_body(&input));
             assert!(message.starts_with(expected), "{message}");
         }
     }

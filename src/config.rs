@@ -232,6 +232,8 @@ pub struct MailConfig {
     pub accounts: Vec<MailAccount>,
     /// Decoded mailbox paths never shown, compared case-insensitively.
     pub exclude_mailboxes: Vec<String>,
+    /// Decoded mailbox paths a move may not take a message out of or into, compared case-insensitively.
+    pub no_move_mailboxes: Vec<String>,
     /// An explicit `~/Library/Mail/V<n>` directory; `None` means the highest one with an index.
     pub root: Option<PathBuf>,
 }
@@ -267,6 +269,17 @@ impl MailConfig {
         let path = path.to_lowercase();
         for excluded in &self.exclude_mailboxes {
             if excluded.to_lowercase() == path {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the decoded mailbox `path` is closed to moves, ignoring case.
+    pub fn is_no_move(&self, path: &str) -> bool {
+        let path = path.to_lowercase();
+        for closed in &self.no_move_mailboxes {
+            if closed.to_lowercase() == path {
                 return true;
             }
         }
@@ -601,6 +614,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawMail {
     exclude_mailboxes: Option<Vec<String>>,
+    #[serde(default)]
+    no_move_mailboxes: Vec<String>,
     root: Option<PathBuf>,
     #[serde(default)]
     accounts: BTreeMap<String, String>,
@@ -912,6 +927,7 @@ fn parse_place(name: String, place: toml::Value) -> Result<Place, ConfigError> {
 fn parse_mail(mail: RawMail) -> Result<MailConfig, ConfigError> {
     let RawMail {
         exclude_mailboxes,
+        no_move_mailboxes,
         root,
         accounts,
     } = mail;
@@ -968,6 +984,7 @@ fn parse_mail(mail: RawMail) -> Result<MailConfig, ConfigError> {
     Ok(MailConfig {
         accounts: configured,
         exclude_mailboxes,
+        no_move_mailboxes,
         root,
     })
 }
@@ -1848,6 +1865,7 @@ mod tests {
                     mail_account(READ_ID, "main"),
                 ],
                 exclude_mailboxes: vec!["Trash".to_owned(), "Archive/2019".to_owned()],
+                no_move_mailboxes: Vec::new(),
                 root: Some(PathBuf::from("/tmp/Mail/V10")),
             })
         );
@@ -1873,6 +1891,34 @@ mod tests {
         let mail = with_mail("exclude_mailboxes = []").unwrap().mail.unwrap();
         assert!(mail.exclude_mailboxes.is_empty());
         assert!(!mail.is_excluded("Trash"));
+    }
+
+    #[test]
+    fn absent_no_move_mailboxes_is_empty() {
+        let mail = with_mail("").unwrap().mail.unwrap();
+        assert!(mail.no_move_mailboxes.is_empty());
+        assert!(!mail.is_no_move("Junk"));
+    }
+
+    #[test]
+    fn no_move_mailboxes_ignore_case_and_match_whole_paths() {
+        let mail = with_mail(r#"no_move_mailboxes = ["Junk", "[Gmail]/Spam"]"#)
+            .unwrap()
+            .mail
+            .unwrap();
+        assert_eq!(mail.no_move_mailboxes, ["Junk", "[Gmail]/Spam"]);
+        assert!(mail.is_no_move("junk"));
+        assert!(mail.is_no_move("[GMAIL]/SPAM"));
+        assert!(!mail.is_no_move("Junk/Old"));
+        assert!(!mail.is_no_move("Spam"));
+    }
+
+    #[test]
+    fn no_move_mailboxes_wrong_type() {
+        let err = with_mail(r#"no_move_mailboxes = "Junk""#).unwrap_err();
+        let ConfigError::Parse(_) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
     }
 
     #[test]
