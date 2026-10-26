@@ -13,7 +13,7 @@ use axum::http::uri::Authority;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, get};
+use axum::routing::{MethodRouter, get, post, put};
 use axum::{Json, Router};
 use chrono::Local;
 use serde_json::json;
@@ -25,18 +25,18 @@ use crate::auth::{AuthError, Authenticator, EXEMPT_ROUTE, Principal};
 use crate::config::{AccountName, Config, HostName, Place};
 use crate::ekctl::{self, EkctlError};
 use crate::health::{AuthStatus, HEALTH_TTL, HealthCheck, Probe};
-use crate::mail::MessageId;
 use crate::mail::emlx::EmlxError;
-use crate::mail::script::{self, JunkMove, JunkStatus, Moved, ScriptError};
+use crate::mail::script::{self, FlagWrite, JunkMove, JunkStatus, MailMove, Moved, ScriptError};
 use crate::mail::store::{
-    AccountListing, MailReader, MailStore, MessagePlace, MoveTarget, RegisteredAccount, StoreError,
-    Visibility,
+    AccountListing, MailReader, MailStore, MessagePlace, MoveRequest, MoveResolution, MoveTarget,
+    RegisteredAccount, StoreError, Visibility,
 };
+use crate::mail::{FlagColor, MessageId};
 use crate::model::{CalendarKind, EventId, InvalidEventId};
 use crate::policy::{GuardError, Policy, PolicyError, ReminderGuardError};
 use crate::remindctl::{self, RemindctlError};
 use crate::reminders_model::{RcReminder, Reminder, ReminderId};
-use crate::request::{self, Invalid};
+use crate::request::{self, Invalid, MailMoveBody};
 
 /// The largest request body the bridge accepts.
 pub const BODY_LIMIT: usize = 64 * 1024;
@@ -99,7 +99,7 @@ pub struct Runners {
     pub calendars: ekctl::Runner,
     /// Runs `remindctl` for reminders.
     pub reminders: remindctl::Runner,
-    /// Runs `osascript` to mark mail junk or not junk.
+    /// Runs `osascript` for the mail writes: junk status, flag colour and moves.
     pub mail: script::Runner,
 }
 
@@ -130,10 +130,23 @@ struct JunkRequest {
     status: JunkStatus,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WriteKind {
+    Junk(JunkStatus),
+    Flag(Option<FlagColor>),
+    Move,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlagRequest {
+    id: MessageId,
+    color: Option<FlagColor>,
+}
+
 #[derive(Debug, Clone)]
-struct JunkWrite {
+struct MailWrite {
     account: AccountName,
-    status: JunkStatus,
+    kind: WriteKind,
 }
 
 impl App {
@@ -519,6 +532,14 @@ fn routes() -> Vec<(&'static str, MethodRouter<Arc<App>>)> {
             "/v1/mail/messages/{id}",
             get(mail_message).patch(mark_mail_junk.layer(middleware::from_fn(require_json))),
         ),
+        (
+            "/v1/mail/messages/{id}/flag",
+            put(set_mail_flag.layer(middleware::from_fn(require_json))).delete(clear_mail_flag),
+        ),
+        (
+            "/v1/mail/messages/{id}/move",
+            post(move_mail_message.layer(middleware::from_fn(require_json))),
+        ),
     ]
 }
 
@@ -602,9 +623,17 @@ async fn log_request(request: Request, next: Next) -> Response {
     let ekctl = joined(ekctl_calls.calls());
     let remindctl = joined(remindctl_calls.calls());
     let rows = response.extensions().get::<Rows>().map(|Rows(rows)| *rows);
-    let (account, junk) = match response.extensions().get::<JunkWrite>() {
-        Some(JunkWrite { account, status }) => (Some(account.to_string()), Some(status.is_junk())),
-        None => (None, None),
+    let (account, junk, flag) = match response.extensions().get::<MailWrite>() {
+        Some(MailWrite { account, kind }) => {
+            let account = Some(account.to_string());
+            match kind {
+                WriteKind::Junk(status) => (account, Some(status.is_junk()), None),
+                WriteKind::Flag(Some(color)) => (account, None, Some(color.name())),
+                WriteKind::Flag(None) => (account, None, Some("off")),
+                WriteKind::Move => (account, None, None),
+            }
+        }
+        None => (None, None, None),
     };
     let client = response
         .extensions()
@@ -620,6 +649,7 @@ async fn log_request(request: Request, next: Next) -> Response {
         rows,
         account,
         junk,
+        flag,
         client = client.as_ref().map(tracing::field::display),
         "request"
     );
@@ -1024,9 +1054,9 @@ async fn mark_mail_junk(
             "message not found".to_owned(),
         ));
     };
-    let logged = JunkWrite {
+    let logged = MailWrite {
         account: place.account.name.clone(),
-        status,
+        kind: WriteKind::Junk(status),
     };
     let request = JunkRequest { place, id, status };
     let mut response = match move_junk(&app.mail_script, request).await {
@@ -1071,6 +1101,149 @@ async fn move_junk(runner: &script::Runner, request: JunkRequest) -> Result<Resp
         "junk": status.is_junk(),
     }))
     .into_response())
+}
+
+async fn set_mail_flag(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let Path(id) = id?;
+    let id = request::mail_message_id(&id)?;
+    let color = request::mail_flag_body(&body?)?;
+    write_mail_flag(
+        &app,
+        store,
+        FlagRequest {
+            id,
+            color: Some(color),
+        },
+    )
+    .await
+}
+
+async fn clear_mail_flag(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let Path(id) = id?;
+    let id = request::mail_message_id(&id)?;
+    write_mail_flag(&app, store, FlagRequest { id, color: None }).await
+}
+
+async fn write_mail_flag(
+    app: &App,
+    store: Arc<MailStore>,
+    flag: FlagRequest,
+) -> Result<Response, ApiError> {
+    let FlagRequest { id, color } = flag;
+    let place = read_mail(store, move |reader| reader.place(id)).await?;
+    let Some(MessagePlace {
+        account,
+        mailbox,
+        junk: _,
+        inbox: _,
+    }) = place
+    else {
+        return Err(message_not_found());
+    };
+    let logged = MailWrite {
+        account: account.name,
+        kind: WriteKind::Flag(color),
+    };
+    let request = FlagWrite {
+        account: account.id,
+        source: mailbox,
+        id,
+        color,
+    };
+    let mut response = match app.mail_script.flag(&request).await {
+        Ok(()) => Json(json!({
+            "id": id,
+            "flag": color.map(FlagColor::name),
+        }))
+        .into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    };
+    response.extensions_mut().insert(logged);
+    Ok(response)
+}
+
+async fn move_mail_message(
+    State(app): Shared,
+    id: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let store = mail_store(&app)?;
+    let Path(id) = id?;
+    let id = request::mail_message_id(&id)?;
+    let MailMoveBody { from, to } = request::mail_move_body(&body?)?;
+    let request = MoveRequest { id, from, to };
+    let resolution = read_mail(store, move |reader| reader.resolve_move(&request)).await?;
+    let Some(resolution) = resolution else {
+        return Err(message_not_found());
+    };
+    let (account, from, to) = match resolution {
+        MoveResolution::Move { account, from, to } => (account, from, to),
+        MoveResolution::AlreadyThere { account, to } => {
+            let logged = MailWrite {
+                account: account.name.clone(),
+                kind: WriteKind::Move,
+            };
+            let mut response = moved_response(Some(id), &account.name, &to);
+            response.extensions_mut().insert(logged);
+            return Ok(response);
+        }
+        MoveResolution::Closed => {
+            return Err(ApiError::Status(
+                StatusCode::FORBIDDEN,
+                "mailbox is closed to moves".to_owned(),
+            ));
+        }
+        MoveResolution::NotInFrom => {
+            return Err(ApiError::Status(
+                StatusCode::CONFLICT,
+                "message is not in the from mailbox".to_owned(),
+            ));
+        }
+        MoveResolution::NoTarget => {
+            return Err(ApiError::Status(
+                StatusCode::CONFLICT,
+                "account has no to mailbox".to_owned(),
+            ));
+        }
+    };
+    let logged = MailWrite {
+        account: account.name.clone(),
+        kind: WriteKind::Move,
+    };
+    let request = MailMove {
+        account: account.id,
+        from,
+        id,
+        to,
+    };
+    let mut response = match app.mail_script.move_message(&request).await {
+        Ok(Moved(moved)) => moved_response(moved, &account.name, &request.to),
+        Err(err) => ApiError::from(err).into_response(),
+    };
+    response.extensions_mut().insert(logged);
+    Ok(response)
+}
+
+fn moved_response(id: Option<MessageId>, account: &AccountName, mailbox: &str) -> Response {
+    Json(json!({
+        "id": id,
+        "account": account,
+        "mailbox": mailbox,
+    }))
+    .into_response()
+}
+
+fn message_not_found() -> ApiError {
+    ApiError::Status(StatusCode::NOT_FOUND, "message not found".to_owned())
 }
 
 async fn empty_event_id() -> ApiError {
@@ -4415,11 +4588,31 @@ esac"#,
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = mark(&junk, mail_fixture::IN_SPAM, false).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) =
+            put_flag(&junk, mail_fixture::MULTIPART, &json!({"color": "orange"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = clear_flag(&junk, mail_fixture::PLAIN).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = clear_flag(&junk, mail_fixture::IN_SPAM).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = move_to(
+            &junk,
+            mail_fixture::MULTIPART,
+            ("INBOX", "[Gmail]/All Mail"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = move_to(&junk, mail_fixture::MULTIPART, ("INBOX", "Secret folder")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = move_to(&junk, mail_fixture::MULTIPART, ("INBOX", "[Gmail]/Spam")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         let failing = Fake::new(
             "echo 'execution error: Secret \"[Gmail]/Spam\" <hidden-id@example.com> (-10000)' >&2\nexit 1",
         );
         let junk = junk_app(&mail_config(&fixture), &failing);
         let (status, _) = mark(&junk, mail_fixture::MULTIPART, true).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let (status, _) = put_flag(&junk, mail_fixture::MULTIPART, &json!({"color": "red"})).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         let log = captured.text();
         assert!(log.contains("message file refused"), "{log}");
@@ -4466,6 +4659,15 @@ esac"#,
             "method=PATCH route=/v1/mail/messages/{id} status=404",
             "method=PATCH route=/v1/mail/messages/{id} status=502",
             "Mail failed with error -10000",
+            "method=PUT route=/v1/mail/messages/{id}/flag status=200",
+            r#"account="gmail" flag="orange""#,
+            r#"account="main" flag="off""#,
+            "method=DELETE route=/v1/mail/messages/{id}/flag status=200",
+            "method=DELETE route=/v1/mail/messages/{id}/flag status=404",
+            "method=POST route=/v1/mail/messages/{id}/move status=200",
+            "method=POST route=/v1/mail/messages/{id}/move status=409",
+            "method=POST route=/v1/mail/messages/{id}/move status=403",
+            "method=PUT route=/v1/mail/messages/{id}/flag status=502",
         ] {
             assert!(log.contains(expected), "{expected} missing from:\n{log}");
         }
@@ -4590,7 +4792,7 @@ esac"#,
 
     fn osascript_fake() -> Fake {
         Fake::new(&format!(
-            "{RECORD_ARGS}\nif [ \"$4\" = \"$6\" ]; then echo \"$5\"; else echo {MOVED_ID}; fi"
+            "{RECORD_ARGS}\ncase \"$6\" in off|[0-6]) echo \"$5\";; *) if [ \"$4\" = \"$6\" ]; then echo \"$5\"; else echo {MOVED_ID}; fi;; esac"
         ))
     }
 
@@ -4962,17 +5164,399 @@ esac"#,
         assert_eq!(fake.calls(), ["start", "end", "start", "end"]);
     }
 
+    async fn put_flag(router: &Router, id: i64, body: &Value) -> (StatusCode, Value) {
+        send(
+            router,
+            json_request(Method::PUT, &format!("/v1/mail/messages/{id}/flag"), body),
+        )
+        .await
+    }
+
+    async fn clear_flag(router: &Router, id: i64) -> (StatusCode, Value) {
+        send(
+            router,
+            build_request(
+                Method::DELETE,
+                &format!("/v1/mail/messages/{id}/flag"),
+                Body::empty(),
+            ),
+        )
+        .await
+    }
+
+    async fn move_to(router: &Router, id: i64, path: (&str, &str)) -> (StatusCode, Value) {
+        let (from, to) = path;
+        send(
+            router,
+            json_request(
+                Method::POST,
+                &format!("/v1/mail/messages/{id}/move"),
+                &json!({"from": from, "to": to}),
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn put_mail_flag_sets_the_colour_through_the_source_mailbox() {
+        let fixture = MailFixture::labelled();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = put_flag(
+            &router,
+            mail_fixture::MULTIPART,
+            &json!({"color": "orange"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": mail_fixture::MULTIPART, "flag": "orange"})
+        );
+        assert_eq!(
+            fake.recorded_args(),
+            [
+                "-e",
+                script::FLAG_SCRIPT,
+                mail_fixture::GMAIL,
+                "INBOX",
+                "383621",
+                "1"
+            ]
+        );
+
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = put_flag(
+            &router,
+            mail_fixture::GMAIL_LABELLED,
+            &json!({"color": "gray"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": mail_fixture::GMAIL_LABELLED, "flag": "gray"})
+        );
+        let args = fake.recorded_args();
+        assert_eq!(args[3], "[Gmail]/All Mail");
+        assert_eq!(args[5], "6");
+    }
+
+    #[tokio::test]
+    async fn delete_mail_flag_clears_it() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = clear_flag(&router, mail_fixture::PLAIN).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({"id": mail_fixture::PLAIN, "flag": null}));
+        assert_eq!(
+            fake.recorded_args(),
+            [
+                "-e",
+                script::FLAG_SCRIPT,
+                mail_fixture::MAIN,
+                "Inbox",
+                "830",
+                "off"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_flag_of_an_invisible_message_is_not_found() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        for id in [
+            mail_fixture::IN_SPAM,
+            mail_fixture::DELETED_ROW,
+            mail_fixture::UNCONFIGURED,
+            999_999,
+        ] {
+            let (status, body) = put_flag(&router, id, &json!({"color": "red"})).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(body, error("message not found"));
+            let (status, body) = clear_flag(&router, id).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(body, error("message not found"));
+        }
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mail_flag_validates_the_request() {
+        let fixture = MailFixture::standard();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let uri = format!("/v1/mail/messages/{}/flag", mail_fixture::PLAIN);
+        for body in [
+            "",
+            "{}",
+            r#"{"color": "pink"}"#,
+            r#"{"color": "Orange"}"#,
+            r#"{"color": 1}"#,
+            r#"{"color": "red", "extra": 1}"#,
+            r#"["red"]"#,
+        ] {
+            let (status, response) =
+                send(&router, build_request(Method::PUT, &uri, Body::from(body))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(response["error"].as_str().is_some(), "{response}");
+        }
+        let (status, body) = send(
+            &router,
+            json_request(Method::PUT, &uri, &json!({"color": "pink"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            error("`color` must be one of red, orange, yellow, green, blue, purple, gray")
+        );
+        let (status, body) = clear_flag(&router, 0).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, error("message id must be a positive integer"));
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header("host", HOST)
+            .body(Body::from(r#"{"color": "red"}"#))
+            .unwrap();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(body, error("content type must be application/json"));
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mail_flag_and_move_when_mail_is_off() {
+        let fake = osascript_fake();
+        let router = junk_app(&configured(), &fake);
+        let off = error("mail is off: add [mail] to the config");
+        let (status, body) = put_flag(&router, 830, &json!({"color": "red"})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, off);
+        let (status, body) = clear_flag(&router, 830).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, off);
+        let (status, body) = move_to(&router, 830, ("Inbox", "Archive")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, off);
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn mail_flag_and_move_map_runner_errors_like_junk() {
+        let fixture = MailFixture::standard();
+        let fail = |text: &str| format!("echo '{text}' >&2\nexit 1");
+        let cases = [
+            (
+                fail("execution error: not allowed (-1743)"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                fail("execution error: no such (-1728)"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                fail("execution error: slow (-1712)"),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                fail("execution error: Secret <hidden@example.com> (-10000)"),
+                StatusCode::BAD_GATEWAY,
+            ),
+            ("echo 'missing value'".to_owned(), StatusCode::BAD_GATEWAY),
+            ("echo 777".to_owned(), StatusCode::BAD_GATEWAY),
+        ];
+        for (script, expected) in cases {
+            let fake = Fake::new(&script);
+            let router = junk_app(&mail_config(&fixture), &fake);
+            let (status, body) =
+                put_flag(&router, mail_fixture::PLAIN, &json!({"color": "red"})).await;
+            assert_eq!(status, expected, "flag {script}");
+            assert!(!body.to_string().contains("hidden"), "{body}");
+            let (status, _) = clear_flag(&router, mail_fixture::PLAIN).await;
+            assert_eq!(status, expected, "clear {script}");
+        }
+        for (script, expected) in [
+            (
+                fail("execution error: no such (-1728)"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                fail("execution error: Secret <hidden@example.com> (-10000)"),
+                StatusCode::BAD_GATEWAY,
+            ),
+            ("echo 'missing value'".to_owned(), StatusCode::BAD_GATEWAY),
+        ] {
+            let fake = Fake::new(&script);
+            let router = junk_app(&without_exclusions(&fixture), &fake);
+            let (status, body) =
+                move_to(&router, mail_fixture::MULTIPART, ("INBOX", "[Gmail]/Spam")).await;
+            assert_eq!(status, expected, "move {script}");
+            assert!(!body.to_string().contains("hidden"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn move_mail_archives_a_gmail_message_and_brings_it_back() {
+        let fixture = MailFixture::labelled();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = move_to(
+            &router,
+            mail_fixture::GMAIL_LABELLED,
+            ("inbox", "[gmail]/all mail"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": MOVED_ID, "account": "gmail", "mailbox": "[Gmail]/All Mail"})
+        );
+        assert_eq!(
+            fake.recorded_args(),
+            [
+                "-e",
+                script::MOVE_SCRIPT,
+                mail_fixture::GMAIL,
+                "INBOX",
+                &mail_fixture::GMAIL_LABELLED.to_string(),
+                "[Gmail]/All Mail"
+            ]
+        );
+
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) = move_to(
+            &router,
+            mail_fixture::MULTIPART_ALL_MAIL,
+            ("[Gmail]/All Mail", "INBOX"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": MOVED_ID, "account": "gmail", "mailbox": "INBOX"})
+        );
+        assert_eq!(fake.recorded_args()[3], "[Gmail]/All Mail");
+    }
+
+    #[tokio::test]
+    async fn move_mail_without_a_new_copy_has_no_id() {
+        let fixture = MailFixture::labelled();
+        let fake = Fake::new("echo");
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let (status, body) =
+            move_to(&router, mail_fixture::GMAIL_LABELLED, ("INBOX", "Receipts")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": null, "account": "gmail", "mailbox": "Receipts"})
+        );
+    }
+
+    #[tokio::test]
+    async fn move_mail_already_there_answers_without_calling_mail() {
+        let fixture = MailFixture::labelled();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        for (from, to) in [("[Gmail]/All Mail", "INBOX"), ("INBOX", "inbox")] {
+            let (status, body) = move_to(&router, mail_fixture::GMAIL_LABELLED, (from, to)).await;
+            assert_eq!(status, StatusCode::OK, "{from} {to}");
+            assert_eq!(
+                body,
+                json!({"id": mail_fixture::GMAIL_LABELLED, "account": "gmail", "mailbox": "INBOX"})
+            );
+        }
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn move_mail_refusals() {
+        let fixture = MailFixture::labelled();
+        let fake = osascript_fake();
+        let mut config = mail_config(&fixture);
+        if let Some(mail) = &mut config.mail {
+            mail.no_move_mailboxes = vec!["Receipts".to_owned()];
+        }
+        let router = junk_app(&config, &fake);
+        let id = mail_fixture::GMAIL_LABELLED;
+        let closed = error("mailbox is closed to moves");
+        let not_in = error("message is not in the from mailbox");
+        for (from, to, want, expected) in [
+            ("INBOX", "[Gmail]/Spam", StatusCode::FORBIDDEN, &closed),
+            ("INBOX", "receipts", StatusCode::FORBIDDEN, &closed),
+            ("Receipts", "INBOX", StatusCode::FORBIDDEN, &closed),
+            ("Nowhere", "Nowhere", StatusCode::CONFLICT, &not_in),
+        ] {
+            let (status, body) = move_to(&router, id, (from, to)).await;
+            assert_eq!(status, want, "{from} {to}");
+            assert_eq!(&body, expected, "{from} {to}");
+        }
+        let (status, body) = move_to(&router, id, ("[Gmail]/Drafts", "INBOX")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, error("message is not in the from mailbox"));
+        let (status, body) = move_to(&router, id, ("INBOX", "Missing")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, error("account has no to mailbox"));
+        let (status, body) =
+            move_to(&router, mail_fixture::IN_SPAM, ("[Gmail]/Spam", "INBOX")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, error("message not found"));
+        let (status, body) = move_to(&router, 999_999, ("INBOX", "Receipts")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, error("message not found"));
+        assert_eq!(fake.log(), "");
+    }
+
+    #[tokio::test]
+    async fn move_mail_validates_the_request() {
+        let fixture = MailFixture::labelled();
+        let fake = osascript_fake();
+        let router = junk_app(&mail_config(&fixture), &fake);
+        let uri = format!("/v1/mail/messages/{}/move", mail_fixture::GMAIL_LABELLED);
+        for body in [
+            "",
+            "{}",
+            r#"{"from": "INBOX"}"#,
+            r#"{"to": "INBOX"}"#,
+            r#"{"from": "", "to": "INBOX"}"#,
+            r#"{"from": "INBOX", "to": 1}"#,
+            r#"{"from": "INBOX", "to": "Receipts", "copy": true}"#,
+        ] {
+            let (status, response) =
+                send(&router, build_request(Method::POST, &uri, Body::from(body))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(response["error"].as_str().is_some(), "{response}");
+        }
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header("host", HOST)
+            .body(Body::from(r#"{"from": "INBOX", "to": "Receipts"}"#))
+            .unwrap();
+        let (status, _) = send(&router, request).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(fake.log(), "");
+    }
+
     const KID: &str = "key-1";
     const ISSUER: &str = "https://auth.example.com";
     const AUDIENCE: &str = "https://eventkit-bridge";
     const CLIENT: &str = "agent";
-    const ALL_SCOPES: [&str; 6] = [
+    const ALL_SCOPES: [&str; 8] = [
         "bridge:calendar.read",
         "bridge:calendar.write",
         "bridge:reminders.read",
         "bridge:reminders.write",
         "bridge:mail.read",
         "bridge:mail.junk",
+        "bridge:mail.flag",
+        "bridge:mail.move",
     ];
 
     fn auth_table() -> AuthConfig {
@@ -5142,6 +5726,27 @@ esac"#,
                 method: Method::PATCH,
                 uri: format!("/v1/mail/messages/{}", mail_fixture::MULTIPART),
                 body: Some(json!({ "junk": true })),
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:mail.flag",
+                method: Method::PUT,
+                uri: format!("/v1/mail/messages/{}/flag", mail_fixture::MULTIPART),
+                body: Some(json!({ "color": "orange" })),
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:mail.flag",
+                method: Method::DELETE,
+                uri: format!("/v1/mail/messages/{}/flag", mail_fixture::MULTIPART),
+                body: None,
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:mail.move",
+                method: Method::POST,
+                uri: format!("/v1/mail/messages/{}/move", mail_fixture::MULTIPART),
+                body: Some(json!({ "from": "INBOX", "to": "[Gmail]/Spam" })),
                 status: StatusCode::OK,
             },
         ]

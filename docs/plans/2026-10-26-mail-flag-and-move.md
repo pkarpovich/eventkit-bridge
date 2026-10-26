@@ -254,14 +254,14 @@ The request line carries the route template, status, duration, the account name,
 - Modify: `src/server.rs`
 - Modify: `src/auth/mod.rs`
 
-- [ ] `mail_flag_body` (`color`) and `mail_move_body` (`from`, `to`) with `deny_unknown_fields` and the existing `400` texts
-- [ ] routes `PUT` / `DELETE` `/v1/mail/messages/{id}/flag` and `POST /v1/mail/messages/{id}/move`, `require_json` on `PUT` and `POST`; handlers per Technical Details, `AlreadyThere` answered without the runner, status mapping shared with junk; the `///` doc comment on `Runners.mail` describes every Mail write
-- [ ] `SCOPE_TABLE` rows (`mail.flag` twice, `mail.move`), `ALL_SCOPES`, `scoped_cases()` and the auth table tests
-- [ ] request-line log extension with the account name and the colour or `off`
-- [ ] write `oneshot` tests: set and clear a flag, invisible message, bad colour, bad body, wrong content type, mail off
-- [ ] write `oneshot` tests: Gmail inbox to All Mail (an `osascript` call with `from` `INBOX`) and back, All Mail into a label the message already carries and `from == to`, both `200` with the same id and no `osascript` call, each `403` and `409`, copy not found gives `id: null`, each runner error, scope refusals for the new scopes
-- [ ] extend `mail_request_log_carries_rows_but_no_content` to the three routes; `every_route_but_health_has_a_scope` passes
-- [ ] run `mise run check` - must pass before task 7
+- [x] `mail_flag_body` (`color`) and `mail_move_body` (`from`, `to`) with `deny_unknown_fields` and the existing `400` texts
+- [x] routes `PUT` / `DELETE` `/v1/mail/messages/{id}/flag` and `POST /v1/mail/messages/{id}/move`, `require_json` on `PUT` and `POST`; handlers per Technical Details, `AlreadyThere` answered without the runner, status mapping shared with junk; the `///` doc comment on `Runners.mail` describes every Mail write
+- [x] `SCOPE_TABLE` rows (`mail.flag` twice, `mail.move`), `ALL_SCOPES`, `scoped_cases()` and the auth table tests
+- [x] request-line log extension with the account name and the colour or `off`
+- [x] write `oneshot` tests: set and clear a flag, invisible message, bad colour, bad body, wrong content type, mail off
+- [x] write `oneshot` tests: Gmail inbox to All Mail (an `osascript` call with `from` `INBOX`) and back, All Mail into a label the message already carries and `from == to`, both `200` with the same id and no `osascript` call, each `403` and `409`, copy not found gives `id: null`, each runner error, scope refusals for the new scopes
+- [x] extend `mail_request_log_carries_rows_but_no_content` to the three routes; `every_route_but_health_has_a_scope` passes
+- [x] run `mise run check` - must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 

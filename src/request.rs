@@ -702,6 +702,66 @@ pub fn mail_junk_body(body: &[u8]) -> Result<JunkStatus, Invalid> {
     Ok(JunkStatus::from(junk))
 }
 
+/// The body of `PUT /v1/mail/messages/{id}/flag`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailFlagBody {
+    /// The colour name.
+    pub color: String,
+}
+
+/// Parses a `PUT /v1/mail/messages/{id}/flag` body, whose only and required field is `color`.
+pub fn mail_flag_body(body: &[u8]) -> Result<FlagColor, Invalid> {
+    let body: serde_json::Value = parse_json(body)?;
+    if !body.is_object() {
+        return Err(Invalid::new("invalid JSON body: expected an object"));
+    }
+    let MailFlagBody { color } = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
+    };
+    let Some(color) = FlagColor::from_name(&color) else {
+        return Err(Invalid::new(
+            "`color` must be one of red, orange, yellow, green, blue, purple, gray",
+        ));
+    };
+    Ok(color)
+}
+
+/// The body of `POST /v1/mail/messages/{id}/move`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailMoveBody {
+    /// The mailbox path the message is in.
+    pub from: String,
+    /// The mailbox path it goes to.
+    pub to: String,
+}
+
+fn mailbox_text(key: &str, value: &str) -> Result<(), Invalid> {
+    if value.is_empty() {
+        return Err(Invalid::new(format!("`{key}` must not be empty")));
+    }
+    check_text(key, value, MAX_MAILBOX)
+}
+
+/// Parses a `POST /v1/mail/messages/{id}/move` body, whose only and required fields are `from`
+/// and `to`.
+pub fn mail_move_body(body: &[u8]) -> Result<MailMoveBody, Invalid> {
+    let body: serde_json::Value = parse_json(body)?;
+    if !body.is_object() {
+        return Err(Invalid::new("invalid JSON body: expected an object"));
+    }
+    let body: MailMoveBody = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(err) => return Err(Invalid::new(format!("invalid JSON body: {err}"))),
+    };
+    let MailMoveBody { from, to } = &body;
+    mailbox_text("from", from)?;
+    mailbox_text("to", to)?;
+    Ok(body)
+}
+
 /// The body of `POST /v1/reminders`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1920,6 +1980,108 @@ mod tests {
         ];
         for (input, expected) in cases {
             let message = message(mail_junk_body(&input));
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn mail_flag_body_takes_one_colour() {
+        for color in FlagColor::ALL {
+            assert_eq!(
+                mail_flag_body(&body(json!({"color": color.name()}))),
+                Ok(color)
+            );
+        }
+    }
+
+    #[test]
+    fn mail_flag_body_refuses_everything_else() {
+        let colors = "`color` must be one of red, orange, yellow, green, blue, purple, gray";
+        let cases = [
+            (b"".to_vec(), "invalid JSON body: EOF while parsing"),
+            (body(json!({})), "invalid JSON body: missing field `color`"),
+            (body(json!({"color": "pink"})), colors),
+            (body(json!({"color": "Orange"})), colors),
+            (body(json!({"color": ""})), colors),
+            (
+                body(json!({"color": 1})),
+                "invalid JSON body: invalid type: integer `1`, expected a string",
+            ),
+            (
+                body(json!({"color": null})),
+                "invalid JSON body: invalid type: null, expected a string",
+            ),
+            (
+                body(json!({"color": "red", "flag": true})),
+                "invalid JSON body: unknown field `flag`",
+            ),
+            (
+                body(json!(["red"])),
+                "invalid JSON body: expected an object",
+            ),
+        ];
+        for (input, expected) in cases {
+            let message = message(mail_flag_body(&input));
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn mail_move_body_takes_from_and_to() {
+        let parsed = mail_move_body(&body(json!({"from": "INBOX", "to": "[Gmail]/All Mail"})));
+        assert_eq!(
+            parsed,
+            Ok(MailMoveBody {
+                from: "INBOX".to_owned(),
+                to: "[Gmail]/All Mail".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn mail_move_body_refuses_everything_else() {
+        let long = "x".repeat(1001);
+        let cases = [
+            (b"".to_vec(), "invalid JSON body: EOF while parsing"),
+            (
+                body(json!({"to": "Archive"})),
+                "invalid JSON body: missing field `from`",
+            ),
+            (
+                body(json!({"from": "INBOX"})),
+                "invalid JSON body: missing field `to`",
+            ),
+            (
+                body(json!({"from": "INBOX", "to": "Archive", "copy": true})),
+                "invalid JSON body: unknown field `copy`",
+            ),
+            (
+                body(json!({"from": 1, "to": "Archive"})),
+                "invalid JSON body: invalid type: integer `1`, expected a string",
+            ),
+            (
+                body(json!({"from": "", "to": "Archive"})),
+                "`from` must not be empty",
+            ),
+            (
+                body(json!({"from": "INBOX", "to": ""})),
+                "`to` must not be empty",
+            ),
+            (
+                body(json!({"from": "INBOX", "to": long})),
+                "`to` must be at most 1000 characters",
+            ),
+            (
+                body(json!({"from": "IN\u{0}BOX", "to": "Archive"})),
+                "`from` must not contain control characters",
+            ),
+            (
+                body(json!("INBOX")),
+                "invalid JSON body: expected an object",
+            ),
+        ];
+        for (input, expected) in cases {
+            let message = message(mail_move_body(&input));
             assert!(message.starts_with(expected), "{message}");
         }
     }
