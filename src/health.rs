@@ -346,7 +346,7 @@ mod tests {
         if let Some(write) = write {
             toml.push_str(&format!("write_calendars = [\"{write}\"]\n"));
         }
-        Config::from_toml(&toml).unwrap()
+        crate::config::with_test_auth(&toml).unwrap()
     }
 
     fn with_lists(read_lists: &[&str]) -> Config {
@@ -357,7 +357,7 @@ mod tests {
             toml.push_str(&format!("\"{id}\","));
         }
         toml.push_str("]\n");
-        Config::from_toml(&toml).unwrap()
+        crate::config::with_test_auth(&toml).unwrap()
     }
 
     fn counting(delay: &str) -> Fake {

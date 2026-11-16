@@ -114,7 +114,7 @@ pub struct App {
     hosts: KnownHosts,
     mail: Option<Arc<MailStore>>,
     mail_script: script::Runner,
-    auth: Option<Arc<Authenticator>>,
+    auth: Arc<Authenticator>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,8 +151,8 @@ struct MailWrite {
 
 impl App {
     /// The bridge for `config`, running `ekctl` and `remindctl` through `runners` and checking
-    /// bearer tokens with `auth` when `[auth]` is configured.
-    pub fn new(config: &Config, runners: Runners, auth: Option<Arc<Authenticator>>) -> Self {
+    /// the bearer token of every request but `/healthz` with `auth`.
+    pub fn new(config: &Config, runners: Runners, auth: Arc<Authenticator>) -> Self {
         let Runners {
             calendars,
             reminders,
@@ -691,7 +691,7 @@ async fn healthz(State(app): Shared) -> Response {
             reminders: &app.reminders,
             policy: &app.policy,
             mail: app.mail.as_ref(),
-            auth: app.auth.as_deref().map(|auth| AuthStatus::of(auth.jwks())),
+            auth: Some(AuthStatus::of(app.auth.jwks())),
         })
         .await
         .into_response()
@@ -750,9 +750,7 @@ async fn require_known_host(State(app): Shared, request: Request, next: Next) ->
 }
 
 async fn require_bearer(State(app): Shared, request: Request, next: Next) -> Response {
-    let Some(auth) = &app.auth else {
-        return next.run(request).await;
-    };
+    let auth = &app.auth;
     let route = request
         .extensions()
         .get::<MatchedPath>()
@@ -1309,21 +1307,21 @@ mod tests {
     const HOST: &str = "127.0.0.1:8790";
 
     fn configured() -> Config {
-        Config::from_toml(&format!(
+        crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\nwrite_calendars = [\"{WRITE_ID}\"]"
         ))
         .unwrap()
     }
 
     fn read_only() -> Config {
-        Config::from_toml(&format!(
+        crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]"
         ))
         .unwrap()
     }
 
     fn unconfigured() -> Config {
-        Config::from_toml("listen = \"127.0.0.1:8790\"").unwrap()
+        crate::config::with_test_auth("listen = \"127.0.0.1:8790\"").unwrap()
     }
 
     fn runners(runner: Runner) -> Runners {
@@ -1347,7 +1345,7 @@ mod tests {
     }
 
     fn app(config: &Config, runner: Runner) -> Router {
-        router(Arc::new(App::new(config, runners(runner), None)))
+        router(Arc::new(App::new(config, runners(runner), test_auth())))
     }
 
     fn show_in(calendar: &str) -> String {
@@ -1377,6 +1375,15 @@ mod tests {
     }
 
     fn build_request(method: Method, uri: &str, body: Body) -> Request<Body> {
+        let mut request = anonymous_request(method, uri, body);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&bearer()).unwrap(),
+        );
+        request
+    }
+
+    fn anonymous_request(method: Method, uri: &str, body: Body) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri(uri)
@@ -1384,6 +1391,10 @@ mod tests {
             .header("content-type", "application/json")
             .body(body)
             .unwrap()
+    }
+
+    fn bearer() -> String {
+        format!("Bearer {}", token(&ALL_SCOPES))
     }
 
     fn json_request(method: Method, uri: &str, body: &Value) -> Request<Body> {
@@ -1402,6 +1413,11 @@ mod tests {
 
     async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
         send(router, build_request(Method::GET, uri, Body::empty())).await
+    }
+
+    fn without_auth_keys(mut body: Value) -> (Value, u64) {
+        let auth = body.as_object_mut().unwrap().remove("auth").unwrap();
+        (body, auth["jwks_keys"].as_u64().unwrap())
     }
 
     fn error(message: &str) -> Value {
@@ -1480,7 +1496,7 @@ mod tests {
     async fn events_from_unreadable_calendars_are_dropped() {
         let fake = Fake::printing("list_events.json");
         let router = app(
-            &Config::from_toml(&format!(
+            &crate::config::with_test_auth(&format!(
                 "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{OTHER_ID}\"]"
             ))
             .unwrap(),
@@ -1790,6 +1806,7 @@ mod tests {
         ];
         for (method, uri, content_type) in cases {
             let mut request = Request::builder()
+                .header(header::AUTHORIZATION, bearer())
                 .method(method.clone())
                 .uri(uri)
                 .header("host", HOST);
@@ -1810,6 +1827,7 @@ mod tests {
         }
         assert!(fake.calls().is_empty());
         let request = Request::builder()
+            .header(header::AUTHORIZATION, bearer())
             .method(Method::POST)
             .uri("/v1/events")
             .header("host", HOST)
@@ -2292,6 +2310,8 @@ esac"#,
         let router = app(&configured(), fake.runner());
         let (status, body) = get(&router, "/healthz").await;
         assert_eq!(status, StatusCode::OK);
+        let (body, keys) = without_auth_keys(body);
+        assert_eq!(keys, 1);
         assert_eq!(
             body,
             json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 2})
@@ -2300,7 +2320,7 @@ esac"#,
 
     #[tokio::test]
     async fn healthz_degraded() {
-        let missing = Config::from_toml(&format!(
+        let missing = crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\", \"{OTHER_ID}\"]"
         ))
         .unwrap();
@@ -2357,7 +2377,10 @@ esac"#,
     }
 
     async fn send_host(router: &Router, method: Method, hosts: &[&str]) -> StatusCode {
-        let mut request = Request::builder().method(method).uri("/v1/events");
+        let mut request = Request::builder()
+            .header(header::AUTHORIZATION, bearer())
+            .method(method)
+            .uri("/v1/events");
         for host in hosts {
             request = request.header("host", *host);
         }
@@ -2371,7 +2394,7 @@ esac"#,
     #[tokio::test]
     async fn unknown_hosts_are_refused_before_ekctl() {
         let fake = write_fake();
-        let config = Config::from_toml(&format!(
+        let config = crate::config::with_test_auth(&format!(
             "listen = \"100.64.0.1:8790\"\nhosts = [\"mac.tail1234.ts.net\"]\nwrite_calendars = [\"{WRITE_ID}\"]"
         ))
         .unwrap();
@@ -2397,6 +2420,7 @@ esac"#,
         }
         assert!(fake.calls().is_empty());
         let request = Request::builder()
+            .header(header::AUTHORIZATION, bearer())
             .uri("http://evil.example.com:8790/v1/calendars")
             .header("host", "100.64.0.1:8790")
             .body(Body::empty())
@@ -2424,7 +2448,7 @@ esac"#,
     #[tokio::test]
     async fn ipv6_listen_host() {
         let fake = Fake::printing("list_calendars.json");
-        let config = Config::from_toml(&format!(
+        let config = crate::config::with_test_auth(&format!(
             "listen = \"[fd7a:115c:a1e0::1]:8790\"\nread_calendars = [\"{READ_ID}\"]"
         ))
         .unwrap();
@@ -2435,6 +2459,7 @@ esac"#,
             ("[fd7a:115c:a1e0::2]:8790", StatusCode::MISDIRECTED_REQUEST),
         ] {
             let request = Request::builder()
+                .header(header::AUTHORIZATION, bearer())
                 .uri("/v1/calendars")
                 .header("host", host)
                 .body(Body::empty())
@@ -2667,7 +2692,7 @@ esac"#,
             "if [ -e \"$LOG\" ]; then cat '{}'; else touch \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
         ));
-        let app = App::new(&configured(), runners(fake.runner()), None);
+        let app = App::new(&configured(), runners(fake.runner()), test_auth());
         app.announce_calendars(Duration::from_millis(10)).await;
         let log = captured.text();
         assert!(log.contains("cannot list calendars yet"), "{log}");
@@ -2688,7 +2713,7 @@ esac"#,
             "if [ -s \"$LOG\" ]; then cat '{}'; else echo failed >> \"$LOG\"; exit 1; fi",
             fixture("list_calendars.json").display()
         ));
-        let app = Arc::new(App::new(&configured(), runners(fake.runner()), None));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner()), test_auth()));
         let announcer = tokio::spawn({
             let app = Arc::clone(&app);
             async move { app.announce_calendars(Duration::from_secs(30)).await }
@@ -2709,7 +2734,7 @@ esac"#,
         let fake = Fake::new("sleep 5");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Arc::new(App::new(&configured(), runners(fake.runner()), None));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner()), test_auth()));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve(
             listener,
@@ -2745,7 +2770,7 @@ esac"#,
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Arc::new(App::new(&configured(), runners(fake.runner()), None));
+        let app = Arc::new(App::new(&configured(), runners(fake.runner()), test_auth()));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve(
             listener,
@@ -2758,12 +2783,11 @@ esac"#,
             },
         ));
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(
-                b"GET /v1/calendars HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
+        let request = format!(
+            "GET /v1/calendars HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: {}\r\nconnection: close\r\n\r\n",
+            bearer()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
         while fake.log().is_empty() {
             time::sleep(Duration::from_millis(10)).await;
         }
@@ -2779,14 +2803,14 @@ esac"#,
     const SHOP_ADDRESS: &str = "1 Example Street, Exampletown";
 
     fn lists_config() -> Config {
-        Config::from_toml(&format!(
+        crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\nread_lists = [\"{READ_ID}\"]\nwrite_lists = [\"{WRITE_ID}\"]\n[places]\nshop = {{ address = \"{SHOP_ADDRESS}\", radius = 150 }}\nhome = {{ address = \"2 Home Lane, Hometown\" }}\n"
         ))
         .unwrap()
     }
 
     fn read_lists_only() -> Config {
-        Config::from_toml(&format!(
+        crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nread_lists = [\"{READ_ID}\"]"
         ))
         .unwrap()
@@ -2802,7 +2826,7 @@ esac"#,
                 reminders,
                 mail: no_osascript(),
             },
-            None,
+            test_auth(),
         )))
     }
 
@@ -3390,6 +3414,7 @@ esac"#,
             (Method::PATCH, REMINDER_PATH),
         ] {
             let request = Request::builder()
+                .header(header::AUTHORIZATION, bearer())
                 .method(method.clone())
                 .uri(uri)
                 .header("host", HOST)
@@ -3418,6 +3443,7 @@ esac"#,
         ];
         for (method, uri) in routes {
             let request = Request::builder()
+                .header(header::AUTHORIZATION, bearer())
                 .method(method.clone())
                 .uri(uri)
                 .header("host", "evil.example.com:8790")
@@ -3754,7 +3780,7 @@ esac"#,
                 reminders,
                 mail: no_osascript(),
             },
-            None,
+            test_auth(),
         )));
         let (status, body) = get(&router, "/v1/lists").await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
@@ -3768,6 +3794,8 @@ esac"#,
         let router = reminder_app(&lists_config(), &fake);
         let (status, body) = get(&router, "/healthz").await;
         assert_eq!(status, StatusCode::OK);
+        let (body, keys) = without_auth_keys(body);
+        assert_eq!(keys, 1);
         assert_eq!(
             body,
             json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "lists": 2})
@@ -3903,7 +3931,7 @@ esac"#,
                 reminders,
                 mail: no_osascript(),
             },
-            None,
+            test_auth(),
         );
         app.announce_lists(Duration::from_millis(10)).await;
         let log = captured.text();
@@ -4335,6 +4363,7 @@ esac"#,
         }
         for method in [Method::GET, Method::PATCH] {
             let request = Request::builder()
+                .header(header::AUTHORIZATION, bearer())
                 .method(method)
                 .uri("/v1/mail/messages/830")
                 .header("host", "rebound.example.com:8790")
@@ -4715,7 +4744,10 @@ esac"#,
                 continue;
             }
             if line.contains("method=GET route=/v1/mail/messages/{id} status=200") {
-                assert!(line.ends_with(" rows=1"), "{line}");
+                assert!(
+                    line.ends_with(&format!(" rows=1 client={CLIENT}")),
+                    "{line}"
+                );
             }
             if line.contains("method=PATCH") {
                 assert!(!line.contains("rows="), "{line}");
@@ -4739,7 +4771,7 @@ esac"#,
                 "me@gmail.example",
             ),
         ]);
-        let app = App::new(&mail_config(&fixture), runners(no_ekctl()), None);
+        let app = App::new(&mail_config(&fixture), runners(no_ekctl()), test_auth());
         app.announce_mail(Duration::from_millis(10)).await;
         let log = captured.text();
         assert!(
@@ -4788,7 +4820,7 @@ esac"#,
         if let Some(mail) = &mut config.mail {
             mail.root = Some(fixture.root.join("missing"));
         }
-        let app = App::new(&config, runners(no_ekctl()), None);
+        let app = App::new(&config, runners(no_ekctl()), test_auth());
         let finished = time::timeout(
             Duration::from_millis(200),
             app.announce_mail(Duration::from_millis(10)),
@@ -4803,7 +4835,7 @@ esac"#,
             "{log}"
         );
 
-        let app = App::new(&configured(), runners(no_ekctl()), None);
+        let app = App::new(&configured(), runners(no_ekctl()), test_auth());
         app.announce_mail(Duration::from_millis(10)).await;
         assert!(!captured.text().contains("mail account"));
     }
@@ -4824,7 +4856,7 @@ esac"#,
     fn junk_app_with_timeout(config: &Config, fake: &Fake, timeout: Duration) -> Router {
         let mut runners = runners(no_ekctl());
         runners.mail = script::Runner::new(fake.program().to_owned(), timeout);
-        router(Arc::new(App::new(config, runners, None)))
+        router(Arc::new(App::new(config, runners, test_auth())))
     }
 
     fn without_exclusions(fixture: &MailFixture) -> Config {
@@ -5112,6 +5144,7 @@ esac"#,
             assert_eq!(body, error("message id must be a positive integer"));
         }
         let request = Request::builder()
+            .header(header::AUTHORIZATION, bearer())
             .method(Method::PATCH)
             .uri(&uri)
             .header("host", HOST)
@@ -5153,7 +5186,11 @@ esac"#,
         let osascript = osascript_fake();
         let mut runners = runners(calendars.runner());
         runners.mail = script::Runner::new(osascript.program().to_owned(), Duration::from_secs(10));
-        let router = router(Arc::new(App::new(&mail_config(&fixture), runners, None)));
+        let router = router(Arc::new(App::new(
+            &mail_config(&fixture),
+            runners,
+            test_auth(),
+        )));
         let held = tokio::spawn({
             let router = router.clone();
             async move { get(&router, "/v1/calendars").await }
@@ -5340,6 +5377,7 @@ esac"#,
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, error("message id must be a positive integer"));
         let request = Request::builder()
+            .header(header::AUTHORIZATION, bearer())
             .method(Method::PUT)
             .uri(&uri)
             .header("host", HOST)
@@ -5555,6 +5593,7 @@ esac"#,
             assert!(response["error"].as_str().is_some(), "{response}");
         }
         let request = Request::builder()
+            .header(header::AUTHORIZATION, bearer())
             .method(Method::POST)
             .uri(&uri)
             .header("host", HOST)
@@ -5587,6 +5626,12 @@ esac"#,
             jwks_url: url::Url::parse("https://auth.example.com/jwks.json").unwrap(),
             scope_prefix: "bridge:".to_owned(),
         }
+    }
+
+    fn test_auth() -> Arc<Authenticator> {
+        let dir = tempfile::tempdir().unwrap();
+        let jwks = test_source::preloaded(dir.path(), &[KID]);
+        Arc::new(Authenticator::new(&auth_table(), jwks))
     }
 
     fn now() -> i64 {
@@ -5642,13 +5687,13 @@ esac"#,
         let mut config = without_exclusions(&fixture);
         let table = auth_table();
         let authenticator = Authenticator::new(&table, test_source::preloaded(dir.path(), kids));
-        config.auth = Some(table);
+        config.auth = table;
         let mut runners = runners(calendars.runner());
         runners.mail = script::Runner::new(osascript.program().to_owned(), Duration::from_secs(10));
         let router = router(Arc::new(App::new(
             &config,
             runners,
-            Some(Arc::new(authenticator)),
+            Arc::new(authenticator),
         )));
         AuthApp {
             _dir: dir,
@@ -5692,7 +5737,7 @@ esac"#,
     }
 
     fn empty(method: Method, uri: &str) -> Request<Body> {
-        build_request(method, uri, Body::empty())
+        anonymous_request(method, uri, Body::empty())
     }
 
     const INVALID_CHALLENGE: &str = r#"Bearer error="invalid_token""#;
@@ -5782,7 +5827,11 @@ esac"#,
             status: _,
         } = case;
         match body {
-            Some(body) => json_request(method.clone(), uri, body),
+            Some(body) => anonymous_request(
+                method.clone(),
+                uri,
+                Body::from(serde_json::to_vec(body).unwrap()),
+            ),
             None => empty(method.clone(), uri),
         }
     }
@@ -5974,17 +6023,6 @@ esac"#,
             answer.body,
             json!({"status": "degraded", "reason": "auth jwks unavailable"})
         );
-    }
-
-    #[tokio::test]
-    async fn healthz_without_auth_has_no_auth_field() {
-        let fake = Fake::printing("list_calendars.json");
-        let router = app(&configured(), fake.runner());
-
-        let (status, body) = get(&router, "/healthz").await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.get("auth"), None);
     }
 
     #[tokio::test]
@@ -6204,18 +6242,5 @@ esac"#,
         ] {
             assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
         }
-    }
-
-    #[tokio::test]
-    async fn request_log_without_auth_has_no_client() {
-        let (captured, _guard) = capture();
-        let fake = write_fake();
-        let router = app(&configured(), fake.runner());
-
-        get(&router, EVENT_PATH).await;
-
-        let log = captured.text();
-        assert!(log.contains("status=200"), "{log}");
-        assert!(!log.contains("client="), "{log}");
     }
 }

@@ -309,7 +309,7 @@ mod tests {
     }
 
     fn policy(toml: &str) -> Policy {
-        Policy::new(&Config::from_toml(toml).unwrap())
+        Policy::new(&crate::config::with_test_auth(toml).unwrap())
     }
 
     fn read_and_write() -> Policy {

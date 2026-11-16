@@ -161,8 +161,8 @@ fn run_daemon() -> Result<(), String> {
     ))
 }
 
-fn authenticator(config_path: &Path, config: &Config) -> Option<Arc<Authenticator>> {
-    let auth = config.auth.as_ref()?;
+fn authenticator(config_path: &Path, config: &Config) -> Arc<Authenticator> {
+    let auth = &config.auth;
     let AuthConfig {
         issuer,
         audience,
@@ -172,7 +172,7 @@ fn authenticator(config_path: &Path, config: &Config) -> Option<Arc<Authenticato
     tracing::info!(issuer, audience, scope_prefix, "auth on");
     let source = Arc::new(HttpJwksSource::new(jwks_url.clone()));
     let jwks = Jwks::new(source, config_path.with_file_name(JWKS_CACHE_FILE));
-    Some(Arc::new(Authenticator::new(auth, Arc::new(jwks))))
+    Arc::new(Authenticator::new(auth, Arc::new(jwks)))
 }
 
 fn resolve_executable() -> Result<PathBuf, String> {
@@ -182,7 +182,7 @@ fn resolve_executable() -> Result<PathBuf, String> {
 struct Setup {
     config: Config,
     runners: Runners,
-    auth: Option<Arc<Authenticator>>,
+    auth: Arc<Authenticator>,
 }
 
 async fn daemon(
@@ -198,9 +198,7 @@ async fn daemon(
         .await
         .map_err(|err| format!("cannot listen on {}: {err}", config.listen))?;
     tracing::info!(listen = %config.listen, version = env!("CARGO_PKG_VERSION"), "listening");
-    let refresher = auth
-        .as_ref()
-        .map(|auth| tokio::spawn(Arc::clone(auth.jwks()).run_refresh()));
+    let refresher = tokio::spawn(Arc::clone(auth.jwks()).run_refresh());
     let app = Arc::new(App::new(&config, runners, auth));
     let announcer = {
         let app = Arc::clone(&app);
@@ -226,9 +224,7 @@ async fn daemon(
     .await;
     announcer.abort();
     mail_announcer.abort();
-    if let Some(refresher) = refresher {
-        refresher.abort();
-    }
+    refresher.abort();
     result.map_err(|err| format!("server failed: {err}"))?;
     tracing::info!("stopped");
     Ok(())
@@ -381,10 +377,7 @@ fn describe(path: &Path, config: &Config) -> String {
         None => out.push_str("mail: off\n"),
         Some(mail) => out.push_str(&describe_mail(mail)),
     }
-    match auth {
-        None => out.push_str("auth: off\n"),
-        Some(auth) => out.push_str(&describe_auth(auth)),
-    }
+    out.push_str(&describe_auth(auth));
     out
 }
 
@@ -396,7 +389,7 @@ fn describe_auth(auth: &AuthConfig) -> String {
         scope_prefix,
     } = auth;
     format!(
-        "auth: on\nauth issuer: {issuer}\nauth audience: {audience}\nauth jwks_url: {jwks_url}\nauth scope_prefix: {scope_prefix:?}\n"
+        "auth issuer: {issuer}\nauth audience: {audience}\nauth jwks_url: {jwks_url}\nauth scope_prefix: {scope_prefix:?}\n"
     )
 }
 
@@ -441,6 +434,12 @@ mod tests {
     use eventkit_bridge::auth::{FetchError, JwksSource};
 
     use super::*;
+
+    const AUTH: &str = "[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\n";
+
+    fn with_test_auth(text: &str) -> Result<Config, eventkit_bridge::config::ConfigError> {
+        Config::from_toml(&format!("{text}\n{AUTH}"))
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, argh::EarlyExit> {
         Cli::from_args(&["eventkit-bridge"], args)
@@ -526,7 +525,7 @@ mod tests {
 
     #[test]
     fn describe_unconfigured() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.starts_with("config ok: /tmp/config.toml\nlisten: 127.0.0.1:8790\n"));
         assert!(text.contains("read_calendars: none (unconfigured)\n"));
@@ -538,7 +537,7 @@ mod tests {
 
     #[test]
     fn describe_configured() {
-        let config = Config::from_toml(
+        let config = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             hosts = ["mac.example.ts.net"]
@@ -558,7 +557,7 @@ mod tests {
 
     #[test]
     fn describe_reminders() {
-        let config = Config::from_toml(
+        let config = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             read_lists = ["4F7D9489-A78F-4369-A951-213207DCFEE3"]
@@ -586,16 +585,20 @@ mod tests {
 
     #[test]
     fn describe_mail_off() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.contains("mail: off\n"), "{text}");
     }
 
     #[test]
-    fn describe_auth_off() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+    fn describe_always_ends_with_auth() {
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
-        assert!(text.ends_with("mail: off\nauth: off\n"), "{text}");
+        assert!(
+            text.contains("mail: off\nauth issuer: https://auth.example.com\n"),
+            "{text}"
+        );
+        assert!(!text.contains("auth: o"), "{text}");
     }
 
     #[test]
@@ -614,11 +617,10 @@ mod tests {
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(
             text.ends_with(
-                "auth: on\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth scope_prefix: \"bridge:\"\n"
+                "mail: off\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth scope_prefix: \"bridge:\"\n"
             ),
             "{text}"
         );
-        assert!(!text.contains("auth: off"), "{text}");
     }
 
     #[test]
@@ -652,12 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn no_auth_table_builds_no_authenticator() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
-        assert!(authenticator(Path::new("/nonexistent/config.toml"), &config).is_none());
-    }
-
-    #[test]
     fn authenticator_loads_the_cache_beside_the_config() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -666,7 +662,7 @@ mod tests {
         )
         .unwrap();
 
-        let auth = authenticator(&dir.path().join("config.toml"), &auth_config()).unwrap();
+        let auth = authenticator(&dir.path().join("config.toml"), &auth_config());
 
         assert_eq!(auth.jwks().key_count(), 1);
     }
@@ -675,7 +671,7 @@ mod tests {
     fn authenticator_without_a_cache_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
 
-        let auth = authenticator(&dir.path().join("config.toml"), &auth_config()).unwrap();
+        let auth = authenticator(&dir.path().join("config.toml"), &auth_config());
 
         assert_eq!(auth.jwks().key_count(), 0);
         assert_eq!(auth.jwks().age(), None);
@@ -683,7 +679,7 @@ mod tests {
 
     #[test]
     fn describe_mail_defaults() {
-        let config = Config::from_toml("listen = \"127.0.0.1:8790\"\n[mail]\n").unwrap();
+        let config = with_test_auth("listen = \"127.0.0.1:8790\"\n[mail]\n").unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.contains("mail: on\n"), "{text}");
         assert!(
@@ -700,7 +696,7 @@ mod tests {
         );
         assert!(
             text.ends_with(
-                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\nauth: off\n"
+                "mail root: the highest ~/Library/Mail/V<n> with MailData/Envelope Index\nauth issuer: https://auth.example.com\nauth audience: https://eventkit-bridge\nauth jwks_url: https://auth.example.com/jwks.json\nauth scope_prefix: \"bridge:\"\n"
             ),
             "{text}"
         );
@@ -708,7 +704,7 @@ mod tests {
 
     #[test]
     fn describe_mail_configured() {
-        let config = Config::from_toml(
+        let config = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
 
@@ -737,7 +733,7 @@ mod tests {
     #[test]
     fn describe_mail_without_exclusions() {
         let config =
-            Config::from_toml("listen = \"127.0.0.1:8790\"\n[mail]\nexclude_mailboxes = []\n")
+            with_test_auth("listen = \"127.0.0.1:8790\"\n[mail]\nexclude_mailboxes = []\n")
                 .unwrap();
         let text = describe(Path::new("/tmp/config.toml"), &config);
         assert!(text.contains("mail excluded mailboxes: none\n"), "{text}");
@@ -759,12 +755,13 @@ mod tests {
     async fn daemon_fails_when_listen_cannot_be_bound() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = taken.local_addr().unwrap();
-        let config = Config::from_toml(&format!("listen = \"{listen}\"")).unwrap();
+        let config = with_test_auth(&format!("listen = \"{listen}\"")).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let auth = authenticator(&dir.path().join("config.toml"), &config);
         let setup = Setup {
             config,
             runners: missing_runners(dir.path()),
-            auth: None,
+            auth,
         };
         let result = daemon(setup, std::future::pending()).await;
         let Err(message) = result else {
@@ -814,11 +811,11 @@ mod tests {
             Arc::clone(&source) as Arc<dyn JwksSource>,
             dir.path().join(JWKS_CACHE_FILE),
         ));
-        let table = config.auth.clone().unwrap();
+        let table = config.auth.clone();
         let setup = Setup {
             config,
             runners: missing_runners(dir.path()),
-            auth: Some(Arc::new(Authenticator::new(&table, Arc::clone(&jwks)))),
+            auth: Arc::new(Authenticator::new(&table, Arc::clone(&jwks))),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let driver = async {
