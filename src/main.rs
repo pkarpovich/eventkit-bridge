@@ -169,7 +169,7 @@ fn authenticator(config_path: &Path, config: &Config) -> Arc<Authenticator> {
         jwks_url,
         scope_prefix,
     } = auth;
-    tracing::info!(issuer, audience, scope_prefix, "auth on");
+    tracing::info!(issuer, audience, scope_prefix, "auth provider");
     let source = Arc::new(HttpJwksSource::new(jwks_url.clone()));
     let jwks = Jwks::new(source, config_path.with_file_name(JWKS_CACHE_FILE));
     Arc::new(Authenticator::new(auth, Arc::new(jwks)))

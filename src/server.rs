@@ -691,7 +691,7 @@ async fn healthz(State(app): Shared) -> Response {
             reminders: &app.reminders,
             policy: &app.policy,
             mail: app.mail.as_ref(),
-            auth: Some(AuthStatus::of(app.auth.jwks())),
+            auth: AuthStatus::of(app.auth.jwks()),
         })
         .await
         .into_response()
