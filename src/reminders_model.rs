@@ -539,14 +539,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::config::Config;
     use crate::fake_ekctl::fixture_text;
 
     const WRITE_LIST: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
     const SHOP_ADDRESS: &str = "1 Example Street, Exampletown";
 
     fn places() -> Vec<Place> {
-        let config = Config::from_toml(&format!(
+        let config = crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\n[places]\nshop = {{ address = \"{SHOP_ADDRESS}\", radius = 150 }}\nhome = {{ address = \"2 Home Lane\" }}\n"
         ))
         .unwrap();

@@ -19,7 +19,7 @@ It requires macOS 14 Sonoma or later on Apple Silicon.
 
 - **The network is the first access control.** The bridge binds only to the literal IP address in its config and refuses to listen on every interface (`0.0.0.0`, `::` or `::ffff:0.0.0.0`). Bind it to your tailscale IP, and only devices on your tailnet can reach it.
 - **Requests must name the bridge.** The `Host` header must be the listen IP or a name listed in `hosts`; anything else is refused with `421`. This stops a web page open in a browser on the tailnet from reaching the bridge through DNS rebinding.
-- **An optional bearer token is the second gate.** With an `[auth]` table, every request except `/healthz` must carry an OAuth 2.0 access token from your OpenID provider, and each route needs one scope (see Authentication). The bridge validates the token itself against the provider's published keys; it never sees a client secret. The token adds to the network bind and the `Host` check, which still run first; it does not replace them. Without `[auth]`, the network is the only access control.
+- **A bearer token is the second gate.** Every request except `/healthz` must carry an OAuth 2.0 access token from your OpenID provider, and each route needs one scope (see Authentication). The bridge validates the token itself against the provider's published keys; it never sees a client secret. The token adds to the network bind and the `Host` check, which still run first; it does not replace them. There is no setting that turns it off: a config without `[auth]` does not load.
 - **Reads touch only the calendars you list.** A request for any other calendar is refused with `403`, and events from other calendars are never returned.
 - **Writes touch only the write calendars.** A new event must name one of them. Before every update or delete, the bridge looks up the event and refuses the change unless the event is in a write calendar. A bug in a client cannot change an event in any other calendar.
 - **Recurring events are not changed.** `ekctl` looks an event up by id, and for a recurring event that is the first occurrence of the series, so an update or delete would silently hit the wrong occurrence. The bridge refuses both with `409` until `ekctl` can address a single occurrence.
@@ -41,13 +41,20 @@ This installs `EventKitBridge.app` into `/Applications` and puts the `eventkit-b
 
 ## First run
 
-The bridge runs as a LaunchAgent in your login session and needs a config before it first starts. You do not know your calendar and list ids yet, so the first run only sets the listen address; the bridge then lists your calendars and reminder lists in its log.
+The bridge runs as a LaunchAgent in your login session and needs a config before it first starts. Every request to it needs a bearer token from your OpenID provider (see Authentication), so the first config names the provider as well as the listen address. You do not know your calendar and list ids yet, and you need no client and no token yet: the bridge lists your calendars and reminder lists in its log by itself.
 
-1. Create `~/.config/eventkit-bridge/config.toml` with the address to listen on, a literal IP such as your tailscale IP:
+1. Create `~/.config/eventkit-bridge/config.toml` with the address to listen on, a literal IP such as your tailscale IP, and the `[auth]` table for your provider:
 
    ```toml
    listen = "100.64.0.1:8790"
+
+   [auth]
+   issuer = "https://auth.example.com"
+   audience = "https://eventkit-bridge"
+   jwks_url = "https://auth.example.com/jwks.json"
    ```
+
+   `issuer` is your provider's issuer URL and `jwks_url` its key set, over `https` only. `audience` is the name the provider puts in the `aud` claim of the tokens it issues for the bridge. The bridge starts even while the provider is unreachable: until it has the keys, `/healthz` says `auth jwks unavailable` and every token is refused, but the calendar and list ids still appear in the log.
 
 2. Check the config:
 
@@ -180,15 +187,15 @@ jwks_url = "https://auth.example.com/jwks.json"
 | `mail.exclude_mailboxes` | no | Mailbox paths never shown, compared case-insensitively, such as `[Gmail]/Spam`. Defaults to the list in the example above; `[]` excludes nothing. |
 | `mail.no_move_mailboxes` | no | Mailbox paths a move may not take a message from or into, compared case-insensitively on the whole path, in every account. A listed mailbox stays readable. Empty by default. A trash or junk mailbox that `exclude_mailboxes` leaves visible must be listed here, or moves into it are allowed. |
 | `mail.root` | no | The Mail data directory to read. Defaults to the highest `~/Library/Mail/V<n>` that contains `MailData/Envelope Index`. Only useful for development. |
-| `auth` | no | The `[auth]` table. Its presence turns the bearer-token gate on (see Authentication); without it no token is read. |
-| `auth.issuer` | yes, in `[auth]` | The provider URL, compared exactly with the token's `iss`. Must not be blank or contain whitespace. |
-| `auth.audience` | yes, in `[auth]` | The audience the token's `aud` must contain. Must not be blank or contain whitespace. |
-| `auth.jwks_url` | yes, in `[auth]` | The absolute `http` or `https` URL of the provider's JWK set. There is no discovery. |
+| `auth` | yes | The `[auth]` table (see Authentication). Without it, or without one of its required keys, the config does not load, and the error names what is missing. |
+| `auth.issuer` | yes | The provider URL, compared exactly with the token's `iss`. Must not be blank or contain whitespace. |
+| `auth.audience` | yes | The audience the token's `aud` must contain. Must not be blank or contain whitespace. |
+| `auth.jwks_url` | yes | The absolute `https` URL of the provider's JWK set, as RFC 8414 requires. An `http` URL is refused, loopback included. There is no discovery. |
 | `auth.scope_prefix` | no | Default `bridge:`. Put in front of every scope name, so `calendar.read` becomes `bridge:calendar.read`. May be empty. Only printable ASCII other than space, `"` and `\`. |
 
 Unknown keys are rejected. The config is read once at startup; after changing it, run `eventkit-bridge install` again to restart the daemon.
 
-`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes, the no-move mailboxes and the mail root; it never opens the mail store. Last, it prints `auth: off`, or `auth: on` with the issuer, audience, `jwks_url` and `scope_prefix`; it never fetches the keys.
+`--check-config` prints the readable and writable calendars and lists and the place names with their radii. Place addresses are never printed or logged. It also prints `mail: off`, or `mail: on` with the configured mail accounts, the excluded mailboxes, the no-move mailboxes and the mail root; it never opens the mail store. Last, it prints the issuer, audience, `jwks_url` and `scope_prefix` of `[auth]`; it never fetches the keys.
 
 #### Why places are named
 
@@ -196,9 +203,9 @@ A location trigger names a place from the config rather than taking an address f
 
 ### Authentication
 
-Authentication is optional. Without an `[auth]` table the bridge reads no token, and the network bind and the `Host` check are the whole access control.
+Authentication is required. A config without an `[auth]` table, or without one of its required keys, does not load.
 
-With `[auth]`, every request except `GET /healthz` needs an OAuth 2.0 access token in the `Authorization: Bearer <token>` header; a request without one is refused with `401`. There is no setting that lets a request without a token through. The bridge is not an OAuth provider and has no login: an external OpenID provider issues the token to the client through the `client_credentials` grant, and the bridge checks it locally against the provider's published keys, without calling the provider per request.
+Every request except `GET /healthz` needs an OAuth 2.0 access token in the `Authorization: Bearer <token>` header; a request without one is refused with `401`. There is no setting that lets a request without a token through. The bridge is not an OAuth provider and has no login: an external OpenID provider issues the token to the client through the `client_credentials` grant, and the bridge checks it locally against the provider's published keys, without calling the provider per request.
 
 ```toml
 [auth]
@@ -231,28 +238,32 @@ Each route needs one scope, `scope_prefix` followed by the name below:
 | Scope | Routes |
 | --- | --- |
 | `calendar.read` | `GET /v1/calendars`, `GET /v1/events`, `GET /v1/events/{id}`, `GET /v1/free` |
-| `calendar.write` | `POST /v1/events`, `PATCH` and `DELETE /v1/events/{id}` |
+| `calendar.create` | `POST /v1/events` |
+| `calendar.edit` | `PATCH /v1/events/{id}` |
+| `calendar.delete` | `DELETE /v1/events/{id}` |
 | `reminders.read` | `GET /v1/lists`, `GET /v1/places`, `GET /v1/reminders`, `GET /v1/reminders/{id}` |
-| `reminders.write` | `POST /v1/reminders`, `PATCH` and `DELETE /v1/reminders/{id}` |
+| `reminders.create` | `POST /v1/reminders` |
+| `reminders.edit` | `PATCH /v1/reminders/{id}`, which also completes a reminder |
+| `reminders.delete` | `DELETE /v1/reminders/{id}` |
 | `mail.read` | `GET /v1/mail/accounts`, `GET /v1/mail/messages`, `GET /v1/mail/messages/{id}` |
 | `mail.junk` | `PATCH /v1/mail/messages/{id}` |
 | `mail.flag` | `PUT` and `DELETE /v1/mail/messages/{id}/flag` |
 | `mail.move` | `POST /v1/mail/messages/{id}/move` |
 | none | `GET /healthz`, which needs no token at all |
 
-A write scope does not include the read scope: a client that creates events and reads them asks for both `bridge:calendar.write` and `bridge:calendar.read`. `HEAD` needs the scope of `GET`. A path that does not exist, or a method a route does not accept, still needs a valid token, but no scope, before it answers `404` or `405`. The scopes decide which routes a client may call; which calendars, lists and mail accounts it may touch is still decided by the rest of the config.
+One scope is one ability, and no scope includes another: a client that creates events and reads them asks for both `bridge:calendar.create` and `bridge:calendar.read`, and one that only creates cannot change or delete what exists. `HEAD` needs the scope of `GET`. A path that does not exist, or a method a route does not accept, still needs a valid token, but no scope, before it answers `404` or `405`. The scopes decide which routes a client may call; which calendars, lists and mail accounts it may touch is still decided by the rest of the config.
 
 | Case | Status | `WWW-Authenticate` | Body |
 | --- | --- | --- | --- |
 | No token | `401` | `Bearer` | `{"error":"missing bearer token"}` |
 | A token that fails any check, including a second `Authorization` header or a scheme other than `Bearer` | `401` | `Bearer error="invalid_token"` | `{"error":"invalid bearer token"}` |
-| A valid token without the route's scope | `403` | `Bearer error="insufficient_scope", scope="bridge:calendar.write"` | `{"error":"insufficient scope: bridge:calendar.write needed"}` |
+| A valid token without the route's scope | `403` | `Bearer error="insufficient_scope", scope="bridge:calendar.create"` | `{"error":"insufficient scope: bridge:calendar.create needed"}` |
 
 The error never says which check failed; the log records only the kind of failure (see Logs).
 
 The bridge fetches the provider's keys from `jwks_url` at startup, retries every 30 seconds until it succeeds, and refreshes them every 12 hours, or 5 minutes after a failed refresh. It keeps only `RSA` signing keys with a `kid`; a key set with none of them is treated as a failed fetch and the old keys stay. A token signed with a key the bridge does not know yet makes it fetch once more, at most once a minute, so a key rotated in at the provider works at once. The last good key set is saved to `~/.config/eventkit-bridge/jwks-cache.json` and loaded at startup, so a restart while the provider is down does not refuse every request. The file holds public keys only. The fetch trusts the certificates in the macOS keychain, so a provider behind a private CA the Mac already trusts works, and it ignores `HTTP_PROXY`. Each fetch gives up after 10 seconds and refuses a key set over 64 KiB.
 
-To turn authentication on, give every client a token first, then add `[auth]` and run `eventkit-bridge install`; from then on a client without a token gets `401`.
+Give every client a token before it calls the bridge: a client without one gets `401`.
 
 ### Command line
 
@@ -266,11 +277,11 @@ To turn authentication on, give every client a token first, then add `[auth]` an
 
 `install` points the LaunchAgent at the real binary inside `EventKitBridge.app`, not at the Homebrew symlink, because the Calendars, Reminders and Full Disk Access permissions belong to the app bundle. It warns when the binary is not inside an `.app` bundle, since the permissions would then not survive an upgrade.
 
-To remove the bridge completely, run `eventkit-bridge uninstall`, then `brew uninstall --cask --zap eventkit-bridge`, which also deletes the config directory (the config and, with `[auth]`, `jwks-cache.json`), the LaunchAgent plist and the log.
+To remove the bridge completely, run `eventkit-bridge uninstall`, then `brew uninstall --cask --zap eventkit-bridge`, which also deletes the config directory (the config and `jwks-cache.json`), the LaunchAgent plist and the log.
 
 ## HTTP API
 
-The examples use `http://100.64.0.1:8790`. With `[auth]`, every example also needs `-H "Authorization: Bearer $TOKEN"` (see Authentication). Every response body is JSON. Every error is `{"error":"<message>"}` with the status codes below.
+The examples use `http://100.64.0.1:8790`. Every example also needs `-H "Authorization: Bearer $TOKEN"` (see Authentication). Every response body is JSON. Every error is `{"error":"<message>"}` with the status codes below.
 
 ### Types
 
@@ -429,8 +440,8 @@ A body larger than 64 KiB is `413`. `POST`, `PUT` and `PATCH` must send `Content
 | Status | Meaning |
 | --- | --- |
 | `400` | The request is invalid; the message names the parameter or field. |
-| `401` | With `[auth]`: the bearer token is missing (`missing bearer token`) or fails a check (`invalid bearer token`). `WWW-Authenticate` says which. |
-| `403` | The security policy refused the request, or, with `[auth]`, the token lacks the route's scope (`insufficient scope: <scope> needed`). |
+| `401` | The bearer token is missing (`missing bearer token`) or fails a check (`invalid bearer token`). `WWW-Authenticate` says which. |
+| `403` | The security policy refused the request, or the token lacks the route's scope (`insufficient scope: <scope> needed`). |
 | `404` | The event, the reminder or the route does not exist. |
 | `409` | `PATCH` or `DELETE` on a recurring event. |
 | `405` | The route does not accept the method. |
@@ -444,7 +455,7 @@ Requests are handled one `ekctl` or `remindctl` call at a time; both tools share
 
 ## Reminders API
 
-The reminder routes follow the same rules as the calendar routes: the `Host` check, with `[auth]` a bearer token with the route's scope, `Content-Type: application/json` on `POST` and `PATCH`, the 64 KiB body limit, `{"error": ...}` errors, and `400` for unknown query parameters, unknown body fields and control characters other than newline and tab.
+The reminder routes follow the same rules as the calendar routes: the `Host` check, a bearer token with the route's scope, `Content-Type: application/json` on `POST` and `PATCH`, the 64 KiB body limit, `{"error": ...}` errors, and `400` for unknown query parameters, unknown body fields and control characters other than newline and tab.
 
 ### Types
 
@@ -575,7 +586,7 @@ Reminder sections, tags, subtasks, smart lists, the Groceries list type and the 
 
 ## Mail API
 
-The mail routes follow the same rules as the other routes: the `Host` check, with `[auth]` a bearer token with the route's scope, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`, `PUT` and `DELETE` on `/v1/mail/messages/{id}/flag` and `POST` on `/v1/mail/messages/{id}/move`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
+The mail routes follow the same rules as the other routes: the `Host` check, a bearer token with the route's scope, `{"error": ...}` errors, and `400` for unknown query parameters, repeated single-valued parameters and control characters. They accept `GET`, plus `PATCH` on `/v1/mail/messages/{id}`, `PUT` and `DELETE` on `/v1/mail/messages/{id}/flag` and `POST` on `/v1/mail/messages/{id}/move`; any other method is `405`. Without a `[mail]` table every mail route answers `404 mail is off: add [mail] to the config`.
 
 Mail reads do not wait for `ekctl` or `remindctl`: they open their own read-only connection to the Envelope Index per request. Mail writes do not wait for them either; they wait only for each other, one Mail call at a time.
 
@@ -748,8 +759,8 @@ curl -X POST -H 'content-type: application/json' -d '{"from": "INBOX", "to": "[G
 | Status | Meaning |
 | --- | --- |
 | `400` | The request is invalid; the message names the parameter. |
-| `401` | With `[auth]`: the bearer token is missing or invalid. |
-| `403` | A move names a mailbox in `no_move_mailboxes` or `exclude_mailboxes`. With `[auth]`: the token lacks `mail.read`, or the scope of the write: `mail.junk` for a `PATCH`, `mail.flag` for a flag route, `mail.move` for a move. |
+| `401` | The bearer token is missing or invalid. |
+| `403` | A move names a mailbox in `no_move_mailboxes` or `exclude_mailboxes`. The token lacks `mail.read`, or the scope of the write: `mail.junk` for a `PATCH`, `mail.flag` for a flag route, `mail.move` for a move. |
 | `404` | Mail is off, the message is not visible, the route does not exist, or Mail could not find the message to change (it moved or was deleted in the meantime). |
 | `405` | A method other than `GET`, or a method a route does not list above. |
 | `409` | The account has no junk mailbox or no inbox, or a move names a mailbox the message is not in or the account does not have. |
@@ -773,14 +784,14 @@ curl http://100.64.0.1:8790/healthz
 When the bridge can read every configured calendar, it answers `200`:
 
 ```json
-{"status":"ok","version":"0.9.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95,"auth":{"jwks_keys":2,"jwks_age_s":3120}}
+{"status":"ok","version":"0.10.0","calendars":2,"lists":1,"mail_accounts":2,"newest_message_age_s":95,"auth":{"jwks_keys":2,"jwks_age_s":3120}}
 ```
 
 `calendars` is the number of readable calendars that exist. When reminder lists are configured, the check also runs `remindctl`, and `lists` is the number of readable lists that exist; without lists, `lists` is left out and `remindctl` is not run. Unlike a missing calendar, a configured list that no longer exists does not make the check degraded; it only lowers `lists`, so compare `lists` with the number of lists in your config.
 
 When `[mail]` is present, the check also opens the mail store, checks that every table and column the bridge reads exists, and checks that every account in `[mail.accounts]` has mailboxes. `mail_accounts` is the number of configured accounts, and `newest_message_age_s` is how many seconds ago the newest visible message arrived, or `null` when there is none. A value that keeps growing means Mail stopped syncing. Without `[mail]`, both fields are left out.
 
-When `[auth]` is present, `auth.jwks_keys` is the number of usable keys the bridge holds, and `auth.jwks_age_s` is how many seconds ago they were fetched from the provider, or `null` when no keys are loaded. Keys loaded from `jwks-cache.json` keep the age of their original fetch. Without `[auth]`, `auth` is left out. `/healthz` never needs a token.
+`auth.jwks_keys` is the number of usable keys the bridge holds, and `auth.jwks_age_s` is how many seconds ago they were fetched from the provider, or `null` when no keys are loaded. Keys loaded from `jwks-cache.json` keep the age of their original fetch. `/healthz` never needs a token.
 
 Otherwise it answers `503`:
 
@@ -799,7 +810,7 @@ Otherwise it answers `503`:
 | `mail no access` | `[mail]` is present and the mail store cannot be opened or read. This is how a missing Full Disk Access grant shows up. |
 | `mail schema changed` | A table or column the bridge reads is missing from the Envelope Index, most likely after a macOS update. |
 | `mail account missing` | An account in `[mail.accounts]` has no mailboxes in Mail's store. |
-| `auth jwks unavailable` | `[auth]` is present and the bridge holds no keys at all, neither fetched from `jwks_url` nor loaded from `jwks-cache.json`, so every token is refused. Old keys do not count as degraded. |
+| `auth jwks unavailable` | The bridge holds no keys at all, neither fetched from `jwks_url` nor loaded from `jwks-cache.json`, so every token is refused. Old keys do not count as degraded. |
 
 A calendar, reminder or mail problem is reported before `auth jwks unavailable`. `timeout` covers `remindctl` as well. The check runs `ekctl` (and `remindctl`, and the mail check) at most once every 10 seconds and reuses the result in between, so it is safe to poll.
 
@@ -807,23 +818,25 @@ A calendar, reminder or mail problem is reported before `auth jwks unavailable`.
 
 There is usually nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
 
+Upgrading to 0.10.0: `[auth]` is required, and `jwks_url` must be `https`. A config without `[auth]`, or with an `http` `jwks_url`, does not load, and launchd keeps restarting a daemon that cannot load its config. Before you upgrade a bridge without `[auth]`, register the bridge's audience and its clients in your provider, give every client a token (see Authentication), add `[auth]` and run `eventkit-bridge install`; from then on a client without a token gets `401`. If `jwks_url` is `http`, change it to the provider's `https` URL and run `eventkit-bridge install` first. The write scopes of calendars and reminders are split by ability: `calendar.write` and `reminders.write` open nothing any more, so give clients `calendar.create`, `calendar.edit` and `calendar.delete`, and `reminders.create`, `reminders.edit` and `reminders.delete`, as they need them, before you upgrade. A token with only the old scope gets `403` on every write route.
+
 Upgrading to 0.9.0 with `[mail]`: a Gmail message is now listed once, in `[Gmail]/All Mail`, with its labels in `labels`, instead of once per mailbox. `mailbox=INBOX` still finds it through its label. With `[Gmail]/All Mail` in `exclude_mailboxes`, every Gmail message is hidden. To use the new routes, grant clients the `mail.flag` and `mail.move` scopes. Add `no_move_mailboxes` for every trash or junk mailbox that `exclude_mailboxes` leaves visible, or moves into it are allowed.
 
 Upgrading to 0.8.0 with an `[auth]` table: delete the `required` line from `[auth]` first and run `eventkit-bridge install`. 0.8.0 no longer knows the key, so a config that still has it fails to load with an unknown-key error naming `required`. On 0.7.0 a missing `required` means `true`, so deleting the line changes nothing there; if it was `required = false`, make sure every client sends a token before deleting it, because 0.8.0 refuses a request without one with `401`.
 
 ## Logs
 
-The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, a junk request for a visible message logs the account name and the requested junk value, a flag request logs the account name and the colour or `off`, and a move request logs the account name, whatever the outcome. With `[auth]`, the line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401` has no `client`, and without `[auth]` the field is left out:
+The daemon logs to `~/Library/Logs/eventkit-bridge.log`. Each request produces one line with the method, the route template, the status, the duration and, when `ekctl` or `remindctl` ran, each subcommand with its exit code. A successful mail read also logs how many rows it returned, a junk request for a visible message logs the account name and the requested junk value, a flag request logs the account name and the colour or `off`, and a move request logs the account name, whatever the outcome. The line ends with `client=` and the token's `client_id` (or `sub`) once the token is valid, also when it is refused with `403` for a missing scope. A request refused with `401`, and `/healthz`, have no `client`:
 
 ```
-2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0"
-2026-10-05T09:13:02.104377Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/reminders/{id} status=200 duration_ms=164 remindctl="info=0, edit=0"
-2026-10-05T09:13:40.402118Z  INFO eventkit_bridge::server: request method=GET route=/v1/mail/messages status=200 duration_ms=18 rows=25
-2026-10-05T09:14:05.611904Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/mail/messages/{id} status=200 duration_ms=1240 account="work" junk=true
+2026-10-05T09:12:40.881207Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/events/{id} status=403 duration_ms=212 ekctl="show event=0" client=my-agent
+2026-10-05T09:13:02.104377Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/reminders/{id} status=200 duration_ms=164 remindctl="info=0, edit=0" client=my-agent
+2026-10-05T09:13:40.402118Z  INFO eventkit_bridge::server: request method=GET route=/v1/mail/messages status=200 duration_ms=18 rows=25 client=my-agent
+2026-10-05T09:14:05.611904Z  INFO eventkit_bridge::server: request method=PATCH route=/v1/mail/messages/{id} status=200 duration_ms=1240 account="work" junk=true client=my-agent
 2026-10-05T09:15:21.030455Z  INFO eventkit_bridge::server: request method=GET route=/v1/calendars status=200 duration_ms=95 client=my-agent
 ```
 
-A refused token also logs `token refused` with its kind (`missing`, `malformed`, `unknown key`, `invalid` or `insufficient scope`) and nothing else. At startup, `auth on` logs the issuer, audience and `scope_prefix`, and `jwks loaded` the number of keys and whether they came from the `file` or the `provider`; a failed fetch logs `cannot fetch the jwks` with the HTTP status or the kind of error, never the body.
+A refused token also logs `token refused` with its kind (`missing`, `malformed`, `unknown key`, `invalid` or `insufficient scope`) and nothing else. At startup, `auth provider` logs the issuer, audience and `scope_prefix`, and `jwks loaded` the number of keys and whether they came from the `file` or the `provider`; a failed fetch logs `cannot fetch the jwks` with the HTTP status or the kind of error, never the body.
 
 Policy refusals log their reason. Event titles, notes, locations, URLs and attendees, reminder titles and notes, place addresses and coordinates, and mail addresses, names, subjects, summaries, bodies, attachment names, Message-IDs and mailbox paths of mail writes are never logged; of a failed Mail call, only its error code is logged. The only calendar, reminder and mail details in the log are the startup listing of calendar ids, titles and accounts, reminder list ids and titles, place names with their radii, and mail account uuids with their type, description and counts. Bearer tokens, the `Authorization` header and every token claim other than the client id are never logged. The description of an IMAP account is often its email address; it appears once, in the startup listing.
 
@@ -863,6 +876,7 @@ The log is not rotated. To truncate it:
 - **`/healthz` says `mail schema changed`.** A macOS update changed the Envelope Index. Mail reads stay unreliable until the bridge is updated for the new format; remove `[mail]` to keep the rest of the bridge healthy meanwhile.
 - **`/healthz` says `auth jwks unavailable`.** The bridge has never fetched the provider's keys and has no `jwks-cache.json` to fall back on, so every token is refused. Look for `cannot fetch the jwks` in the log: a `status` means the provider answered with an error, so check `jwks_url` in a browser; `timed out` or `transport error` means the Mac cannot reach the provider or does not trust its certificate. `no usable keys` means the key set has no `RSA` signing key with a `kid`. `body too large` means the key set is over 64 KiB, and `not a jwk set` means `jwks_url` did not return a `{"keys": [...]}` document, which usually means it points at a login or discovery page. The bridge retries every 30 seconds, and the check turns healthy with the first successful fetch.
 - **Every request with a token gets `401 invalid bearer token`, and the log says `token refused kind=invalid`.** Most often the token has no `aud`: some providers, Authelia among them, issue a token without one when the token request leaves out `audience`. Request the token with `audience` set to the `audience` in `[auth]`, and check that the client is allowed that audience in the provider. Decode the token's middle segment (base64url) to compare its `iss` and `aud` with the config; `iss` must match `issuer` exactly, including a trailing slash.
+- **The bridge is unreachable after upgrading to 0.10.0, and the log says the `[auth]` table is required or `auth.jwks_url` must be an absolute https URL.** 0.10.0 requires `[auth]` and an `https` key set URL, and launchd keeps restarting a daemon that cannot load its config. `eventkit-bridge --check-config` prints the same error. Fix the config as described in Upgrades, and run `eventkit-bridge install`.
 - **The bridge is unreachable after upgrading to 0.8.0, and the log says ``unknown field `required` ``.** 0.8.0 removed `required` from `[auth]`, and launchd keeps restarting a daemon that cannot load its config. Delete the line from `~/.config/eventkit-bridge/config.toml`, check that every client sends a token (a request without one is now `401`), and run `eventkit-bridge install`.
 - **The bridge is unreachable after a reboot.** It is a LaunchAgent, so it runs only in your login session. With FileVault on, it starts only after you log in following a reboot. If it starts before tailscale is up, the bind fails, and launchd keeps restarting it until the address exists.
 - **`install` warns that the program is not inside an `.app` bundle.** You ran a binary from somewhere other than the installed app. The Calendars, Reminders and Full Disk Access permissions are tied to `EventKitBridge.app` and would not survive an upgrade; run `install` from the Homebrew-installed `eventkit-bridge`.

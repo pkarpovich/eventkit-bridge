@@ -51,7 +51,7 @@ pub enum DegradedReason {
     /// A configured mail account has no mailboxes.
     #[serde(rename = "mail account missing")]
     MailAccountMissing,
-    /// `[auth]` is configured and no signing key is loaded, from neither the provider nor the cache file.
+    /// No signing key is loaded, from neither the provider nor the cache file.
     #[serde(rename = "auth jwks unavailable")]
     AuthJwksUnavailable,
 }
@@ -86,8 +86,8 @@ pub enum Health {
         lists: Option<usize>,
         /// The mail store, `None` when `[mail]` is absent.
         mail: Option<MailStatus>,
-        /// The bearer-token keys, `None` when `[auth]` is absent.
-        auth: Option<AuthStatus>,
+        /// The bearer-token keys.
+        auth: AuthStatus,
     },
     /// The bridge cannot serve reads as configured.
     Degraded(DegradedReason),
@@ -118,13 +118,11 @@ impl IntoResponse for Health {
                     body["mail_accounts"] = json!(accounts);
                     body["newest_message_age_s"] = json!(newest_message_age_s);
                 }
-                if let Some(AuthStatus {
+                let AuthStatus {
                     jwks_keys,
                     jwks_age_s,
-                }) = auth
-                {
-                    body["auth"] = json!({"jwks_keys": jwks_keys, "jwks_age_s": jwks_age_s});
-                }
+                } = auth;
+                body["auth"] = json!({"jwks_keys": jwks_keys, "jwks_age_s": jwks_age_s});
                 (StatusCode::OK, Json(body)).into_response()
             }
             Health::Degraded(reason) => (
@@ -147,8 +145,8 @@ pub struct Probe<'a> {
     pub policy: &'a Policy,
     /// The mail store, `None` when `[mail]` is absent.
     pub mail: Option<&'a Arc<MailStore>>,
-    /// The bearer-token keys as they are now, `None` when `[auth]` is absent.
-    pub auth: Option<AuthStatus>,
+    /// The bearer-token keys as they are now.
+    pub auth: AuthStatus,
 }
 
 /// Runs `ekctl list calendars`, `remindctl status` and `list` when reminder lists are
@@ -193,7 +191,7 @@ impl HealthCheck {
     }
 }
 
-fn with_auth(health: Health, auth: Option<AuthStatus>) -> Health {
+fn with_auth(health: Health, auth: AuthStatus) -> Health {
     let Health::Ok {
         calendars,
         lists,
@@ -203,11 +201,7 @@ fn with_auth(health: Health, auth: Option<AuthStatus>) -> Health {
     else {
         return health;
     };
-    if let Some(AuthStatus {
-        jwks_keys: 0,
-        jwks_age_s: _,
-    }) = auth
-    {
+    if auth.jwks_keys == 0 {
         return Health::Degraded(DegradedReason::AuthJwksUnavailable);
     }
     Health::Ok {
@@ -231,7 +225,7 @@ async fn probe_all(probe: Probe<'_>) -> Result<Health, DegradedReason> {
         reminders,
         policy,
         mail,
-        auth: _,
+        auth,
     } = probe;
     let listed = match calendars.session().await.list_calendars().await {
         Ok(listed) => listed,
@@ -253,7 +247,7 @@ async fn probe_all(probe: Probe<'_>) -> Result<Health, DegradedReason> {
         calendars: existing,
         lists,
         mail,
-        auth: None,
+        auth,
     })
 }
 
@@ -336,6 +330,10 @@ mod tests {
     const WRITE_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
     const MISSING_ID: &str = "11111111-2222-3333-4444-555555555555";
     const ABSENT_LIST: &str = "99999999-2222-3333-4444-555555555555";
+    const KEYS: AuthStatus = AuthStatus {
+        jwks_keys: 1,
+        jwks_age_s: Some(0),
+    };
 
     fn config(read: &[&str], write: Option<&str>) -> Config {
         let mut toml = String::from("listen = \"127.0.0.1:8790\"\nread_calendars = [");
@@ -346,7 +344,7 @@ mod tests {
         if let Some(write) = write {
             toml.push_str(&format!("write_calendars = [\"{write}\"]\n"));
         }
-        Config::from_toml(&toml).unwrap()
+        crate::config::with_test_auth(&toml).unwrap()
     }
 
     fn with_lists(read_lists: &[&str]) -> Config {
@@ -357,7 +355,7 @@ mod tests {
             toml.push_str(&format!("\"{id}\","));
         }
         toml.push_str("]\n");
-        Config::from_toml(&toml).unwrap()
+        crate::config::with_test_auth(&toml).unwrap()
     }
 
     fn counting(delay: &str) -> Fake {
@@ -391,7 +389,7 @@ mod tests {
                 reminders: &reminders,
                 policy: &Policy::new(config),
                 mail: None,
-                auth: None,
+                auth: KEYS,
             })
             .await
     }
@@ -409,7 +407,7 @@ mod tests {
                 reminders: &reminders,
                 policy: &Policy::new(config),
                 mail: None,
-                auth: None,
+                auth: KEYS,
             })
             .await
     }
@@ -424,7 +422,7 @@ mod tests {
                 calendars: 2,
                 lists: None,
                 mail: None,
-                auth: None,
+                auth: KEYS,
             }
         );
     }
@@ -516,7 +514,7 @@ mod tests {
                 calendars: 1,
                 lists: None,
                 mail: None,
-                auth: None,
+                auth: KEYS,
             }
         );
         assert_eq!(fake.log(), "list\n");
@@ -532,7 +530,7 @@ mod tests {
                 calendars: 1,
                 lists: Some(2),
                 mail: None,
-                auth: None,
+                auth: KEYS,
             }
         );
         assert_eq!(fake.log(), "list\nstatus\nlist\n");
@@ -562,7 +560,7 @@ mod tests {
                 reminders: &reminders,
                 policy: &Policy::new(&config),
                 mail: None,
-                auth: None,
+                auth: KEYS,
             })
             .await;
         assert_eq!(health, Health::Degraded(DegradedReason::RemindctlFailed));
@@ -578,7 +576,7 @@ mod tests {
                 reminders: &reminders,
                 policy: &Policy::new(&config),
                 mail: None,
-                auth: None,
+                auth: KEYS,
             })
             .await;
         assert_eq!(health, Health::Degraded(DegradedReason::Timeout));
@@ -598,7 +596,7 @@ mod tests {
                 reminders: &reminders,
                 policy: &policy,
                 mail: None,
-                auth: None,
+                auth: KEYS,
             };
             assert_eq!(
                 health.check(probe).await,
@@ -606,7 +604,7 @@ mod tests {
                     calendars: 1,
                     lists: None,
                     mail: None,
-                    auth: None,
+                    auth: KEYS,
                 }
             );
         }
@@ -625,7 +623,7 @@ mod tests {
             reminders: &reminders,
             policy: &policy,
             mail: None,
-            auth: None,
+            auth: KEYS,
         };
         let health = HealthCheck::new(&config, Duration::from_millis(50));
         health.check(probe).await;
@@ -648,7 +646,7 @@ mod tests {
             reminders: &reminders,
             policy: &policy,
             mail: Some(&store),
-            auth: None,
+            auth: KEYS,
         };
         let health = HealthCheck::new(&config, Duration::from_millis(50));
         let Health::Ok {
@@ -659,7 +657,7 @@ mod tests {
                     accounts: 2,
                     newest_message_age_s: Some(_),
                 }),
-            auth: None,
+            auth: KEYS,
         } = health.check(probe).await
         else {
             panic!("mail status missing");
@@ -674,7 +672,7 @@ mod tests {
             calendars: 1,
             lists: None,
             mail: Some(_),
-            auth: None,
+            auth: KEYS,
         } = health.check(probe).await
         else {
             panic!("cached result not reused");
@@ -705,7 +703,7 @@ mod tests {
                 reminders: &reminders,
                 policy: &Policy::new(&config),
                 mail: Some(&store),
-                auth: None,
+                auth: KEYS,
             })
             .await;
         assert_eq!(health, Health::Degraded(DegradedReason::EkctlFailed));
@@ -755,7 +753,7 @@ mod tests {
                         reminders: &reminders,
                         policy: &policy,
                         mail: None,
-                        auth: None,
+                        auth: KEYS,
                     })
                     .await
             }));
@@ -767,7 +765,7 @@ mod tests {
                     calendars: 1,
                     lists: None,
                     mail: None,
-                    auth: None,
+                    auth: KEYS,
                 }
             );
         }
@@ -798,22 +796,22 @@ mod tests {
             calendars: 1,
             lists: None,
             mail: None,
-            auth: None,
+            auth: KEYS,
         };
         assert_eq!(ok.into_response().status(), StatusCode::OK);
         assert_eq!(
             body(ok).await,
-            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1})
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "auth": {"jwks_keys": 1, "jwks_age_s": 0}})
         );
         assert_eq!(
             body(Health::Ok {
                 calendars: 1,
                 lists: Some(3),
                 mail: None,
-                auth: None,
+                auth: KEYS,
             })
             .await,
-            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "lists": 3})
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "lists": 3, "auth": {"jwks_keys": 1, "jwks_age_s": 0}})
         );
         assert_eq!(
             body(Health::Ok {
@@ -823,10 +821,10 @@ mod tests {
                     accounts: 2,
                     newest_message_age_s: Some(42),
                 }),
-                auth: None,
+                auth: KEYS,
             })
             .await,
-            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 2, "newest_message_age_s": 42})
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 2, "newest_message_age_s": 42, "auth": {"jwks_keys": 1, "jwks_age_s": 0}})
         );
         assert_eq!(
             body(Health::Ok {
@@ -836,21 +834,21 @@ mod tests {
                     accounts: 1,
                     newest_message_age_s: None,
                 }),
-                auth: None,
+                auth: KEYS,
             })
             .await,
-            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 1, "newest_message_age_s": null})
+            json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "calendars": 1, "mail_accounts": 1, "newest_message_age_s": null, "auth": {"jwks_keys": 1, "jwks_age_s": 0}})
         );
     }
 
-    fn auth(jwks_keys: usize, jwks_age_s: Option<u64>) -> Option<AuthStatus> {
-        Some(AuthStatus {
+    fn auth(jwks_keys: usize, jwks_age_s: Option<u64>) -> AuthStatus {
+        AuthStatus {
             jwks_keys,
             jwks_age_s,
-        })
+        }
     }
 
-    async fn check_auth(config: &Config, fake: &Fake, status: Option<AuthStatus>) -> Health {
+    async fn check_auth(config: &Config, fake: &Fake, status: AuthStatus) -> Health {
         let runner = fake.runner();
         let reminders = absent_remindctl(&runner);
         HealthCheck::new(config, HEALTH_TTL)

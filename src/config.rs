@@ -355,7 +355,7 @@ pub fn discover_mail_root(mail: &Path) -> Result<PathBuf, MailRootError> {
     Ok(root)
 }
 
-/// The `[auth]` table; its presence turns the bearer-token gate on.
+/// The `[auth]` table: the provider whose tokens every request but `/healthz` must carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     /// Compared exactly with a token's `iss`.
@@ -415,8 +415,8 @@ pub struct Config {
     pub remindctl: Option<PathBuf>,
     /// The `[mail]` table; `None` turns mail off.
     pub mail: Option<MailConfig>,
-    /// The `[auth]` table; `None` leaves the network bind and the `Host` check as the whole access control.
-    pub auth: Option<AuthConfig>,
+    /// The `[auth]` table every request but `/healthz` is checked against.
+    pub auth: AuthConfig,
 }
 
 /// Why a config file was rejected; every rule violation names its key.
@@ -565,6 +565,11 @@ pub enum ConfigError {
     /// `mail.root` is set to an empty path.
     #[error("`mail.root` must not be empty")]
     EmptyMailRoot,
+    /// The `[auth]` table is absent.
+    #[error(
+        "the `[auth]` table is required: add it with `issuer`, `audience` and `jwks_url` (see Authentication in the README)"
+    )]
+    MissingAuth,
     /// A required key of `[auth]` is absent.
     #[error("`auth.{0}` is required")]
     MissingAuthKey(&'static str),
@@ -574,8 +579,8 @@ pub enum ConfigError {
     /// `auth.issuer` or `auth.audience` contains whitespace.
     #[error("`auth.{0}` must not contain whitespace")]
     AuthKeyWhitespace(&'static str),
-    /// `auth.jwks_url` is not an absolute `http` or `https` URL.
-    #[error("`auth.jwks_url` must be an absolute http or https URL, got {value:?}: {reason}")]
+    /// `auth.jwks_url` is not an absolute `https` URL.
+    #[error("`auth.jwks_url` must be an absolute https URL, got {value:?}: {reason}")]
     InvalidJwksUrl {
         /// The URL as written.
         value: String,
@@ -734,10 +739,10 @@ impl Config {
             Some(mail) => Some(parse_mail(mail)?),
         };
 
-        let auth = match auth {
-            None => None,
-            Some(auth) => Some(parse_auth(auth)?),
+        let Some(auth) = auth else {
+            return Err(ConfigError::MissingAuth);
         };
+        let auth = parse_auth(auth)?;
 
         Ok(Self {
             listen,
@@ -1050,13 +1055,13 @@ fn parse_jwks_url(value: String) -> Result<Url, ConfigError> {
             });
         }
     };
-    match url.scheme() {
-        "http" | "https" => Ok(url),
-        _ => Err(ConfigError::InvalidJwksUrl {
+    if url.scheme() != "https" {
+        return Err(ConfigError::InvalidJwksUrl {
             value,
-            reason: "the scheme must be http or https",
-        }),
+            reason: "the scheme must be https",
+        });
     }
+    Ok(url)
 }
 
 fn is_scope_token_char(c: char) -> bool {
@@ -1123,6 +1128,14 @@ pub(crate) fn has_control_character(value: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) const TEST_AUTH: &str = "[auth]\nissuer = \"https://auth.example.com\"\naudience = \"https://eventkit-bridge\"\njwks_url = \"https://auth.example.com/jwks.json\"\n";
+
+#[cfg(test)]
+pub(crate) fn with_test_auth(text: &str) -> Result<Config, ConfigError> {
+    Config::from_toml(&format!("{text}\n{TEST_AUTH}"))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1136,7 +1149,7 @@ mod tests {
 
     #[test]
     fn valid_config() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "100.64.0.1:8790"
             hosts = ["Mac.tail1234.ts.net"]
@@ -1160,7 +1173,12 @@ mod tests {
                 places: Vec::new(),
                 remindctl: None,
                 mail: None,
-                auth: None,
+                auth: AuthConfig {
+                    issuer: "https://auth.example.com".to_owned(),
+                    audience: "https://eventkit-bridge".to_owned(),
+                    jwks_url: Url::parse("https://auth.example.com/jwks.json").unwrap(),
+                    scope_prefix: "bridge:".to_owned(),
+                },
             }
         );
     }
@@ -1177,6 +1195,12 @@ mod tests {
         }
     }
 
+    fn valid_places(places: &str) -> Result<Config, ConfigError> {
+        with_test_auth(&format!(
+            "listen = \"127.0.0.1:8790\"\n[places]\n{places}\n"
+        ))
+    }
+
     fn with_places(places: &str) -> Result<Config, ConfigError> {
         Config::from_toml(&format!(
             "listen = \"127.0.0.1:8790\"\n[places]\n{places}\n"
@@ -1185,7 +1209,7 @@ mod tests {
 
     #[test]
     fn valid_reminders_config() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             read_lists = ["{READ_ID}"]
@@ -1213,7 +1237,7 @@ mod tests {
 
     #[test]
     fn minimal_config_has_no_reminders() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         assert!(config.read_lists.is_empty());
         assert!(config.write_lists.is_empty());
         assert!(config.places.is_empty());
@@ -1232,7 +1256,7 @@ mod tests {
             ("read_lists", "ZF7D9489-A78F-4369-A951-213207DCFEE3"),
             ("write_lists", ""),
         ] {
-            let err = Config::from_toml(&format!(
+            let err = with_test_auth(&format!(
                 "listen = \"127.0.0.1:8790\"\n{key} = [\"{value}\"]"
             ))
             .unwrap_err();
@@ -1254,7 +1278,7 @@ mod tests {
     #[test]
     fn lowercase_list_id_is_stored_in_uppercase() {
         let lower = READ_ID.to_ascii_lowercase();
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nread_lists = [\"{lower}\"]"
         ))
         .unwrap();
@@ -1296,7 +1320,7 @@ mod tests {
     fn longest_place_name() {
         let name = format!("9{}b", "a-".repeat(19));
         assert_eq!(name.len(), 40);
-        let config = with_places(&format!("{name} = {{ address = \"1 Main St\" }}")).unwrap();
+        let config = valid_places(&format!("{name} = {{ address = \"1 Main St\" }}")).unwrap();
         assert_eq!(config.places[0].name.as_str(), name);
     }
 
@@ -1384,7 +1408,7 @@ mod tests {
     #[test]
     fn places_not_table() {
         let err =
-            Config::from_toml("listen = \"127.0.0.1:8790\"\nplaces = \"1 Main St\"").unwrap_err();
+            with_test_auth("listen = \"127.0.0.1:8790\"\nplaces = \"1 Main St\"").unwrap_err();
         let ConfigError::PlacesNotTable = &err else {
             panic!("unexpected error: {err:?}");
         };
@@ -1427,7 +1451,7 @@ mod tests {
 
     #[test]
     fn radius_bounds_are_inclusive() {
-        let config = with_places(
+        let config = valid_places(
             "near = { address = \"1 Main St\", radius = 50 }\nfar = { address = \"2 Main St\", radius = 2000 }",
         )
         .unwrap();
@@ -1442,13 +1466,13 @@ mod tests {
 
     #[test]
     fn default_radius() {
-        let config = with_places(r#"home = { address = "2 Elm Street" }"#).unwrap();
+        let config = valid_places(r#"home = { address = "2 Elm Street" }"#).unwrap();
         assert_eq!(config.places, vec![place("home", "2 Elm Street", 100)]);
     }
 
     #[test]
     fn address_is_redacted_in_debug() {
-        let config = with_places(r#"home = { address = "2 Elm Street" }"#).unwrap();
+        let config = valid_places(r#"home = { address = "2 Elm Street" }"#).unwrap();
         let debug = format!("{config:?}");
         assert!(!debug.contains("Elm"), "{debug}");
         assert!(debug.contains("home"), "{debug}");
@@ -1456,7 +1480,7 @@ mod tests {
 
     #[test]
     fn write_list_implied_readable() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             read_lists = ["{WRITE_ID}", "{READ_ID}", "{READ_ID}"]
@@ -1472,7 +1496,7 @@ mod tests {
 
     #[test]
     fn write_list_readable_without_read_lists() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\nwrite_lists = [\"{WRITE_ID}\"]"
         ))
         .unwrap();
@@ -1482,7 +1506,7 @@ mod tests {
 
     #[test]
     fn empty_remindctl() {
-        let err = Config::from_toml(
+        let err = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             remindctl = ""
@@ -1496,7 +1520,7 @@ mod tests {
 
     #[test]
     fn remindctl_defaults_next_to_executable() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         let executable =
             Path::new("/Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge");
         assert_eq!(
@@ -1507,7 +1531,7 @@ mod tests {
 
     #[test]
     fn remindctl_override() {
-        let config = Config::from_toml(
+        let config = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             remindctl = "/usr/local/bin/remindctl"
@@ -1522,13 +1546,13 @@ mod tests {
 
     #[test]
     fn ipv6_listen() {
-        let config = Config::from_toml(r#"listen = "[fd7a:115c:a1e0::1]:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "[fd7a:115c:a1e0::1]:8790""#).unwrap();
         assert_eq!(config.listen, "[fd7a:115c:a1e0::1]:8790".parse().unwrap());
     }
 
     #[test]
     fn minimal_config_is_first_run() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         assert!(config.hosts.is_empty());
         assert!(config.read_calendars.is_empty());
         assert!(config.write_calendars.is_empty());
@@ -1538,7 +1562,7 @@ mod tests {
 
     #[test]
     fn missing_listen() {
-        let err = Config::from_toml(&format!(r#"read_calendars = ["{READ_ID}"]"#)).unwrap_err();
+        let err = with_test_auth(&format!(r#"read_calendars = ["{READ_ID}"]"#)).unwrap_err();
         assert!(err.to_string().contains("`listen`"));
         let ConfigError::MissingListen = err else {
             panic!("unexpected error: {err:?}");
@@ -1547,7 +1571,7 @@ mod tests {
 
     #[test]
     fn unspecified_ipv4_listen() {
-        let err = Config::from_toml(r#"listen = "0.0.0.0:8790""#).unwrap_err();
+        let err = with_test_auth(r#"listen = "0.0.0.0:8790""#).unwrap_err();
         let ConfigError::ListenUnspecified(addr) = err else {
             panic!("unexpected error: {err:?}");
         };
@@ -1556,7 +1580,7 @@ mod tests {
 
     #[test]
     fn unspecified_ipv6_listen() {
-        let err = Config::from_toml(r#"listen = "[::]:8790""#).unwrap_err();
+        let err = with_test_auth(r#"listen = "[::]:8790""#).unwrap_err();
         let ConfigError::ListenUnspecified(_) = err else {
             panic!("unexpected error: {err:?}");
         };
@@ -1568,7 +1592,7 @@ mod tests {
             r#"listen = "[::ffff:0.0.0.0]:8790""#,
             r#"listen = "[::ffff:0:0]:8790""#,
         ] {
-            let err = Config::from_toml(value).unwrap_err();
+            let err = with_test_auth(value).unwrap_err();
             let ConfigError::ListenUnspecified(_) = err else {
                 panic!("unexpected error: {err:?}");
             };
@@ -1577,13 +1601,13 @@ mod tests {
 
     #[test]
     fn ipv4_mapped_loopback_listen() {
-        let config = Config::from_toml(r#"listen = "[::ffff:127.0.0.1]:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "[::ffff:127.0.0.1]:8790""#).unwrap();
         assert_eq!(config.listen, "[::ffff:127.0.0.1]:8790".parse().unwrap());
     }
 
     #[test]
     fn hostname_listen() {
-        let err = Config::from_toml(r#"listen = "localhost:8790""#).unwrap_err();
+        let err = with_test_auth(r#"listen = "localhost:8790""#).unwrap_err();
         let ConfigError::ListenNotLiteral(value) = &err else {
             panic!("unexpected error: {err:?}");
         };
@@ -1593,7 +1617,7 @@ mod tests {
 
     #[test]
     fn listen_without_port() {
-        let err = Config::from_toml(r#"listen = "100.64.0.1""#).unwrap_err();
+        let err = with_test_auth(r#"listen = "100.64.0.1""#).unwrap_err();
         let ConfigError::ListenNotLiteral(_) = err else {
             panic!("unexpected error: {err:?}");
         };
@@ -1601,7 +1625,7 @@ mod tests {
 
     #[test]
     fn malformed_toml() {
-        let err = Config::from_toml(r#"listen = "127.0.0.1:8790"#).unwrap_err();
+        let err = with_test_auth(r#"listen = "127.0.0.1:8790"#).unwrap_err();
         let ConfigError::Parse(_) = &err else {
             panic!("unexpected error: {err:?}");
         };
@@ -1610,7 +1634,7 @@ mod tests {
 
     #[test]
     fn wrong_type_names_position() {
-        let err = Config::from_toml(
+        let err = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = "not-a-list"
@@ -1625,7 +1649,7 @@ mod tests {
 
     #[test]
     fn unknown_key_names_key() {
-        let err = Config::from_toml(
+        let err = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             write_calendar = "x"
@@ -1640,7 +1664,7 @@ mod tests {
 
     #[test]
     fn empty_read_calendar_id() {
-        let err = Config::from_toml(
+        let err = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = [" "]
@@ -1655,7 +1679,7 @@ mod tests {
 
     #[test]
     fn write_calendar_id_with_comma() {
-        let err = Config::from_toml(&format!(
+        let err = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             write_calendars = ["{READ_ID},{WRITE_ID}"]
@@ -1672,7 +1696,7 @@ mod tests {
 
     #[test]
     fn calendar_id_with_control_character() {
-        let err = Config::from_toml(
+        let err = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = ["abc\u0007"]
@@ -1696,7 +1720,7 @@ mod tests {
             ),
             ("[::1]", "must contain only letters, digits, `-` and `.`"),
         ] {
-            let err = Config::from_toml(&format!(
+            let err = with_test_auth(&format!(
                 "listen = \"127.0.0.1:8790\"\nhosts = [\"{host}\"]"
             ))
             .unwrap_err();
@@ -1711,7 +1735,7 @@ mod tests {
 
     #[test]
     fn empty_ekctl() {
-        let err = Config::from_toml(
+        let err = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             ekctl = ""
@@ -1725,7 +1749,7 @@ mod tests {
 
     #[test]
     fn write_calendar_implied_readable() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = ["{READ_ID}"]
@@ -1738,7 +1762,7 @@ mod tests {
 
     #[test]
     fn write_calendar_readable_without_read_list() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             write_calendars = ["{WRITE_ID}"]
@@ -1751,7 +1775,7 @@ mod tests {
 
     #[test]
     fn write_calendar_listed_as_read_is_not_duplicated() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = ["{WRITE_ID}", "{READ_ID}", "{READ_ID}"]
@@ -1764,7 +1788,7 @@ mod tests {
 
     #[test]
     fn absent_write_calendars() {
-        let config = Config::from_toml(&format!(
+        let config = with_test_auth(&format!(
             r#"
             listen = "127.0.0.1:8790"
             read_calendars = ["{READ_ID}"]
@@ -1777,7 +1801,7 @@ mod tests {
 
     #[test]
     fn ekctl_defaults_next_to_executable() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         let executable =
             Path::new("/Applications/EventKitBridge.app/Contents/MacOS/eventkit-bridge");
         assert_eq!(
@@ -1788,7 +1812,7 @@ mod tests {
 
     #[test]
     fn ekctl_override() {
-        let config = Config::from_toml(
+        let config = with_test_auth(
             r#"
             listen = "127.0.0.1:8790"
             ekctl = "/usr/local/bin/ekctl"
@@ -1825,7 +1849,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            format!("listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\n"),
+            format!("listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\n{TEST_AUTH}"),
         )
         .unwrap();
         let config = Config::load(&path).unwrap();
@@ -1833,7 +1857,7 @@ mod tests {
     }
 
     fn with_mail(mail: &str) -> Result<Config, ConfigError> {
-        Config::from_toml(&format!("listen = \"127.0.0.1:8790\"\n[mail]\n{mail}\n"))
+        with_test_auth(&format!("listen = \"127.0.0.1:8790\"\n[mail]\n{mail}\n"))
     }
 
     fn mail_account(id: &str, name: &str) -> MailAccount {
@@ -1873,7 +1897,7 @@ mod tests {
 
     #[test]
     fn absent_mail_is_off() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
+        let config = with_test_auth(r#"listen = "127.0.0.1:8790""#).unwrap();
         assert_eq!(config.mail, None);
     }
 
@@ -2212,39 +2236,70 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.auth,
-            Some(AuthConfig {
+            AuthConfig {
                 issuer: "https://auth.example.com".to_owned(),
                 audience: "https://eventkit-bridge".to_owned(),
                 jwks_url: Url::parse("https://auth.example.com/jwks.json").unwrap(),
                 scope_prefix: "eventkit/".to_owned(),
-            })
+            }
         );
     }
 
     #[test]
     fn auth_defaults() {
         let config = with_auth(&format!("{AUTH_ISSUER}{AUTH_AUDIENCE}{AUTH_JWKS}")).unwrap();
-        let auth = config.auth.unwrap();
+        let auth = config.auth;
         assert_eq!(auth.scope_prefix, "bridge:");
     }
 
     #[test]
     fn auth_absent() {
-        let config = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap();
-        assert_eq!(config.auth, None);
+        let err = Config::from_toml(r#"listen = "127.0.0.1:8790""#).unwrap_err();
+        let ConfigError::MissingAuth = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(
+            err.to_string(),
+            "the `[auth]` table is required: add it with `issuer`, `audience` and `jwks_url` (see Authentication in the README)"
+        );
     }
 
     #[test]
-    fn auth_http_jwks_url_accepted() {
-        let config = auth_with(
-            "jwks_url",
-            "jwks_url = \"http://10.0.0.5:9091/jwks.json\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            config.auth.unwrap().jwks_url.as_str(),
-            "http://10.0.0.5:9091/jwks.json"
-        );
+    fn auth_absent_with_every_other_table() {
+        let err = Config::from_toml(&format!(
+            "listen = \"127.0.0.1:8790\"\nread_calendars = [\"{READ_ID}\"]\n[mail]\n"
+        ))
+        .unwrap_err();
+        let ConfigError::MissingAuth = err else {
+            panic!("unexpected error: {err:?}");
+        };
+    }
+
+    #[test]
+    fn auth_http_jwks_url_refused() {
+        for value in [
+            "http://auth.example.com/jwks.json",
+            "http://127.0.0.1:9091/jwks.json",
+            "http://localhost/jwks.json",
+            "HTTP://auth.example.com/jwks.json",
+        ] {
+            let err = auth_with("jwks_url", &format!("jwks_url = \"{value}\"\n")).unwrap_err();
+            let ConfigError::InvalidJwksUrl {
+                value: written,
+                reason,
+            } = &err
+            else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(written, value);
+            assert_eq!(*reason, "the scheme must be https");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`auth.jwks_url` must be an absolute https URL, got {value:?}: the scheme must be https"
+                )
+            );
+        }
     }
 
     #[test]
@@ -2300,7 +2355,7 @@ mod tests {
             ("/jwks.json", "not an absolute URL"),
             (
                 "ftp://auth.example.com/jwks.json",
-                "the scheme must be http or https",
+                "the scheme must be https",
             ),
             ("", "empty"),
             (" ", "empty"),
@@ -2337,13 +2392,13 @@ mod tests {
     #[test]
     fn auth_empty_scope_prefix() {
         let config = auth_with("scope_prefix", "scope_prefix = \"\"\n").unwrap();
-        assert_eq!(config.auth.unwrap().scope_prefix, "");
+        assert_eq!(config.auth.scope_prefix, "");
     }
 
     #[test]
     fn auth_scope_prefix_edge_characters() {
         let config = auth_with("scope_prefix", "scope_prefix = \"!#[]~:/\"\n").unwrap();
-        assert_eq!(config.auth.unwrap().scope_prefix, "!#[]~:/");
+        assert_eq!(config.auth.scope_prefix, "!#[]~:/");
     }
 
     #[test]

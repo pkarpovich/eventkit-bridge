@@ -550,7 +550,6 @@ mod tests {
     use tokio::time;
 
     use super::*;
-    use crate::config::Config;
     use crate::fake_ekctl::{Fake, fixture};
     use crate::reminders_model::{Interval, Unit};
     use crate::subprocess::{STDERR_TAIL, STDOUT_CAP};
@@ -576,7 +575,7 @@ mod tests {
     }
 
     fn shop() -> Place {
-        let config = Config::from_toml(&format!(
+        let config = crate::config::with_test_auth(&format!(
             "listen = \"127.0.0.1:8790\"\n[places]\nshop = {{ address = \"{SHOP_ADDRESS}\", radius = 150 }}\n"
         ))
         .unwrap();

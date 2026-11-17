@@ -1589,7 +1589,7 @@ mod tests {
     const LIST_ID: &str = "8C1E2A44-0D6B-4F7E-9C11-5B2F3A9E7D10";
 
     fn places() -> Vec<Place> {
-        crate::config::Config::from_toml(
+        crate::config::with_test_auth(
             "listen = \"127.0.0.1:8790\"\n[places]\nshop = { address = \"1 Example Street\", radius = 150 }\n",
         )
         .unwrap()
