@@ -238,22 +238,26 @@ Each route needs one scope, `scope_prefix` followed by the name below:
 | Scope | Routes |
 | --- | --- |
 | `calendar.read` | `GET /v1/calendars`, `GET /v1/events`, `GET /v1/events/{id}`, `GET /v1/free` |
-| `calendar.write` | `POST /v1/events`, `PATCH` and `DELETE /v1/events/{id}` |
+| `calendar.create` | `POST /v1/events` |
+| `calendar.edit` | `PATCH /v1/events/{id}` |
+| `calendar.delete` | `DELETE /v1/events/{id}` |
 | `reminders.read` | `GET /v1/lists`, `GET /v1/places`, `GET /v1/reminders`, `GET /v1/reminders/{id}` |
-| `reminders.write` | `POST /v1/reminders`, `PATCH` and `DELETE /v1/reminders/{id}` |
+| `reminders.create` | `POST /v1/reminders` |
+| `reminders.edit` | `PATCH /v1/reminders/{id}`, which also completes a reminder |
+| `reminders.delete` | `DELETE /v1/reminders/{id}` |
 | `mail.read` | `GET /v1/mail/accounts`, `GET /v1/mail/messages`, `GET /v1/mail/messages/{id}` |
 | `mail.junk` | `PATCH /v1/mail/messages/{id}` |
 | `mail.flag` | `PUT` and `DELETE /v1/mail/messages/{id}/flag` |
 | `mail.move` | `POST /v1/mail/messages/{id}/move` |
 | none | `GET /healthz`, which needs no token at all |
 
-A write scope does not include the read scope: a client that creates events and reads them asks for both `bridge:calendar.write` and `bridge:calendar.read`. `HEAD` needs the scope of `GET`. A path that does not exist, or a method a route does not accept, still needs a valid token, but no scope, before it answers `404` or `405`. The scopes decide which routes a client may call; which calendars, lists and mail accounts it may touch is still decided by the rest of the config.
+One scope is one ability, and no scope includes another: a client that creates events and reads them asks for both `bridge:calendar.create` and `bridge:calendar.read`, and one that only creates cannot change or delete what exists. `HEAD` needs the scope of `GET`. A path that does not exist, or a method a route does not accept, still needs a valid token, but no scope, before it answers `404` or `405`. The scopes decide which routes a client may call; which calendars, lists and mail accounts it may touch is still decided by the rest of the config.
 
 | Case | Status | `WWW-Authenticate` | Body |
 | --- | --- | --- | --- |
 | No token | `401` | `Bearer` | `{"error":"missing bearer token"}` |
 | A token that fails any check, including a second `Authorization` header or a scheme other than `Bearer` | `401` | `Bearer error="invalid_token"` | `{"error":"invalid bearer token"}` |
-| A valid token without the route's scope | `403` | `Bearer error="insufficient_scope", scope="bridge:calendar.write"` | `{"error":"insufficient scope: bridge:calendar.write needed"}` |
+| A valid token without the route's scope | `403` | `Bearer error="insufficient_scope", scope="bridge:calendar.create"` | `{"error":"insufficient scope: bridge:calendar.create needed"}` |
 
 The error never says which check failed; the log records only the kind of failure (see Logs).
 
@@ -814,7 +818,7 @@ A calendar, reminder or mail problem is reported before `auth jwks unavailable`.
 
 There is usually nothing to do. `brew upgrade --cask eventkit-bridge` replaces the app; the running daemon notices within a couple of seconds that its binary changed, finishes the requests in flight and exits, and launchd starts the new version. The Calendars, Reminders and Full Disk Access permissions belong to the app bundle and carry over.
 
-Upgrading to 0.10.0: `[auth]` is required, and `jwks_url` must be `https`. A config without `[auth]`, or with an `http` `jwks_url`, does not load, and launchd keeps restarting a daemon that cannot load its config. Before you upgrade a bridge without `[auth]`, register the bridge's audience and its clients in your provider, give every client a token (see Authentication), add `[auth]` and run `eventkit-bridge install`; from then on a client without a token gets `401`. If `jwks_url` is `http`, change it to the provider's `https` URL and run `eventkit-bridge install` first.
+Upgrading to 0.10.0: `[auth]` is required, and `jwks_url` must be `https`. A config without `[auth]`, or with an `http` `jwks_url`, does not load, and launchd keeps restarting a daemon that cannot load its config. Before you upgrade a bridge without `[auth]`, register the bridge's audience and its clients in your provider, give every client a token (see Authentication), add `[auth]` and run `eventkit-bridge install`; from then on a client without a token gets `401`. If `jwks_url` is `http`, change it to the provider's `https` URL and run `eventkit-bridge install` first. The write scopes of calendars and reminders are split by ability: `calendar.write` and `reminders.write` open nothing any more, so give clients `calendar.create`, `calendar.edit` and `calendar.delete`, and `reminders.create`, `reminders.edit` and `reminders.delete`, as they need them, before you upgrade. A token with only the old scope gets `403` on every write route.
 
 Upgrading to 0.9.0 with `[mail]`: a Gmail message is now listed once, in `[Gmail]/All Mail`, with its labels in `labels`, instead of once per mailbox. `mailbox=INBOX` still finds it through its label. With `[Gmail]/All Mail` in `exclude_mailboxes`, every Gmail message is hidden. To use the new routes, grant clients the `mail.flag` and `mail.move` scopes. Add `no_move_mailboxes` for every trash or junk mailbox that `exclude_mailboxes` leaves visible, or moves into it are allowed.
 

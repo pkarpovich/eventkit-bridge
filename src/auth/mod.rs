@@ -31,18 +31,18 @@ const SCOPE_TABLE: [(&str, &str, &str); 24] = [
     ("GET", "/v1/events/", "calendar.read"),
     ("GET", "/v1/events/{id}", "calendar.read"),
     ("GET", "/v1/free", "calendar.read"),
-    ("POST", "/v1/events", "calendar.write"),
-    ("PATCH", "/v1/events/{id}", "calendar.write"),
-    ("DELETE", "/v1/events/{id}", "calendar.write"),
-    ("PATCH", "/v1/events/", "calendar.write"),
-    ("DELETE", "/v1/events/", "calendar.write"),
+    ("POST", "/v1/events", "calendar.create"),
+    ("PATCH", "/v1/events/{id}", "calendar.edit"),
+    ("DELETE", "/v1/events/{id}", "calendar.delete"),
+    ("PATCH", "/v1/events/", "calendar.edit"),
+    ("DELETE", "/v1/events/", "calendar.delete"),
     ("GET", "/v1/lists", "reminders.read"),
     ("GET", "/v1/places", "reminders.read"),
     ("GET", "/v1/reminders", "reminders.read"),
     ("GET", "/v1/reminders/{id}", "reminders.read"),
-    ("POST", "/v1/reminders", "reminders.write"),
-    ("PATCH", "/v1/reminders/{id}", "reminders.write"),
-    ("DELETE", "/v1/reminders/{id}", "reminders.write"),
+    ("POST", "/v1/reminders", "reminders.create"),
+    ("PATCH", "/v1/reminders/{id}", "reminders.edit"),
+    ("DELETE", "/v1/reminders/{id}", "reminders.delete"),
     ("GET", "/v1/mail/accounts", "mail.read"),
     ("GET", "/v1/mail/messages", "mail.read"),
     ("GET", "/v1/mail/messages/{id}", "mail.read"),
@@ -596,7 +596,7 @@ mod tests {
         let claims = with(
             claims(),
             "scope",
-            json!("bridge:calendar.read  bridge:calendar.write"),
+            json!("bridge:calendar.read  bridge:calendar.create"),
         );
 
         let principal = check(&mint(&claims, KID)).unwrap();
@@ -605,7 +605,7 @@ mod tests {
             principal.scopes,
             scopes(&[
                 "bridge:calendar.read",
-                "bridge:calendar.write",
+                "bridge:calendar.create",
                 "bridge:mail.read"
             ])
         );
@@ -947,18 +947,18 @@ mod tests {
             (Method::GET, "/v1/events/", "calendar.read"),
             (Method::GET, "/v1/events/{id}", "calendar.read"),
             (Method::GET, "/v1/free", "calendar.read"),
-            (Method::POST, "/v1/events", "calendar.write"),
-            (Method::PATCH, "/v1/events/{id}", "calendar.write"),
-            (Method::DELETE, "/v1/events/{id}", "calendar.write"),
-            (Method::PATCH, "/v1/events/", "calendar.write"),
-            (Method::DELETE, "/v1/events/", "calendar.write"),
+            (Method::POST, "/v1/events", "calendar.create"),
+            (Method::PATCH, "/v1/events/{id}", "calendar.edit"),
+            (Method::DELETE, "/v1/events/{id}", "calendar.delete"),
+            (Method::PATCH, "/v1/events/", "calendar.edit"),
+            (Method::DELETE, "/v1/events/", "calendar.delete"),
             (Method::GET, "/v1/lists", "reminders.read"),
             (Method::GET, "/v1/places", "reminders.read"),
             (Method::GET, "/v1/reminders", "reminders.read"),
             (Method::GET, "/v1/reminders/{id}", "reminders.read"),
-            (Method::POST, "/v1/reminders", "reminders.write"),
-            (Method::PATCH, "/v1/reminders/{id}", "reminders.write"),
-            (Method::DELETE, "/v1/reminders/{id}", "reminders.write"),
+            (Method::POST, "/v1/reminders", "reminders.create"),
+            (Method::PATCH, "/v1/reminders/{id}", "reminders.edit"),
+            (Method::DELETE, "/v1/reminders/{id}", "reminders.delete"),
             (Method::GET, "/v1/mail/accounts", "mail.read"),
             (Method::GET, "/v1/mail/messages", "mail.read"),
             (Method::GET, "/v1/mail/messages/{id}", "mail.read"),
@@ -1043,7 +1043,7 @@ mod tests {
             harness
                 .authenticator
                 .required_scope(&Method::POST, "/v1/reminders"),
-            Some("bridge:reminders.write".to_owned())
+            Some("bridge:reminders.create".to_owned())
         );
         assert_eq!(harness.authenticator.jwks().key_count(), 0);
     }

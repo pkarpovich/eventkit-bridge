@@ -5608,11 +5608,15 @@ esac"#,
     const ISSUER: &str = "https://auth.example.com";
     const AUDIENCE: &str = "https://eventkit-bridge";
     const CLIENT: &str = "agent";
-    const ALL_SCOPES: [&str; 8] = [
+    const ALL_SCOPES: [&str; 12] = [
         "bridge:calendar.read",
-        "bridge:calendar.write",
+        "bridge:calendar.create",
+        "bridge:calendar.edit",
+        "bridge:calendar.delete",
         "bridge:reminders.read",
-        "bridge:reminders.write",
+        "bridge:reminders.create",
+        "bridge:reminders.edit",
+        "bridge:reminders.delete",
         "bridge:mail.read",
         "bridge:mail.junk",
         "bridge:mail.flag",
@@ -5760,11 +5764,25 @@ esac"#,
                 status: StatusCode::OK,
             },
             ScopedCase {
-                scope: "bridge:calendar.write",
+                scope: "bridge:calendar.create",
                 method: Method::POST,
                 uri: "/v1/events".to_owned(),
                 body: Some(create_body()),
                 status: StatusCode::CREATED,
+            },
+            ScopedCase {
+                scope: "bridge:calendar.edit",
+                method: Method::PATCH,
+                uri: EVENT_PATH.to_owned(),
+                body: Some(json!({ "title": "Dinner" })),
+                status: StatusCode::OK,
+            },
+            ScopedCase {
+                scope: "bridge:calendar.delete",
+                method: Method::DELETE,
+                uri: EVENT_PATH.to_owned(),
+                body: None,
+                status: StatusCode::NO_CONTENT,
             },
             ScopedCase {
                 scope: "bridge:reminders.read",
@@ -5774,7 +5792,21 @@ esac"#,
                 status: StatusCode::OK,
             },
             ScopedCase {
-                scope: "bridge:reminders.write",
+                scope: "bridge:reminders.create",
+                method: Method::POST,
+                uri: "/v1/reminders".to_owned(),
+                body: Some(json!({})),
+                status: StatusCode::BAD_REQUEST,
+            },
+            ScopedCase {
+                scope: "bridge:reminders.edit",
+                method: Method::PATCH,
+                uri: "/v1/reminders/42".to_owned(),
+                body: Some(json!({ "completed": true })),
+                status: StatusCode::BAD_REQUEST,
+            },
+            ScopedCase {
+                scope: "bridge:reminders.delete",
                 method: Method::DELETE,
                 uri: "/v1/reminders/42".to_owned(),
                 body: None,
@@ -5874,6 +5906,46 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn the_old_write_scopes_open_no_route() {
+        let fake = write_fake();
+        let app = auth_app(&fake, &[KID]);
+        let old = token(&[
+            "bridge:calendar.read",
+            "bridge:calendar.write",
+            "bridge:reminders.read",
+            "bridge:reminders.write",
+        ]);
+        let mut writes = 0;
+        for case in scoped_cases() {
+            let ScopedCase {
+                scope,
+                method,
+                uri: _,
+                body: _,
+                status: _,
+            } = &case;
+            if !scope.starts_with("bridge:calendar.") && !scope.starts_with("bridge:reminders.") {
+                continue;
+            }
+            if scope.ends_with(".read") {
+                continue;
+            }
+            writes += 1;
+            let answer = exchange(&app.router, with_token(scoped_request(&case), &old)).await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN, "{method} {scope}");
+            assert_eq!(
+                answer.challenge,
+                Some(format!(
+                    r#"Bearer error="insufficient_scope", scope="{scope}""#
+                )),
+                "{scope}"
+            );
+        }
+        assert_eq!(writes, 6);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn read_token_on_a_write_route_is_forbidden_before_ekctl() {
         let fake = write_fake();
         let app = auth_app(&fake, &[KID]);
@@ -5888,11 +5960,11 @@ esac"#,
         assert_eq!(answer.status, StatusCode::FORBIDDEN);
         assert_eq!(
             answer.challenge.as_deref(),
-            Some(r#"Bearer error="insufficient_scope", scope="bridge:calendar.write""#)
+            Some(r#"Bearer error="insufficient_scope", scope="bridge:calendar.create""#)
         );
         assert_eq!(
             answer.body,
-            error("insufficient scope: bridge:calendar.write needed")
+            error("insufficient scope: bridge:calendar.create needed")
         );
         assert!(fake.calls().is_empty());
     }
@@ -6084,7 +6156,7 @@ esac"#,
 
         let answer = exchange(
             &app.router,
-            with_token(request, &token(&["bridge:calendar.write"])),
+            with_token(request, &token(&["bridge:calendar.create"])),
         )
         .await;
 
